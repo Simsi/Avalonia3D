@@ -297,7 +297,7 @@ export function renderScene(hostId, packetJson) {
 
   if (packet.controlPlanes.length > 0) {
     gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     gl.depthMask(false);
     gl.useProgram(host.texturedProgram);
     gl.uniformMatrix4fv(host.texturedViewProjLocation, false, viewProj);

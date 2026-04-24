@@ -77,21 +77,26 @@ public partial class MainView : UserControl
             {
                 Spacing = 8,
                 Children =
+        {
+            new TextBlock
             {
-                new TextBlock
-                {
-                    Text = "Live control inside 3D scene",
-                    FontWeight = FontWeight.SemiBold
-                },
-                new TextBox
-                {
-                    Watermark = "Type here..."
-                },
-                new Button
-                {
-                    Content = "Click me"
-                }
+                Text = "Live control inside 3D scene",
+                FontWeight = FontWeight.SemiBold,
+                Foreground = Brushes.Black
+            },
+            new TextBox
+            {
+                Watermark = "Type here...",
+                Foreground = Brushes.Black,
+                Background = Brushes.LightGray
+            },
+            new Button
+            {
+                Content = "Click me",
+                Foreground = Brushes.Black,
+                Background = Brushes.LightGray
             }
+        }
             }
         };
 
@@ -112,7 +117,7 @@ public partial class MainView : UserControl
 
         var outerbtn = new Button()
         {
-
+            Content = "Change ClickMe button color"
         };
 
         outerbtn.Click += (_, _) =>

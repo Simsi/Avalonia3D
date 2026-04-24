@@ -51,6 +51,7 @@ internal sealed class OpenGlSceneRenderer
     private int _texturePositionLocation;
     private int _textureUvLocation;
     private int _textureSamplerLocation;
+    private int _textureViewProjLocation;
     private int _controlVertexBuffer;
     private int _controlIndexBuffer;
     private bool _initialized;
@@ -59,6 +60,7 @@ internal sealed class OpenGlSceneRenderer
     private GlDisableDelegate? _disable;
     private GlUniform1iDelegate? _uniform1i;
     private GlUniform4fDelegate? _uniform4f;
+    private GlUniformMatrix4fvDelegate? _uniformMatrix4fv;
 
     public void Initialize(GlInterface gl)
     {
@@ -72,6 +74,7 @@ internal sealed class OpenGlSceneRenderer
         _disable = LoadDelegate<GlDisableDelegate>(gl, "glDisable");
         _uniform1i = LoadDelegate<GlUniform1iDelegate>(gl, "glUniform1i");
         _uniform4f = LoadDelegate<GlUniform4fDelegate>(gl, "glUniform4f");
+        _uniformMatrix4fv = LoadDelegate<GlUniformMatrix4fvDelegate>(gl, "glUniformMatrix4fv");
 
         _meshProgram = CreateProgram(gl, MeshVertexSource, MeshFragmentSource, (0, "aPosition"));
         _meshPositionLocation = gl.GetAttribLocationString(_meshProgram, "aPosition");
@@ -81,6 +84,7 @@ internal sealed class OpenGlSceneRenderer
         _texturePositionLocation = gl.GetAttribLocationString(_texturedProgram, "aPosition");
         _textureUvLocation = gl.GetAttribLocationString(_texturedProgram, "aTexCoord");
         _textureSamplerLocation = gl.GetUniformLocationString(_texturedProgram, "uTexture");
+        _textureViewProjLocation = gl.GetUniformLocationString(_texturedProgram, "uViewProj");
 
         _controlVertexBuffer = gl.GenBuffer();
         _controlIndexBuffer = gl.GenBuffer();
@@ -242,6 +246,9 @@ internal sealed class OpenGlSceneRenderer
             _uniform1i?.Invoke(_textureSamplerLocation, 0);
         }
 
+        var viewProjection = view * projection;
+        UploadMatrix(_uniformMatrix4fv, _textureViewProjLocation, viewProjection);
+
         foreach (var (plane, _) in planes)
         {
             var texture = EnsureControlTexture(gl, plane);
@@ -251,10 +258,7 @@ internal sealed class OpenGlSceneRenderer
             }
 
             var corners = ControlPlaneGeometry.GetWorldCorners(plane, scene.Camera);
-            if (!TryBuildProjectedControlVertices(corners, view, projection, out var vertexData))
-            {
-                continue;
-            }
+            var vertexData = BuildWorldControlVertices(corners);
 
             gl.BindTexture(GlTexture2D, texture.TextureId);
             gl.BindBuffer(GlArrayBuffer, _controlVertexBuffer);
@@ -378,23 +382,15 @@ internal sealed class OpenGlSceneRenderer
         return result;
     }
 
-    private static bool TryBuildProjectedControlVertices(Vector3[] worldCorners, Matrix4x4 view, Matrix4x4 projection, out float[] vertexData)
+    private static float[] BuildWorldControlVertices(Vector3[] worldCorners)
     {
-        vertexData = new float[20];
+        var vertexData = new float[20];
         for (var i = 0; i < 4; i++)
         {
-            var clip = Vector4.Transform(Vector4.Transform(new Vector4(worldCorners[i], 1f), view), projection);
-            if (System.MathF.Abs(clip.W) < 0.00001f || clip.W <= 0f)
-            {
-                vertexData = Array.Empty<float>();
-                return false;
-            }
-
-            var ndc = new Vector3(clip.X, clip.Y, clip.Z) / clip.W;
             var baseIndex = i * 5;
-            vertexData[baseIndex] = ndc.X;
-            vertexData[baseIndex + 1] = ndc.Y;
-            vertexData[baseIndex + 2] = ndc.Z;
+            vertexData[baseIndex] = worldCorners[i].X;
+            vertexData[baseIndex + 1] = worldCorners[i].Y;
+            vertexData[baseIndex + 2] = worldCorners[i].Z;
         }
 
         // TL, TR, BR, BL
@@ -402,7 +398,7 @@ internal sealed class OpenGlSceneRenderer
         vertexData[8] = 1f; vertexData[9] = 0f;
         vertexData[13] = 1f; vertexData[14] = 1f;
         vertexData[18] = 0f; vertexData[19] = 1f;
-        return true;
+        return vertexData;
     }
 
     private static Vector3 ProjectToNdc(Vector3 world, Matrix4x4 view, Matrix4x4 projection)
@@ -448,6 +444,32 @@ internal sealed class OpenGlSceneRenderer
             return;
         }
         uniform4f?.Invoke(location, color.R, color.G, color.B, color.A);
+    }
+
+    private static void UploadMatrix(GlUniformMatrix4fvDelegate? uniformMatrix4fv, int location, Matrix4x4 matrix)
+    {
+        if (location < 0 || uniformMatrix4fv is null)
+        {
+            return;
+        }
+
+        var values = new[]
+        {
+            matrix.M11, matrix.M12, matrix.M13, matrix.M14,
+            matrix.M21, matrix.M22, matrix.M23, matrix.M24,
+            matrix.M31, matrix.M32, matrix.M33, matrix.M34,
+            matrix.M41, matrix.M42, matrix.M43, matrix.M44
+        };
+
+        var handle = GCHandle.Alloc(values, GCHandleType.Pinned);
+        try
+        {
+            uniformMatrix4fv(location, 1, 0, handle.AddrOfPinnedObject());
+        }
+        finally
+        {
+            handle.Free();
+        }
     }
 
     private static int CreateProgram(GlInterface gl, string vertexSource, string fragmentSource, params (int Location, string Name)[] attributes)
@@ -511,6 +533,9 @@ internal sealed class OpenGlSceneRenderer
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate void GlUniform4fDelegate(int location, float x, float y, float z, float w);
 
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate void GlUniformMatrix4fvDelegate(int location, int count, byte transpose, IntPtr value);
+
     private sealed class MeshGpuResource
     {
         public int GeometryVersion { get; init; }
@@ -564,11 +589,12 @@ void main()
 
     private const string TexturedVertexSource = @"attribute vec3 aPosition;
 attribute vec2 aTexCoord;
+uniform mat4 uViewProj;
 varying vec2 vTexCoord;
 void main()
 {
     vTexCoord = aTexCoord;
-    gl_Position = vec4(aPosition, 1.0);
+    gl_Position = uViewProj * vec4(aPosition, 1.0);
 }";
 
     private const string TexturedFragmentSource = @"#ifdef GL_ES
