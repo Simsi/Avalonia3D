@@ -18,23 +18,18 @@ public static class SceneRenderPacketBuilder
         var view = scene.Camera.GetViewMatrix();
         var projection = scene.Camera.GetProjectionMatrix(aspect);
 
-        var objects = new List<RenderObjectPacket>(scene.Objects.Count);
+        var objects = new List<RenderObjectPacket>();
 
-        foreach (var obj in scene.Objects)
+        foreach (var obj in scene.Registry.Renderables)
         {
-            if (!obj.IsVisible || !obj.UseMeshRendering)
-            {
-                continue;
-            }
-
             var mesh = obj.GetMesh();
             var model = obj.GetModelMatrix();
             var mvp = model * view * projection;
-            var geometryKey = $"{obj.Id}:{obj.GeometryVersion}";
+            var geometryKey = mesh.ResourceKey;
 
             RenderMeshPayload? payload = null;
             if (geometryVersionCache is null ||
-                !geometryVersionCache.TryGetValue(obj.Id, out var knownVersion) ||
+                !geometryVersionCache.TryGetValue(geometryKey, out var knownVersion) ||
                 knownVersion != obj.GeometryVersion)
             {
                 payload = new RenderMeshPayload
@@ -46,17 +41,17 @@ public static class SceneRenderPacketBuilder
 
                 if (geometryVersionCache is not null)
                 {
-                    geometryVersionCache[obj.Id] = obj.GeometryVersion;
+                    geometryVersionCache[geometryKey] = obj.GeometryVersion;
                 }
             }
 
-            var color = obj.Fill;
-            if (obj.IsHovered)
+            var color = obj.Material.EffectiveColor;
+            if (obj.IsEffectivelyHovered)
             {
                 color = color.BlendTowards(Primitives.ColorRgba.White, 0.10f);
             }
 
-            if (obj.IsSelected)
+            if (obj.IsEffectivelySelected)
             {
                 color = color.BlendTowards(Primitives.ColorRgba.White, 0.22f);
             }

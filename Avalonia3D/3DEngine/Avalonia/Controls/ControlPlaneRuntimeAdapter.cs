@@ -50,6 +50,8 @@ internal sealed class ControlPlaneRuntimeAdapter : IDisposable
     public bool IsDirty => _plane.SnapshotDirty;
     public DateTime LastSnapshotUtc => _lastSnapshotUtc;
     public Interactive? FocusedElement => _focusedElement;
+    public bool HasFocus => _focusedElement is not null;
+    public bool ShouldCaptureKeyboardInput => IsTextInputElement(_focusedElement);
     public bool IsInteractionReady => _plane.Snapshot is not null && IsActuallyAttached(_sourceControl);
 
     public bool ShouldRefresh(DateTime nowUtc, TimeSpan minInterval)
@@ -164,6 +166,11 @@ internal sealed class ControlPlaneRuntimeAdapter : IDisposable
         var eventRoot = GetEventRootVisual(rootVisual);
         var oldHover = _hoveredElement;
         _hoveredElement = null;
+        if (IsTextInputElement(_focusedElement))
+        {
+            _focusedElement = null;
+        }
+
         var point = TranslateControlPointToRoot(oldHover, _lastLocalPoint, eventRoot);
         var routed = new PointerEventArgs(
             InputElement.PointerExitedEvent,
@@ -511,6 +518,48 @@ internal sealed class ControlPlaneRuntimeAdapter : IDisposable
             sourceEvent.GetCurrentPoint(rootVisual).Properties,
             sourceEvent.KeyModifiers);
         TryRaiseEvent(target, enterArgs);
+        ClearTextFocusIfPointerLeftFocusedElement(target);
+    }
+
+    private void ClearTextFocusIfPointerLeftFocusedElement(Interactive target)
+    {
+        if (!IsTextInputElement(_focusedElement) || IsSameOrVisualDescendant(_focusedElement, target))
+        {
+            return;
+        }
+
+        _focusedElement = null;
+    }
+
+    private static bool IsSameOrVisualDescendant(Interactive? ancestor, Interactive? target)
+    {
+        if (ancestor is null || target is null)
+        {
+            return false;
+        }
+
+        if (ReferenceEquals(ancestor, target))
+        {
+            return true;
+        }
+
+        var current = target as Visual;
+        while (current is not null)
+        {
+            if (ReferenceEquals(current, ancestor))
+            {
+                return true;
+            }
+
+            current = current.GetVisualParent();
+        }
+
+        return false;
+    }
+
+    private static bool IsTextInputElement(Interactive? target)
+    {
+        return target is TextBox;
     }
 
     private Interactive ResolveInteractiveTarget(Point localPoint)

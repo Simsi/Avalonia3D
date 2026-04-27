@@ -1,0 +1,15 @@
+[$RootKey$\Packages\{d9f3b129-4b58-4ae5-bd4f-1ab60a6d3f20}]
+@="3DEngine Previewer Connector"
+"InprocServer32"="$WinDir$\SYSTEM32\MSCOREE.DLL"
+"Class"="ThreeDEngine.PreviewerVsix.VsixPackage"
+"Assembly"="ThreeDEngine.PreviewerVsix, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null"
+"CodeBase"="$PackageFolder$\ThreeDEngine.PreviewerVsix.dll"
+"CompanyName"="ThreeDEngine"
+"ProductName"="3DEngine Previewer Connector"
+"ProductVersion"="0.1.4"
+"MinEdition"="standard"
+"ID"=dword:00000001
+"AllowsBackgroundLoading"=dword:00000001
+
+[$RootKey$\Menus]
+"{d9f3b129-4b58-4ae5-bd4f-1ab60a6d3f20}"=", 1000, 1"

@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>PreviewerApp</RootNamespace>
+    <AssemblyName>PreviewerApp</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The previewer is intentionally a separate process but reuses the host app assembly/project. -->
+    <ProjectReference Include="..\Avalonia3D.csproj" />
+    <PackageReference Include="Avalonia.Desktop" Version="$(AvaloniaVersion)" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="$(AvaloniaVersion)" />
+  </ItemGroup>
+</Project>

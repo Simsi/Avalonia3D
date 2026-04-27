@@ -19,22 +19,33 @@ public static class Raycaster
         var ray = ProjectionHelper.CreateRay(scene.Camera, viewportPosition, viewportSize);
         PickingResult? closest = null;
 
-        foreach (var obj in scene.Objects)
+        var candidates = scene.Registry.PickableIndex.QueryRay(ray);
+        var objects = candidates.Count == 0 ? scene.Registry.Pickables : candidates;
+
+        foreach (var obj in objects)
         {
-            if (!obj.IsVisible || !obj.UseScenePicking)
+            if (predicate is not null && !predicate(obj))
             {
                 continue;
             }
 
-            if (predicate is not null && !predicate(obj))
+            if (obj.Collider is not null)
             {
+                if (obj.Collider.Raycast(obj, ray, out var colliderHit) &&
+                    (closest is null || colliderHit.Distance < closest.Distance))
+                {
+                    closest = new PickingResult(obj, colliderHit.Point, colliderHit.Distance);
+                }
+
                 continue;
             }
 
             var mesh = obj.GetMesh();
             var model = obj.GetModelMatrix();
 
-            if (!IntersectsBoundingSphere(ray, obj.Position, mesh.BoundingRadius * GetAbsMax(obj.Scale)))
+            var boundsCenter = Vector3.Transform(Vector3.Zero, model);
+
+            if (!IntersectsBoundingSphere(ray, boundsCenter, mesh.BoundingRadius * GetAbsMax(model)))
             {
                 continue;
             }
@@ -120,6 +131,11 @@ public static class Raycaster
         return true;
     }
 
-    private static float GetAbsMax(Vector3 scale)
-        => System.Math.Max(System.Math.Abs(scale.X), System.Math.Max(System.Math.Abs(scale.Y), System.Math.Abs(scale.Z)));
+    private static float GetAbsMax(Matrix4x4 model)
+    {
+        var x = Vector3.TransformNormal(Vector3.UnitX, model).Length();
+        var y = Vector3.TransformNormal(Vector3.UnitY, model).Length();
+        var z = Vector3.TransformNormal(Vector3.UnitZ, model).Length();
+        return System.Math.Max(x, System.Math.Max(y, z));
+    }
 }

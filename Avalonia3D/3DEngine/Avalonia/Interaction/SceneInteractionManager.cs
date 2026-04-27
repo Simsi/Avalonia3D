@@ -10,6 +10,7 @@ namespace ThreeDEngine.Avalonia.Interaction;
 public sealed class SceneInteractionManager
 {
     private readonly Action _requestRender;
+    private readonly Func<Vector2>? _getViewportSize;
     private bool _leftPressed;
     private bool _middlePressed;
     private bool _rightPressed;
@@ -18,10 +19,11 @@ public sealed class SceneInteractionManager
     private Vector2 _pressPosition;
     private PickingResult? _pressedPick;
 
-    public SceneInteractionManager(Scene3D scene, Action requestRender)
+    public SceneInteractionManager(Scene3D scene, Action requestRender, Func<Vector2>? getViewportSize = null)
     {
         Scene = scene;
         _requestRender = requestRender;
+        _getViewportSize = getViewportSize;
     }
 
     public event EventHandler<ScenePointerEventArgs>? ObjectClicked;
@@ -36,8 +38,9 @@ public sealed class SceneInteractionManager
         Scene = scene;
         HoveredObject = null;
         SelectedObject = null;
+        _pressedPick = null;
+        _objectDragStarted = false;
     }
-
 
     public void ClearHover()
     {
@@ -62,10 +65,15 @@ public sealed class SceneInteractionManager
 
     public void HandlePointerPressed(Control owner, PointerPressedEventArgs e)
     {
+        var point = e.GetPosition(owner);
+        HandlePointerPressed(owner, e, new Vector2((float)point.X, (float)point.Y));
+    }
+
+    public void HandlePointerPressed(Control owner, PointerPressedEventArgs e, Vector2 position)
+    {
         owner.Focus();
 
-        var point = e.GetPosition(owner);
-        _lastPosition = new Vector2((float)point.X, (float)point.Y);
+        _lastPosition = position;
         _pressPosition = _lastPosition;
 
         if (e.GetCurrentPoint(owner).Properties.IsLeftButtonPressed)
@@ -76,7 +84,7 @@ public sealed class SceneInteractionManager
 
             if (_pressedPick is not null)
             {
-                var args = CreatePointerArgs(_pressedPick, SceneMouseButton.Left);
+                var args = CreatePointerArgs(_pressedPick, _lastPosition, SceneMouseButton.Left);
                 _pressedPick.Object.RaisePointerPressed(args);
             }
         }
@@ -98,13 +106,16 @@ public sealed class SceneInteractionManager
     public void HandlePointerReleased(Control owner, PointerReleasedEventArgs e)
     {
         var point = e.GetPosition(owner);
-        var position = new Vector2((float)point.X, (float)point.Y);
+        HandlePointerReleased(owner, e, new Vector2((float)point.X, (float)point.Y));
+    }
 
+    public void HandlePointerReleased(Control owner, PointerReleasedEventArgs e, Vector2 position)
+    {
         if (_leftPressed && _pressedPick is not null)
         {
             var releasePick = Pick(owner, position);
 
-            var pointerArgs = CreatePointerArgs(_pressedPick, SceneMouseButton.Left);
+            var pointerArgs = CreatePointerArgs(_pressedPick, position, SceneMouseButton.Left);
             _pressedPick.Object.RaisePointerReleased(pointerArgs);
 
             var dragDistance = Vector2.Distance(position, _pressPosition);
@@ -112,7 +123,7 @@ public sealed class SceneInteractionManager
                 releasePick?.Object == _pressedPick.Object &&
                 dragDistance < 6f)
             {
-                var clickArgs = CreatePointerArgs(releasePick, SceneMouseButton.Left);
+                var clickArgs = CreatePointerArgs(releasePick, position, SceneMouseButton.Left);
                 releasePick.Object.RaiseClicked(clickArgs);
                 ObjectClicked?.Invoke(this, clickArgs);
             }
@@ -123,6 +134,7 @@ public sealed class SceneInteractionManager
         _rightPressed = false;
         _objectDragStarted = false;
         _pressedPick = null;
+        _lastPosition = position;
 
         e.Pointer.Capture(null);
         UpdateHover(owner, position, SceneMouseButton.Unknown);
@@ -132,7 +144,11 @@ public sealed class SceneInteractionManager
     public void HandlePointerMoved(Control owner, PointerEventArgs e)
     {
         var point = e.GetPosition(owner);
-        var position = new Vector2((float)point.X, (float)point.Y);
+        HandlePointerMoved(owner, e, new Vector2((float)point.X, (float)point.Y));
+    }
+
+    public void HandlePointerMoved(Control owner, PointerEventArgs e, Vector2 position)
+    {
         var delta = position - _lastPosition;
 
         if (_rightPressed)
@@ -142,10 +158,10 @@ public sealed class SceneInteractionManager
         }
         else if (_middlePressed)
         {
-            Scene.Camera.Pan(delta.X, delta.Y, (float)Math.Max(owner.Bounds.Height, 1.0));
+            Scene.Camera.Pan(delta.X, delta.Y, (float)System.Math.Max(owner.Bounds.Height, 1.0));
             _requestRender();
         }
-        else if (_leftPressed && SelectedObject is not null && _pressedPick?.Object == SelectedObject)
+        else if (_leftPressed && SelectedObject is { IsManipulationEnabled: true } && _pressedPick?.Object == SelectedObject)
         {
             if (!_objectDragStarted && Vector2.Distance(position, _pressPosition) > 4f)
             {
@@ -166,7 +182,23 @@ public sealed class SceneInteractionManager
             var hoverPick = Pick(owner, position);
             if (hoverPick is not null)
             {
-                HoveredObject.RaisePointerMoved(CreatePointerArgs(hoverPick, SceneMouseButton.Unknown));
+                HoveredObject.RaisePointerMoved(CreatePointerArgs(hoverPick, position, SceneMouseButton.Unknown));
+            }
+        }
+
+        _lastPosition = position;
+    }
+
+    public void HandlePointerHover(Control owner, PointerEventArgs e, Vector2 position)
+    {
+        UpdateHover(owner, position, SceneMouseButton.Unknown);
+
+        if (HoveredObject is not null)
+        {
+            var hoverPick = Pick(owner, position);
+            if (hoverPick is not null)
+            {
+                HoveredObject.RaisePointerMoved(CreatePointerArgs(hoverPick, position, SceneMouseButton.Unknown));
             }
         }
 
@@ -186,14 +218,14 @@ public sealed class SceneInteractionManager
             return;
         }
 
-        var viewportHeight = (float)Math.Max(owner.Bounds.Height, 1.0);
-        var distance = Math.Max((Scene.Camera.Position - SelectedObject.Position).Length(), 0.1f);
+        var viewportHeight = (float)System.Math.Max(owner.Bounds.Height, 1.0);
+        var distance = System.Math.Max((Scene.Camera.Position - SelectedObject.Position).Length(), 0.1f);
         var worldUnitsPerPixel =
             (2f * MathF.Tan(Scene.Camera.FieldOfViewDegrees * (MathF.PI / 180f) / 2f) * distance) / viewportHeight;
 
         var translation =
             (Scene.Camera.Right * delta.X * worldUnitsPerPixel) +
-            (-Scene.Camera.Up * delta.Y * worldUnitsPerPixel);
+            (-Scene.Camera.SafeUp * delta.Y * worldUnitsPerPixel);
 
         SelectedObject.Position += translation;
     }
@@ -218,7 +250,7 @@ public sealed class SceneInteractionManager
         if (HoveredObject is not null && pick is not null)
         {
             HoveredObject.IsHovered = true;
-            HoveredObject.RaisePointerEntered(CreatePointerArgs(pick, button));
+            HoveredObject.RaisePointerEntered(CreatePointerArgs(pick, position, button));
         }
 
         _requestRender();
@@ -250,10 +282,42 @@ public sealed class SceneInteractionManager
 
     private PickingResult? Pick(Control owner, Vector2 position)
     {
-        var viewport = new Vector2((float)Math.Max(owner.Bounds.Width, 1.0), (float)Math.Max(owner.Bounds.Height, 1.0));
-        return Raycaster.Pick(Scene, position, viewport);
+        var viewport = _getViewportSize?.Invoke() ??
+                       new Vector2((float)System.Math.Max(owner.Bounds.Width, 1.0), (float)System.Math.Max(owner.Bounds.Height, 1.0));
+        var pick = Raycaster.Pick(Scene, position, viewport);
+        return NormalizePickTarget(pick);
     }
 
-    private ScenePointerEventArgs CreatePointerArgs(PickingResult pick, SceneMouseButton button)
-        => new(pick.Object, _lastPosition, pick.WorldPosition, button);
+    private static PickingResult? NormalizePickTarget(PickingResult? pick)
+    {
+        if (pick is null)
+        {
+            return null;
+        }
+
+        var target = ResolveInteractionTarget(pick.Object);
+        return ReferenceEquals(target, pick.Object)
+            ? pick
+            : new PickingResult(target, pick.WorldPosition, pick.Distance);
+    }
+
+    private static Object3D ResolveInteractionTarget(Object3D obj)
+    {
+        Object3D target = obj;
+        var current = obj;
+        while (current.Parent is not null)
+        {
+            if (current.Parent is CompositeObject3D composite && composite.IsManipulationEnabled)
+            {
+                target = composite;
+            }
+
+            current = current.Parent;
+        }
+
+        return target;
+    }
+
+    private static ScenePointerEventArgs CreatePointerArgs(PickingResult pick, Vector2 position, SceneMouseButton button)
+        => new(pick.Object, position, pick.WorldPosition, button);
 }

@@ -3,6 +3,7 @@ using System.Numerics;
 using Avalonia.Controls;
 using Avalonia.Media.Imaging;
 using ThreeDEngine.Core.Geometry;
+using ThreeDEngine.Core.Collision;
 using ThreeDEngine.Core.Scene;
 
 namespace ThreeDEngine.Avalonia.Controls;
@@ -22,6 +23,8 @@ public class ControlPlane3D : Object3D
     {
         Content = content ?? throw new ArgumentNullException(nameof(content));
         Name = string.IsNullOrWhiteSpace(content.Name) ? content.GetType().Name : content.Name;
+        IsManipulationEnabled = false;
+        Collider = new PlaneCollider3D { Size = new Vector2(_width, _height), LocalNormal = Vector3.UnitZ };
     }
 
     public override bool UseMeshRendering => false;
@@ -41,6 +44,7 @@ public class ControlPlane3D : Object3D
             }
 
             _width = value;
+            UpdateColliderSize();
             MarkGeometryDirty();
         }
     }
@@ -57,6 +61,7 @@ public class ControlPlane3D : Object3D
             }
 
             _height = value;
+            UpdateColliderSize();
             MarkGeometryDirty();
         }
     }
@@ -104,12 +109,15 @@ public class ControlPlane3D : Object3D
         RaiseChanged();
     }
 
-    public override Matrix4x4 GetModelMatrix()
+    public override Matrix4x4 GetModelMatrix() => base.GetModelMatrix();
+
+    private void UpdateColliderSize()
     {
-        var radians = RotationDegrees * (System.MathF.PI / 180f);
-        return Matrix4x4.CreateScale(Scale)
-             * Matrix4x4.CreateFromYawPitchRoll(radians.Y, radians.X, radians.Z)
-             * Matrix4x4.CreateTranslation(Position);
+        if (Collider is PlaneCollider3D plane)
+        {
+            plane.Size = new Vector2(_width, _height);
+            plane.LocalNormal = Vector3.UnitZ;
+        }
     }
 
     protected override Mesh3D BuildMesh()

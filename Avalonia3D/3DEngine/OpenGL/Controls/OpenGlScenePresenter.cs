@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.OpenGL;
@@ -20,6 +21,8 @@ public sealed class OpenGlScenePresenter : OpenGlControlBase, IScenePresenter
         Focusable = false;
         ClipToBounds = true;
     }
+
+    public event EventHandler<SceneFrameRenderedEventArgs>? FrameRendered;
 
     public BackendKind Kind => BackendKind.OpenGlDesktop;
     public Control View => this;
@@ -44,7 +47,10 @@ public sealed class OpenGlScenePresenter : OpenGlControlBase, IScenePresenter
 
     protected override void OnOpenGlRender(GlInterface gl, int fb)
     {
-        _renderer.Render(gl, fb, Scene, Bounds);
+        var start = Stopwatch.GetTimestamp();
+        var stats = _renderer.Render(gl, fb, Scene, Bounds);
+        stats.BackendMilliseconds = GetElapsedMilliseconds(start);
+        FrameRendered?.Invoke(this, new SceneFrameRenderedEventArgs(Kind, stats.BackendMilliseconds, stats));
     }
 
     protected override void OnOpenGlDeinit(GlInterface gl)
@@ -66,5 +72,10 @@ public sealed class OpenGlScenePresenter : OpenGlControlBase, IScenePresenter
         {
             RequestNextFrameRendering();
         }
+    }
+
+    private static double GetElapsedMilliseconds(long startTimestamp)
+    {
+        return (Stopwatch.GetTimestamp() - startTimestamp) * 1000d / Stopwatch.Frequency;
     }
 }

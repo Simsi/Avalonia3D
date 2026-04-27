@@ -1,0 +1,69 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    Import this file from Avalonia3D.csproj.
+
+    It prevents helper source-drop projects from being compiled into the main Avalonia3D app.
+    The PropertyGroup handles normal SDK default item discovery. The Target is intentionally
+    repeated before CoreCompile/AssignTargetPaths because some IDE/design-time builds evaluate
+    default items after user imports and would otherwise still include VSIXConnector/*.cs.
+  -->
+
+  <PropertyGroup>
+    <DefaultItemExcludes>$(DefaultItemExcludes);PreviewerApp\**;VSIXConnector\**</DefaultItemExcludes>
+    <DefaultItemExcludes>$(DefaultItemExcludes);$(MSBuildProjectDirectory)\PreviewerApp\**;$(MSBuildProjectDirectory)\VSIXConnector\**</DefaultItemExcludes>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="PreviewerApp\**\*.cs" />
+    <Compile Remove="PreviewerApp/**/*.cs" />
+    <Compile Remove="VSIXConnector\**\*.cs" />
+    <Compile Remove="VSIXConnector/**/*.cs" />
+
+    <EmbeddedResource Remove="PreviewerApp\**\*" />
+    <EmbeddedResource Remove="PreviewerApp/**/*" />
+    <EmbeddedResource Remove="VSIXConnector\**\*" />
+    <EmbeddedResource Remove="VSIXConnector/**/*" />
+
+    <None Remove="PreviewerApp\**\*" />
+    <None Remove="PreviewerApp/**/*" />
+    <None Remove="VSIXConnector\**\*" />
+    <None Remove="VSIXConnector/**/*" />
+
+    <AvaloniaResource Remove="PreviewerApp\**\*" />
+    <AvaloniaResource Remove="PreviewerApp/**/*" />
+    <AvaloniaResource Remove="VSIXConnector\**\*" />
+    <AvaloniaResource Remove="VSIXConnector/**/*" />
+  </ItemGroup>
+
+  <Target Name="ThreeDEngineDropRemoveHelperProjectItems" BeforeTargets="AssignTargetPaths;ResolveReferences;CoreCompile">
+    <ItemGroup>
+      <Compile Remove="PreviewerApp\**\*.cs" />
+      <Compile Remove="PreviewerApp/**/*.cs" />
+      <Compile Remove="VSIXConnector\**\*.cs" />
+      <Compile Remove="VSIXConnector/**/*.cs" />
+      <Compile Remove="$(MSBuildProjectDirectory)\PreviewerApp\**\*.cs" />
+      <Compile Remove="$(MSBuildProjectDirectory)\VSIXConnector\**\*.cs" />
+
+      <EmbeddedResource Remove="PreviewerApp\**\*" />
+      <EmbeddedResource Remove="PreviewerApp/**/*" />
+      <EmbeddedResource Remove="VSIXConnector\**\*" />
+      <EmbeddedResource Remove="VSIXConnector/**/*" />
+      <EmbeddedResource Remove="$(MSBuildProjectDirectory)\PreviewerApp\**\*" />
+      <EmbeddedResource Remove="$(MSBuildProjectDirectory)\VSIXConnector\**\*" />
+
+      <None Remove="PreviewerApp\**\*" />
+      <None Remove="PreviewerApp/**/*" />
+      <None Remove="VSIXConnector\**\*" />
+      <None Remove="VSIXConnector/**/*" />
+      <None Remove="$(MSBuildProjectDirectory)\PreviewerApp\**\*" />
+      <None Remove="$(MSBuildProjectDirectory)\VSIXConnector\**\*" />
+
+      <AvaloniaResource Remove="PreviewerApp\**\*" />
+      <AvaloniaResource Remove="PreviewerApp/**/*" />
+      <AvaloniaResource Remove="VSIXConnector\**\*" />
+      <AvaloniaResource Remove="VSIXConnector/**/*" />
+      <AvaloniaResource Remove="$(MSBuildProjectDirectory)\PreviewerApp\**\*" />
+      <AvaloniaResource Remove="$(MSBuildProjectDirectory)\VSIXConnector\**\*" />
+    </ItemGroup>
+  </Target>
+</Project>

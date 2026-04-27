@@ -17,14 +17,21 @@ public static class ProjectionHelper
         var view = camera.GetViewMatrix();
         var projection = camera.GetProjectionMatrix(aspect);
 
-        Matrix4x4.Invert(view, out var invView);
-        Matrix4x4.Invert(projection, out var invProjection);
+        if (!Matrix4x4.Invert(view, out var invView) || !Matrix4x4.Invert(projection, out var invProjection))
+        {
+            return new Ray(camera.Position, camera.Forward);
+        }
 
         var x = ((2f * viewportPosition.X) / viewportSize.X) - 1f;
         var y = 1f - ((2f * viewportPosition.Y) / viewportSize.Y);
 
         var near = Vector4.Transform(new Vector4(x, y, 0f, 1f), invProjection);
         var far = Vector4.Transform(new Vector4(x, y, 1f, 1f), invProjection);
+
+        if (System.MathF.Abs(near.W) < 0.00001f || System.MathF.Abs(far.W) < 0.00001f)
+        {
+            return new Ray(camera.Position, camera.Forward);
+        }
 
         near /= near.W;
         far /= far.W;
@@ -34,8 +41,13 @@ public static class ProjectionHelper
 
         var origin = new Vector3(worldNear.X, worldNear.Y, worldNear.Z);
         var farPoint = new Vector3(worldFar.X, worldFar.Y, worldFar.Z);
+        var direction = farPoint - origin;
+        if (direction.LengthSquared() < 0.000001f)
+        {
+            direction = camera.Forward;
+        }
 
-        return new Ray(origin, Vector3.Normalize(farPoint - origin));
+        return new Ray(origin, Vector3.Normalize(direction));
     }
 
     public static bool TryProjectToViewport(
@@ -53,7 +65,7 @@ public static class ProjectionHelper
         var projection = camera.GetProjectionMatrix(aspect);
         var clip = Vector4.Transform(Vector4.Transform(new Vector4(worldPosition, 1f), view), projection);
 
-        if (System.MathF.Abs(clip.W) < 0.00001f)
+        if (System.MathF.Abs(clip.W) < 0.00001f || clip.W <= 0f)
         {
             viewportPosition = default;
             normalizedDepth = 1f;
@@ -61,7 +73,7 @@ public static class ProjectionHelper
         }
 
         var ndc = new Vector3(clip.X, clip.Y, clip.Z) / clip.W;
-        if (ndc.Z < -1.1f || ndc.Z > 1.1f)
+        if (ndc.Z < -1.1f || ndc.Z > 1.1f || ndc.X < -1.5f || ndc.X > 1.5f || ndc.Y < -1.5f || ndc.Y > 1.5f)
         {
             viewportPosition = default;
             normalizedDepth = ndc.Z;
@@ -72,6 +84,6 @@ public static class ProjectionHelper
             (ndc.X * 0.5f + 0.5f) * viewportSize.X,
             (1f - (ndc.Y * 0.5f + 0.5f)) * viewportSize.Y);
         normalizedDepth = ndc.Z;
-        return clip.W > 0f;
+        return true;
     }
 }

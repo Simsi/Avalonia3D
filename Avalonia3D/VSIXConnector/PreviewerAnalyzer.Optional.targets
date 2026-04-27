@@ -1,0 +1,8 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    Obsolete compatibility stub.
+    Previous drops used this target to attach a project-level Roslyn analyzer/code-fix.
+    Full preview integration now lives in VSIXConnector/ThreeDEngine.PreviewerVsix.csproj.
+    Keep this file as a no-op so older Avalonia3D.csproj imports do not break the build.
+  -->
+</Project>

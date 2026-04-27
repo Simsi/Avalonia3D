@@ -28,7 +28,7 @@ internal static class SoftwareSceneRenderer
         var commands = new List<DrawCommand>();
         var viewport = new Vector2((float)width, (float)height);
 
-        foreach (var obj in scene.Objects)
+        foreach (var obj in scene.Registry.AllObjects)
         {
             if (!obj.IsVisible)
             {
@@ -61,12 +61,12 @@ internal static class SoftwareSceneRenderer
             var model = obj.GetModelMatrix();
             var mvp = model * view * projection;
 
-            var color = obj.Fill;
-            if (obj.IsHovered)
+            var color = obj.Material.EffectiveColor;
+            if (obj.IsEffectivelyHovered)
             {
                 color = color.BlendTowards(ColorRgba.White, 0.10f);
             }
-            if (obj.IsSelected)
+            if (obj.IsEffectivelySelected)
             {
                 color = color.BlendTowards(ColorRgba.White, 0.22f);
             }
@@ -173,7 +173,19 @@ internal static class SoftwareSceneRenderer
             return false;
         }
 
+        if (clip.W <= 0f)
+        {
+            point = default;
+            return false;
+        }
+
         var ndc = new Vector3(clip.X, clip.Y, clip.Z) / clip.W;
+        if (ndc.Z < -1.1f || ndc.Z > 1.1f || ndc.X < -1.5f || ndc.X > 1.5f || ndc.Y < -1.5f || ndc.Y > 1.5f)
+        {
+            point = default;
+            return false;
+        }
+
         var x = (ndc.X * 0.5 + 0.5) * width;
         var y = (1.0 - (ndc.Y * 0.5 + 0.5)) * height;
         point = new Point(x, y);

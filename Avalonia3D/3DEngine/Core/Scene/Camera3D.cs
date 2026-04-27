@@ -87,6 +87,10 @@ public sealed class Camera3D
             }
 
             _nearPlane = clamped;
+            if (_farPlane <= _nearPlane)
+            {
+                _farPlane = _nearPlane + 1f;
+            }
             RaiseChanged();
         }
     }
@@ -108,7 +112,7 @@ public sealed class Camera3D
     }
 
     public Matrix4x4 GetViewMatrix()
-        => Matrix4x4.CreateLookAt(Position, Target, Up);
+        => Matrix4x4.CreateLookAt(Position, Position + Forward, SafeUp);
 
     public Matrix4x4 GetProjectionMatrix(float aspectRatio)
     {
@@ -120,13 +124,38 @@ public sealed class Camera3D
             FarPlane);
     }
 
-    public Vector3 Forward => Vector3.Normalize(Target - Position);
+    public Vector3 Forward
+    {
+        get
+        {
+            var forward = Target - Position;
+            return forward.LengthSquared() < 0.000001f ? -Vector3.UnitZ : Vector3.Normalize(forward);
+        }
+    }
+
+    public Vector3 SafeUp
+    {
+        get
+        {
+            var up = Up.LengthSquared() < 0.000001f ? Vector3.UnitY : Vector3.Normalize(Up);
+            if (System.MathF.Abs(Vector3.Dot(up, Forward)) > 0.999f)
+            {
+                up = Vector3.UnitY;
+                if (System.MathF.Abs(Vector3.Dot(up, Forward)) > 0.999f)
+                {
+                    up = Vector3.UnitX;
+                }
+            }
+
+            return up;
+        }
+    }
 
     public Vector3 Right
     {
         get
         {
-            var right = Vector3.Cross(Up, Forward);
+            var right = Vector3.Cross(Forward, SafeUp);
             if (right.LengthSquared() < 0.0001f)
             {
                 return Vector3.UnitX;
@@ -139,11 +168,20 @@ public sealed class Camera3D
     public void Orbit(float deltaYawDegrees, float deltaPitchDegrees)
     {
         var offset = Position - Target;
+        if (offset.LengthSquared() < 0.000001f)
+        {
+            offset = -Forward * 0.001f;
+        }
+
         var yaw = Matrix4x4.CreateFromAxisAngle(Vector3.UnitY, DegreesToRadians(deltaYawDegrees));
         var pitch = Matrix4x4.CreateFromAxisAngle(Right, DegreesToRadians(deltaPitchDegrees));
 
         offset = Vector3.Transform(offset, pitch * yaw);
-        if (offset.LengthSquared() < 0.001f)
+        if (offset.LengthSquared() < 0.000001f)
+        {
+            offset = -Forward * 0.001f;
+        }
+        else if (offset.LengthSquared() < 0.001f)
         {
             offset = Vector3.Normalize(offset) * 0.001f;
         }
@@ -161,7 +199,7 @@ public sealed class Camera3D
 
         var translation =
             (-Right * deltaX * worldUnitsPerPixel) +
-            (Up * deltaY * worldUnitsPerPixel);
+            (SafeUp * deltaY * worldUnitsPerPixel);
 
         _position += translation;
         _target += translation;

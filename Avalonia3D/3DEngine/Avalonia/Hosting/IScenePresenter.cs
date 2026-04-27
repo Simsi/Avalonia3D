@@ -6,6 +6,7 @@ namespace ThreeDEngine.Avalonia.Hosting;
 
 public interface IScenePresenter
 {
+    event System.EventHandler<SceneFrameRenderedEventArgs>? FrameRendered;
     BackendKind Kind { get; }
     Control View { get; }
     Scene3D Scene { get; set; }
