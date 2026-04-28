@@ -1,28 +1,25 @@
 # PreviewerApp
 
-Standalone Avalonia process for 3D previews.
+Desktop Avalonia previewer for 3DEngine source-drop projects.
 
-Expected location after copying into the existing application project:
-
-```text
-Avalonia3D/Avalonia3D/
-  3DEngine/
-  PreviewerApp/
-  VSIXConnector/
-  Views/
-  Avalonia3D.csproj
-```
-
-Run from `Avalonia3D/Avalonia3D` after building the host project:
+Manual run:
 
 ```powershell
-dotnet run --project .\PreviewerApp\PreviewerApp.csproj -- --assembly .\bin\Debug\net8.0\Avalonia3D.dll --type Avalonia3D.Views.DemoServerRack3D
+dotnet build .\Avalonia3D.csproj -c Debug
+dotnet run --project .\PreviewerApp\PreviewerApp.csproj -c Debug -- --assembly .\bin\Debug\net8.0\Avalonia3D.dll --type MyNamespace.MyControl3D
 ```
 
-Arguments:
+If the host project is not named `Avalonia3D.csproj`:
 
-```text
---assembly <path-to-target-dll>
---type <optional-full-type-name>
---project <optional-project-path>
+```powershell
+dotnet run --project .\PreviewerApp\PreviewerApp.csproj -c Debug -p:ThreeDEngineHostProject=.\MyHostProject.csproj -- --assembly .\bin\Debug\net8.0\MyHostProject.dll --type MyNamespace.MyControl3D
 ```
+
+Supported previews:
+
+- `CompositeObject3D` with public parameterless constructor.
+- `[Preview3D] public static Object3D Preview()`.
+- `[Preview3D] public static Scene3D PreviewScene()`.
+- `[Preview3D] public static IEnumerable<PreviewScene3D> Previews()`.
+
+The Visual Studio connector builds and launches this app automatically.

@@ -24,12 +24,15 @@ public sealed class HighScaleMaterialVariant3D
     }
 
     public ColorRgba Resolve(CompositePartTemplate3D part)
+        => Resolve(part.MaterialSlot, part.BaseColor);
+
+    public ColorRgba Resolve(int materialSlot, ColorRgba baseColor)
     {
-        if (_partColors.TryGetValue(part.MaterialSlot, out var color))
+        if (_partColors.TryGetValue(materialSlot, out var color))
         {
             return color;
         }
 
-        return DefaultColor ?? part.BaseColor;
+        return DefaultColor ?? baseColor;
     }
 }

@@ -10,7 +10,7 @@ internal static class Program
     public static void Main(string[] args)
     {
         BuildAvaloniaApp()
-            .StartWithClassicDesktopLifetime(args, ShutdownMode.OnMainWindowClose);
+            .StartWithClassicDesktopLifetime(args);
     }
 
     public static AppBuilder BuildAvaloniaApp()
@@ -19,13 +19,16 @@ internal static class Program
             .LogToTrace();
 }
 
-internal sealed record PreviewerArguments(string? AssemblyPath, string? TypeFullName, string? ProjectPath)
+internal sealed class PreviewerArguments
 {
+    public string? AssemblyPath { get; private set; }
+    public string? TypeFullName { get; private set; }
+    public string? ProjectPath { get; private set; }
+    public string? HostProjectPath { get; private set; }
+
     public static PreviewerArguments Parse(string[] args)
     {
-        string? assembly = null;
-        string? type = null;
-        string? project = null;
+        var parsed = new PreviewerArguments();
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -34,21 +37,26 @@ internal sealed record PreviewerArguments(string? AssemblyPath, string? TypeFull
 
             if (key is "--assembly" or "-a")
             {
-                assembly = value;
+                parsed.AssemblyPath = value;
                 i++;
             }
             else if (key is "--type" or "-t")
             {
-                type = value;
+                parsed.TypeFullName = value;
                 i++;
             }
             else if (key is "--project" or "-p")
             {
-                project = value;
+                parsed.ProjectPath = value;
+                i++;
+            }
+            else if (key is "--host-project")
+            {
+                parsed.HostProjectPath = value;
                 i++;
             }
         }
 
-        return new PreviewerArguments(assembly, type, project);
+        return parsed;
     }
 }

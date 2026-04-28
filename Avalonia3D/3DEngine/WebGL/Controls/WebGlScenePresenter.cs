@@ -36,12 +36,14 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
     private bool _moduleReady;
     private bool _initializing;
     private bool _renderPending;
+    private bool _invalidateScheduled;
     private bool _attached;
     private bool _disposed;
     private int _lastSweptUploadRegistryVersion = -1;
     private string? _performanceMetricsText;
     private bool _performanceMetricsVisible;
     private bool _centerCursorVisible;
+    private readonly WebGlRetainedHighScaleRenderer _retainedHighScale = new();
 
     public WebGlScenePresenter()
     {
@@ -145,8 +147,27 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         }
 
         _renderPending = true;
-        InvalidateVisual();
+        ScheduleInvalidateVisual();
     }
+
+    private void ScheduleInvalidateVisual()
+    {
+        if (_disposed || _invalidateScheduled)
+        {
+            return;
+        }
+
+        _invalidateScheduled = true;
+        Dispatcher.UIThread.Post(() =>
+        {
+            _invalidateScheduled = false;
+            if (!_disposed)
+            {
+                InvalidateVisual();
+            }
+        }, DispatcherPriority.Render);
+    }
+
 
     protected override void OnAttachedToVisualTree(VisualTreeAttachmentEventArgs e)
     {
@@ -249,7 +270,12 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         stats.UploadMilliseconds = GetElapsedMilliseconds(uploadStart);
 
         var packetStart = Stopwatch.GetTimestamp();
-        var packet = WebGlScenePacketBuilder.Build(Scene, (float)Bounds.Width, (float)Bounds.Height, stats);
+        var aspect = (float)(Bounds.Width / Math.Max(Bounds.Height, 1d));
+        var viewProjection = Scene.Camera.GetViewMatrix() * Scene.Camera.GetProjectionMatrix(aspect);
+        var retainedBatches = Scene.Performance.EnableRetainedInstanceBuffers
+            ? _retainedHighScale.BuildAndUpload(_hostId, Scene, viewProjection, stats)
+            : null;
+        var packet = WebGlScenePacketBuilder.Build(Scene, (float)Bounds.Width, (float)Bounds.Height, stats, retainedBatches);
         stats.PacketBuildMilliseconds = GetElapsedMilliseconds(packetStart);
 
         var serializeStart = Stopwatch.GetTimestamp();
@@ -259,7 +285,17 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         WebGlInterop.RenderScene(_hostId, json);
         stats.BackendMilliseconds = GetElapsedMilliseconds(start);
 
-        FrameRendered?.Invoke(this, new SceneFrameRenderedEventArgs(Kind, stats.BackendMilliseconds, stats));
+        // In WebAssembly, user callbacks must not invalidate Avalonia visuals
+        // while Control.Render is active. Defer FrameRendered so benchmark UI
+        // updates and telemetry state changes run after the render pass.
+        var frame = new SceneFrameRenderedEventArgs(Kind, stats.BackendMilliseconds, stats);
+        Dispatcher.UIThread.Post(() =>
+        {
+            if (!_disposed)
+            {
+                FrameRendered?.Invoke(this, frame);
+            }
+        }, DispatcherPriority.Background);
     }
 
     private void UploadDirtyMeshGeometry(RenderStats stats)
@@ -271,9 +307,12 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
 
         foreach (var layer in EnumerateHighScaleLayers())
         {
-            foreach (var part in layer.Template.ResolveParts(HighScaleLodLevel3D.Detailed))
+            foreach (var lod in new[] { HighScaleLodLevel3D.Detailed, HighScaleLodLevel3D.Simplified, HighScaleLodLevel3D.Proxy, HighScaleLodLevel3D.Billboard })
             {
-                UploadMeshIfNeeded(part.Mesh, stats);
+                foreach (var part in layer.Template.ResolveParts(lod))
+                {
+                    UploadMeshIfNeeded(part.Mesh, stats);
+                }
             }
         }
     }
@@ -311,7 +350,8 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
             normals[baseIndex + 2] = sourceNormals[i].Z;
         }
 
-        var geometryJson = JsonSerializer.Serialize(new { positions, normals, indices }, JsonOptions);
+        var materialSlots = mesh.MaterialSlots.Length == mesh.Positions.Length ? mesh.MaterialSlots : Array.Empty<float>();
+        var geometryJson = JsonSerializer.Serialize(new { positions, normals, indices, materialSlots }, JsonOptions);
         WebGlInterop.UploadMeshGeometry(_hostId, meshKey, geometryJson);
         _meshGeometryVersions[meshKey] = 0;
         stats.DirtyMeshUploads++;
@@ -410,9 +450,12 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         }
         foreach (var layer in EnumerateHighScaleLayers())
         {
-            foreach (var part in layer.Template.ResolveParts(HighScaleLodLevel3D.Detailed))
+            foreach (var lod in new[] { HighScaleLodLevel3D.Detailed, HighScaleLodLevel3D.Simplified, HighScaleLodLevel3D.Proxy, HighScaleLodLevel3D.Billboard })
             {
-                liveMeshes.Add(part.Mesh.ResourceKey);
+                foreach (var part in layer.Template.ResolveParts(lod))
+                {
+                    liveMeshes.Add(part.Mesh.ResourceKey);
+                }
             }
         }
 
@@ -476,11 +519,14 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
     {
         if (_hostId >= 0)
         {
+            _retainedHighScale.Reset(_hostId);
             WebGlInterop.DestroyHost(_hostId);
             _hostId = -1;
         }
 
         _moduleReady = false;
+        _renderPending = false;
+        _invalidateScheduled = false;
         _textureVersions.Clear();
         _meshGeometryVersions.Clear();
         _lastSweptUploadRegistryVersion = -1;

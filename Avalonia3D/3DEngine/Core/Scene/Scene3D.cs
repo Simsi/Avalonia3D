@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using ThreeDEngine.Core.Collision;
 using ThreeDEngine.Core.Debugging;
+using ThreeDEngine.Core.HighScale;
 using ThreeDEngine.Core.Lighting;
 using ThreeDEngine.Core.Physics;
 using ThreeDEngine.Core.Primitives;
@@ -29,6 +30,8 @@ public sealed class Scene3D
         Collisions = new CollisionWorld3D();
         Registry = new SceneObjectRegistry(this);
         Performance = ScenePerformanceOptions.CreateDefault();
+        FrameInterpolator = new FrameInterpolator3D();
+        AdaptivePerformance = new AdaptivePerformanceController3D();
     }
 
     public event EventHandler? SceneChanged;
@@ -43,6 +46,10 @@ public sealed class Scene3D
     public SceneObjectRegistry Registry { get; }
 
     public ScenePerformanceOptions Performance { get; }
+
+    public FrameInterpolator3D FrameInterpolator { get; }
+
+    public AdaptivePerformanceController3D AdaptivePerformance { get; }
 
     public IPhysicsCore? PhysicsCore { get; set; } = new BasicPhysicsCore();
 
@@ -86,6 +93,7 @@ public sealed class Scene3D
 
         _objects.Add(obj);
         obj.Changed += OnObjectChanged;
+        if (obj is HighScaleInstanceLayer3D highScaleLayer) highScaleLayer.StateChanged += OnHighScaleStateChanged;
         RaiseChanged(SceneChangeKind.Structure, obj);
         return obj;
     }
@@ -185,6 +193,10 @@ public sealed class Scene3D
         PhysicsCore?.Step(this, deltaSeconds);
     }
 
+    public void BeginSimulationTick() => FrameInterpolator.BeginTick(this);
+
+    public void EndSimulationTick() => FrameInterpolator.EndTick(this);
+
     public bool Remove(Object3D obj)
     {
         var removed = _objects.Remove(obj);
@@ -194,6 +206,7 @@ public sealed class Scene3D
         }
 
         obj.Changed -= OnObjectChanged;
+        if (obj is HighScaleInstanceLayer3D highScaleLayer) highScaleLayer.StateChanged -= OnHighScaleStateChanged;
         RaiseChanged(SceneChangeKind.Structure, obj);
         return true;
     }
@@ -203,6 +216,7 @@ public sealed class Scene3D
         foreach (var obj in _objects)
         {
             obj.Changed -= OnObjectChanged;
+            if (obj is HighScaleInstanceLayer3D highScaleLayer) highScaleLayer.StateChanged -= OnHighScaleStateChanged;
         }
 
         _objects.Clear();
@@ -239,6 +253,7 @@ public sealed class Scene3D
         RaiseChanged(kind, source);
     }
 
+    private void OnHighScaleStateChanged(object? sender, EventArgs e) => RaiseChanged(SceneChangeKind.HighScaleState, sender as Object3D);
     private void OnCameraChanged(object? sender, EventArgs e) => RaiseChanged(SceneChangeKind.Camera);
     private void OnLightChanged(object? sender, EventArgs e) => RaiseChanged(SceneChangeKind.Lighting);
     private void OnDebugOptionsChanged(object? sender, EventArgs e) => RaiseChanged(SceneChangeKind.Debug);
@@ -246,7 +261,10 @@ public sealed class Scene3D
     private void RaiseChanged(SceneChangeKind kind, Object3D? source = null)
     {
         _changeVersion++;
-        Registry.Invalidate();
+        if (RequiresRegistryInvalidation(kind))
+        {
+            Registry.Invalidate();
+        }
         if (kind == SceneChangeKind.Structure)
         {
             _structureVersion++;
@@ -261,6 +279,17 @@ public sealed class Scene3D
 
         SceneChangedDetailed?.Invoke(this, args);
         SceneChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private static bool RequiresRegistryInvalidation(SceneChangeKind kind)
+    {
+        return kind == SceneChangeKind.Unknown ||
+               kind == SceneChangeKind.Structure ||
+               kind == SceneChangeKind.Transform ||
+               kind == SceneChangeKind.Geometry ||
+               kind == SceneChangeKind.Visibility ||
+               kind == SceneChangeKind.Physics ||
+               kind == SceneChangeKind.Control;
     }
 
     private static SceneChangedEventArgs Merge(SceneChangedEventArgs? current, SceneChangedEventArgs next)

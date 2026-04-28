@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
@@ -12,9 +12,7 @@ public static class PreviewDiscovery
     public static IReadOnlyList<PreviewDescriptor> Discover(Assembly assembly, string? typeFullName = null)
     {
         var result = new List<PreviewDescriptor>();
-        var types = GetLoadableTypes(assembly)
-            .Where(t => !t.IsAbstract && (typeFullName is null || string.Equals(t.FullName, typeFullName, StringComparison.Ordinal)))
-            .ToArray();
+        var types = ResolveTargetTypes(assembly, typeFullName);
 
         foreach (var type in types)
         {
@@ -47,6 +45,99 @@ public static class PreviewDiscovery
         }
 
         return result;
+    }
+
+
+    public static IReadOnlyList<Type> ResolveTargetTypes(Assembly assembly, string? typeFullName)
+    {
+        var allTypes = GetLoadableTypes(assembly)
+            .Where(t => !t.IsAbstract)
+            .ToArray();
+
+        if (string.IsNullOrWhiteSpace(typeFullName))
+        {
+            return allTypes;
+        }
+
+        var requested = typeFullName.Trim();
+        var requestedClr = requested.Replace('/', '+');
+        var shortName = requestedClr;
+        var lastDot = shortName.LastIndexOf('.');
+        if (lastDot >= 0 && lastDot + 1 < shortName.Length)
+        {
+            shortName = shortName.Substring(lastDot + 1);
+        }
+
+        // First try exact CLR names. Nested classes use Outer+Inner in reflection.
+        var exact = allTypes
+            .Where(t => string.Equals(t.FullName, requestedClr, StringComparison.Ordinal) ||
+                        string.Equals(t.FullName, requested, StringComparison.Ordinal))
+            .ToArray();
+        if (exact.Length > 0)
+        {
+            return exact;
+        }
+
+        // Then tolerate a wrong namespace from the VSIX/source regex. This is common with
+        // file-scoped namespaces, generated source, moved files, and partial classes.
+        var suffixMatches = allTypes
+            .Where(t => t.FullName is not null &&
+                        (t.FullName.EndsWith("." + shortName, StringComparison.Ordinal) ||
+                         t.FullName.EndsWith("+" + shortName, StringComparison.Ordinal) ||
+                         string.Equals(t.Name, shortName, StringComparison.Ordinal)))
+            .OrderByDescending(IsPreviewCandidate)
+            .ThenBy(t => t.FullName, StringComparer.Ordinal)
+            .ToArray();
+        if (suffixMatches.Length > 0)
+        {
+            return suffixMatches;
+        }
+
+        return Array.Empty<Type>();
+    }
+
+    public static IReadOnlyList<string> FindSimilarTypeNames(Assembly assembly, string typeFullName, int maxCount = 12)
+    {
+        if (string.IsNullOrWhiteSpace(typeFullName))
+        {
+            return Array.Empty<string>();
+        }
+
+        var requested = typeFullName.Trim().Replace('/', '+');
+        var shortName = requested;
+        var lastDot = shortName.LastIndexOf('.');
+        if (lastDot >= 0 && lastDot + 1 < shortName.Length)
+        {
+            shortName = shortName.Substring(lastDot + 1);
+        }
+
+        return GetLoadableTypes(assembly)
+            .Where(t => t.FullName is not null)
+            .Where(t => t.FullName!.IndexOf(shortName, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        t.Name.IndexOf(shortName, StringComparison.OrdinalIgnoreCase) >= 0)
+            .OrderByDescending(IsPreviewCandidate)
+            .ThenBy(t => t.FullName, StringComparer.Ordinal)
+            .Select(t => t.FullName!)
+            .Take(System.Math.Max(1, maxCount))
+            .ToArray();
+    }
+
+    private static bool IsPreviewCandidate(Type type)
+    {
+        if (type.GetCustomAttribute<Preview3DAttribute>() is not null)
+        {
+            return true;
+        }
+
+        if (typeof(CompositeObject3D).IsAssignableFrom(type) && type.GetConstructor(Type.EmptyTypes) is not null)
+        {
+            return true;
+        }
+
+        return type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
+            .Any(method => method.GetCustomAttribute<Preview3DAttribute>() is not null &&
+                           method.GetParameters().Length == 0 &&
+                           IsSupportedReturnType(method.ReturnType));
     }
 
     public static IReadOnlyList<PreviewScene3D> Create(PreviewDescriptor descriptor)

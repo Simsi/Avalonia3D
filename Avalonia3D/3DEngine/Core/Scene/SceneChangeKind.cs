@@ -12,5 +12,6 @@ public enum SceneChangeKind
     Control = 7,
     Camera = 8,
     Lighting = 9,
-    Debug = 10
+    Debug = 10,
+    HighScaleState = 11
 }

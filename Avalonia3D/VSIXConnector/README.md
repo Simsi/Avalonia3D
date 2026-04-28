@@ -1,22 +1,33 @@
 # 3DEngine Previewer VSIX Connector
 
-This is a Visual Studio extension project that adds an `Open 3D Preview` command.
+Adds `Open 3D Preview` to Visual Studio.
 
 Build:
 
 ```powershell
-dotnet clean .\Avalonia3D\VSIXConnector\ThreeDEngine.PreviewerVsix.csproj
-dotnet restore .\Avalonia3D\VSIXConnector\ThreeDEngine.PreviewerVsix.csproj
-dotnet build .\Avalonia3D\VSIXConnector\ThreeDEngine.PreviewerVsix.csproj -c Debug
+dotnet build .\ThreeDEngine.PreviewerVsix.csproj -c Debug
 ```
 
-The project also runs `BuildVsix.ps1` after build, because SDK-style VSIX projects do not always emit a `.vsix` with `dotnet build` on every Visual Studio/MSBuild setup.
+If restore fails because `https://api.nuget.org/v3/index.json` is unavailable, see `BUILD_OFFLINE_RU.md`.
 
-Expected outputs:
+Install the generated package:
 
 ```text
-Avalonia3D\VSIXConnector\bin\Debug\net472\ThreeDEngine.PreviewerVsix.vsix
-Avalonia3D\VSIXConnector\bin\Debug\ThreeDEngine.PreviewerVsix.vsix
+VSIXConnector\bin\Debug\ThreeDEngine.PreviewerVsix.vsix
 ```
 
-Install the `.vsix`, then restart Visual Studio.
+Expected project layout:
+
+```text
+Avalonia3D.csproj or another host csproj
+3DEngine\
+PreviewerApp\PreviewerApp.csproj
+VSIXConnector\ThreeDEngine.PreviewerVsix.csproj
+```
+
+The connector detects the active C# class under the caret, builds the host project, builds PreviewerApp with `ThreeDEngineHostProject=<host-csproj>`, and launches the previewer with `--assembly` and `--type`.
+
+
+## v44 install note
+
+Ручная упаковка через `BuildVsix.ps1` отключена. Устанавливай `.vsix`, созданный VSSDK BuildTools, из `bin\Debug\net472`. Подробности: `INSTALL_VSIX_RU.md`.

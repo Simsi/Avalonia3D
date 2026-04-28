@@ -17,6 +17,7 @@ using ThreeDEngine.Core.Interaction;
 using ThreeDEngine.Core.Collision;
 using ThreeDEngine.Core.Navigation;
 using ThreeDEngine.Core.Physics;
+using ThreeDEngine.Core.Rendering;
 using ThreeDEngine.Core.Math;
 using ThreeDEngine.Core.Scene;
 
@@ -31,8 +32,16 @@ public sealed class Scene3DControl : Border
     public static readonly StyledProperty<bool> EnableSceneNavigationProperty = AvaloniaProperty.Register<Scene3DControl, bool>(nameof(EnableSceneNavigation), true);
     public static readonly StyledProperty<SceneMouseLookMode> MouseLookModeProperty = AvaloniaProperty.Register<Scene3DControl, SceneMouseLookMode>(nameof(MouseLookMode), SceneMouseLookMode.ButtonDrag);
     public static readonly StyledProperty<bool> ShowCenterCursorProperty = AvaloniaProperty.Register<Scene3DControl, bool>(nameof(ShowCenterCursor), true);
+    public static readonly StyledProperty<bool> ContinuousRenderingProperty = AvaloniaProperty.Register<Scene3DControl, bool>(nameof(ContinuousRendering), false);
+    public static readonly StyledProperty<double> ContinuousRenderingFpsProperty = AvaloniaProperty.Register<Scene3DControl, double>(nameof(ContinuousRenderingFps), 60d);
+    public static readonly StyledProperty<bool> FpsLockEnabledProperty = AvaloniaProperty.Register<Scene3DControl, bool>(nameof(FpsLockEnabled), true);
+    public static readonly StyledProperty<double> TargetFpsProperty = AvaloniaProperty.Register<Scene3DControl, double>(nameof(TargetFps), 60d);
+    public static readonly StyledProperty<double> UnlockedMaxFpsProperty = AvaloniaProperty.Register<Scene3DControl, double>(nameof(UnlockedMaxFps), 240d);
+    public static readonly StyledProperty<bool> FrameInterpolationEnabledProperty = AvaloniaProperty.Register<Scene3DControl, bool>(nameof(FrameInterpolationEnabled), false);
+    public static readonly StyledProperty<double> FrameInterpolationTickFpsProperty = AvaloniaProperty.Register<Scene3DControl, double>(nameof(FrameInterpolationTickFps), 20d);
+    public static readonly StyledProperty<bool> AdaptivePerformanceEnabledProperty = AvaloniaProperty.Register<Scene3DControl, bool>(nameof(AdaptivePerformanceEnabled), false);
 
-    private const double PerformanceMetricsUpdateIntervalMilliseconds = 250d;
+    private const double PerformanceMetricsUpdateIntervalMilliseconds = 1000d;
 
     private readonly Grid _root;
     private readonly Canvas _hiddenHost;
@@ -41,6 +50,7 @@ public sealed class Scene3DControl : Border
     private readonly Grid _centerCursorHost;
     private readonly DispatcherTimer _snapshotFallbackTimer;
     private readonly DispatcherTimer _navigationTimer;
+    private readonly DispatcherTimer _continuousRenderTimer;
     private readonly HashSet<Key> _pressedKeys;
     private readonly FreeFlyNavigationSettings _freeFlySettings = new();
     private readonly PersonNavigationSettings _personSettings = new();
@@ -70,6 +80,15 @@ public sealed class Scene3DControl : Border
     private long _performanceWindowStartTicks;
     private string? _pendingPerformanceMetricsText;
     private bool _performanceMetricsTextUpdateScheduled;
+    private bool _unlockedRenderPending;
+    private long _lastFrameRenderedTicks;
+    private long _lastFrameAllocatedBytes;
+    private long _lastAllocationWindowTicks;
+    private long _lastAllocationWindowBytes;
+    private int _lastGen0Count;
+    private int _lastGen1Count;
+    private int _lastGen2Count;
+    private double _lastAllocatedMegabytesPerSecond;
 
     public Scene3DControl()
     {
@@ -131,6 +150,15 @@ public sealed class Scene3DControl : Border
         _navigationTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
         _navigationTimer.Tick += OnNavigationTimerTick;
 
+        _continuousRenderTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
+        _continuousRenderTimer.Tick += (_, _) => RequestPresenterRenderOnly();
+        _lastFrameAllocatedBytes = GC.GetTotalAllocatedBytes(false);
+        _lastAllocationWindowBytes = _lastFrameAllocatedBytes;
+        _lastAllocationWindowTicks = Stopwatch.GetTimestamp();
+        _lastGen0Count = GC.CollectionCount(0);
+        _lastGen1Count = GC.CollectionCount(1);
+        _lastGen2Count = GC.CollectionCount(2);
+
         EnsurePresenter();
         _hiddenHost.ZIndex = -1;
         _root.Children.Add(_hiddenHost);
@@ -138,6 +166,8 @@ public sealed class Scene3DControl : Border
         _root.Children.Add(_performanceMetricsHost);
         UpdatePerformanceMetricsVisibility();
         UpdateCenterCursorVisibility();
+        UpdateContinuousRenderTimerState();
+        UpdateRuntimeOptionsFromControl();
 
         _snapshotFallbackTimer = new DispatcherTimer
         {
@@ -197,6 +227,58 @@ public sealed class Scene3DControl : Border
         set => SetValue(ShowCenterCursorProperty, value);
     }
 
+    public bool ContinuousRendering
+    {
+        get => GetValue(ContinuousRenderingProperty);
+        set => SetValue(ContinuousRenderingProperty, value);
+    }
+
+    public double ContinuousRenderingFps
+    {
+        get => GetValue(ContinuousRenderingFpsProperty);
+        set
+        {
+            SetValue(ContinuousRenderingFpsProperty, value);
+            SetValue(TargetFpsProperty, value);
+        }
+    }
+
+    public bool FpsLockEnabled
+    {
+        get => GetValue(FpsLockEnabledProperty);
+        set => SetValue(FpsLockEnabledProperty, value);
+    }
+
+    public double TargetFps
+    {
+        get => GetValue(TargetFpsProperty);
+        set => SetValue(TargetFpsProperty, value);
+    }
+
+    public double UnlockedMaxFps
+    {
+        get => GetValue(UnlockedMaxFpsProperty);
+        set => SetValue(UnlockedMaxFpsProperty, value);
+    }
+
+    public bool FrameInterpolationEnabled
+    {
+        get => GetValue(FrameInterpolationEnabledProperty);
+        set => SetValue(FrameInterpolationEnabledProperty, value);
+    }
+
+    public double FrameInterpolationTickFps
+    {
+        get => GetValue(FrameInterpolationTickFpsProperty);
+        set => SetValue(FrameInterpolationTickFpsProperty, value);
+    }
+
+    public bool AdaptivePerformanceEnabled
+    {
+        get => GetValue(AdaptivePerformanceEnabledProperty);
+        set => SetValue(AdaptivePerformanceEnabledProperty, value);
+    }
+
     public FreeFlyNavigationSettings FreeFlySettings => _freeFlySettings;
 
     public PersonNavigationSettings PersonSettings => _personSettings;
@@ -217,6 +299,7 @@ public sealed class Scene3DControl : Border
             SubscribeToScene(_scene);
             InteractionManager.SetScene(_scene);
             Adapters.SetScene(_scene);
+            UpdateRuntimeOptionsFromControl();
 
             if (_presenter is not null)
             {
@@ -288,6 +371,7 @@ public sealed class Scene3DControl : Border
             SyncControlAdapters();
             UpdateSnapshotTimerState();
             UpdateNavigationTimerState();
+            UpdateContinuousRenderTimerState();
             RequestRender();
         }, DispatcherPriority.Loaded);
     }
@@ -297,6 +381,8 @@ public sealed class Scene3DControl : Border
         base.OnDetachedFromVisualTree(e);
         _snapshotFallbackTimer.Stop();
         _navigationTimer.Stop();
+        _continuousRenderTimer.Stop();
+        _unlockedRenderPending = false;
         _pressedKeys.Clear();
         EndMouseLook();
         _isPointerInsideScene = false;
@@ -613,6 +699,16 @@ public sealed class Scene3DControl : Border
         {
             UpdateCenterCursorVisibility();
         }
+        else if (change.Property == ContinuousRenderingProperty || change.Property == ContinuousRenderingFpsProperty ||
+                 change.Property == FpsLockEnabledProperty || change.Property == TargetFpsProperty || change.Property == UnlockedMaxFpsProperty)
+        {
+            UpdateContinuousRenderTimerState();
+        }
+        else if (change.Property == FrameInterpolationEnabledProperty || change.Property == FrameInterpolationTickFpsProperty ||
+                 change.Property == AdaptivePerformanceEnabledProperty)
+        {
+            UpdateRuntimeOptionsFromControl();
+        }
         else if (change.Property == NavigationModeProperty || change.Property == EnableSceneNavigationProperty || change.Property == MouseLookModeProperty)
         {
             if (!ShouldUseCenterLockedMouseLook())
@@ -687,13 +783,25 @@ public sealed class Scene3DControl : Border
 
     private void OnSceneChanged(object? sender, SceneChangedEventArgs e)
     {
-        if (e.Kind == SceneChangeKind.Structure || e.Kind == SceneChangeKind.Control || _controlAdapters.Count == 0)
+        if (e.Kind == SceneChangeKind.Structure || e.Kind == SceneChangeKind.Control)
         {
             SyncControlAdapters();
         }
 
-        UpdateNavigationTimerState();
-        RequestRender();
+        if (e.Kind != SceneChangeKind.HighScaleState)
+        {
+            UpdateNavigationTimerState();
+            RequestRender();
+            return;
+        }
+
+        // In continuous-render high-scale scenes telemetry state changes are consumed by
+        // the next scheduled frame. Calling RequestNextFrameRendering for every telemetry
+        // batch creates redundant UI render requests and makes frame pacing worse.
+        if (!ContinuousRendering)
+        {
+            RequestRender();
+        }
     }
 
     private void OnObjectClicked(object? sender, ScenePointerEventArgs e)
@@ -729,7 +837,124 @@ public sealed class Scene3DControl : Border
             RefreshDirtyControlSnapshots();
         }
 
+        RequestPresenterRenderOnly();
+    }
+
+    private void RequestPresenterRenderOnly()
+    {
         _presenter?.RequestRender();
+    }
+
+    private void RequestUnlockedFrameSoon()
+    {
+        if (_unlockedRenderPending || !ContinuousRendering || FpsLockEnabled || TopLevel.GetTopLevel(this) is null)
+        {
+            return;
+        }
+
+        _unlockedRenderPending = true;
+        Dispatcher.UIThread.Post(() =>
+        {
+            _unlockedRenderPending = false;
+            if (ContinuousRendering && !FpsLockEnabled && TopLevel.GetTopLevel(this) is not null)
+            {
+                RequestPresenterRenderOnly();
+            }
+        }, DispatcherPriority.Render);
+    }
+
+    private void UpdateContinuousRenderTimerState()
+    {
+        var target = FpsLockEnabled ? TargetFps : UnlockedMaxFps;
+        target = System.Math.Clamp(target <= 0d ? 60d : target, 1d, 500d);
+        _continuousRenderTimer.Interval = TimeSpan.FromMilliseconds(1000d / target);
+
+        if (ContinuousRendering && TopLevel.GetTopLevel(this) is not null && FpsLockEnabled)
+        {
+            if (!_continuousRenderTimer.IsEnabled)
+            {
+                _continuousRenderTimer.Start();
+            }
+        }
+        else if (_continuousRenderTimer.IsEnabled)
+        {
+            _continuousRenderTimer.Stop();
+        }
+
+        if (ContinuousRendering && !FpsLockEnabled)
+        {
+            RequestUnlockedFrameSoon();
+        }
+    }
+
+    private double EffectiveTargetFps => FpsLockEnabled ? System.Math.Clamp(TargetFps, 1d, 500d) : System.Math.Clamp(UnlockedMaxFps, 1d, 500d);
+
+    private void UpdateRuntimeOptionsFromControl()
+    {
+        Scene.FrameInterpolator.Enabled = FrameInterpolationEnabled;
+        Scene.FrameInterpolator.SimulationTickFps = System.Math.Clamp(FrameInterpolationTickFps, 1d, 240d);
+        Scene.AdaptivePerformance.Enabled = AdaptivePerformanceEnabled;
+        Scene.Performance.AdaptivePerformanceEnabled = AdaptivePerformanceEnabled;
+    }
+
+    private void UpdateRuntimeStats(RenderStats stats)
+    {
+        var now = Stopwatch.GetTimestamp();
+        var allocated = GC.GetTotalAllocatedBytes(false);
+        var frameAllocated = allocated - _lastFrameAllocatedBytes;
+        if (frameAllocated < 0) frameAllocated = 0;
+        _lastFrameAllocatedBytes = allocated;
+
+        if (_lastAllocationWindowTicks == 0)
+        {
+            _lastAllocationWindowTicks = now;
+            _lastAllocationWindowBytes = allocated;
+        }
+
+        var allocElapsed = (now - _lastAllocationWindowTicks) * 1000d / Stopwatch.Frequency;
+        if (allocElapsed >= 250d)
+        {
+            var allocDelta = allocated - _lastAllocationWindowBytes;
+            _lastAllocatedMegabytesPerSecond = allocDelta <= 0 ? 0d : (allocDelta / (1024d * 1024d)) / (allocElapsed / 1000d);
+            _lastAllocationWindowBytes = allocated;
+            _lastAllocationWindowTicks = now;
+        }
+
+        var gen0 = GC.CollectionCount(0);
+        var gen1 = GC.CollectionCount(1);
+        var gen2 = GC.CollectionCount(2);
+        stats.Gen0Collections = gen0 - _lastGen0Count;
+        stats.Gen1Collections = gen1 - _lastGen1Count;
+        stats.Gen2Collections = gen2 - _lastGen2Count;
+        _lastGen0Count = gen0;
+        _lastGen1Count = gen1;
+        _lastGen2Count = gen2;
+
+        stats.AllocatedBytesPerFrame = frameAllocated;
+        stats.AllocatedMegabytesPerSecond = _lastAllocatedMegabytesPerSecond;
+        stats.ManagedAllocatedBytes = allocated;
+        stats.ManagedHeapBytes = GC.GetTotalMemory(false);
+        stats.FrameTotalMilliseconds = stats.BackendMilliseconds;
+        if (_lastFrameRenderedTicks != 0)
+        {
+            var realFrameMs = (now - _lastFrameRenderedTicks) * 1000d / Stopwatch.Frequency;
+            stats.FrameTotalMilliseconds = realFrameMs;
+            var expectedMs = 1000d / EffectiveTargetFps;
+            stats.RenderScheduleDelayMilliseconds = System.Math.Max(0d, realFrameMs - expectedMs);
+            stats.SchedulerDelayMilliseconds = stats.RenderScheduleDelayMilliseconds;
+        }
+        _lastFrameRenderedTicks = now;
+
+        stats.FpsLocked = FpsLockEnabled;
+        stats.TargetFps = EffectiveTargetFps;
+        stats.ContinuousRendering = ContinuousRendering;
+        stats.FrameInterpolationEnabled = FrameInterpolationEnabled;
+        stats.AdaptivePerformanceEnabled = AdaptivePerformanceEnabled;
+        stats.InterpolationAlpha = Scene.FrameInterpolator.Alpha;
+
+        Scene.AdaptivePerformance.Enabled = AdaptivePerformanceEnabled;
+        Scene.AdaptivePerformance.RecordFrame(stats, Scene.Performance, EffectiveTargetFps);
+        stats.AdaptiveQualityScale = Scene.AdaptivePerformance.QualityScale;
     }
 
 
@@ -741,7 +966,13 @@ public sealed class Scene3DControl : Border
             return;
         }
 
+        var statsForRuntime = e.Stats ?? ThreeDEngine.Core.Rendering.RenderStats.Empty;
+        UpdateRuntimeStats(statsForRuntime);
         FrameRendered?.Invoke(this, e);
+        if (ContinuousRendering && !FpsLockEnabled)
+        {
+            RequestUnlockedFrameSoon();
+        }
 
         if (!ShowPerformanceMetrics)
         {
@@ -766,7 +997,7 @@ public sealed class Scene3DControl : Border
 
         var fps = _performanceFrameCount * 1000d / elapsedMilliseconds;
         var averageFrameMilliseconds = _performanceFrameMillisecondsTotal / System.Math.Max(_performanceFrameCount, 1);
-        var stats = e.Stats ?? ThreeDEngine.Core.Rendering.RenderStats.Empty;
+        var stats = statsForRuntime;
 
         // FrameRendered may be raised while Avalonia is inside a render pass.
         // Updating TextBlock.Text there invalidates the visual tree during render.
@@ -777,12 +1008,14 @@ public sealed class Scene3DControl : Border
             $"Backend: {e.Backend}\n" +
             $"Objects: {stats.ObjectCount} | Renderables: {stats.RenderableCount} | Pickables: {stats.PickableCount} | Colliders: {stats.ColliderCount}\n" +
             $"HighScale: {stats.HighScaleInstanceCount} | Chunks: {stats.VisibleChunkCount}/{stats.TotalChunkCount} | Culled: {stats.CulledObjectCount}\n" +
-            $"LOD S/P/B: {stats.LodSimplifiedCount}/{stats.LodProxyCount}/{stats.LodBillboardCount}\n" +
+            $"LOD D/S/P/B/C: {stats.LodDetailedCount}/{stats.LodSimplifiedCount}/{stats.LodProxyCount}/{stats.LodBillboardCount}/{stats.LodCulledCount} | PartInst: {stats.HighScaleVisiblePartInstanceCount}\n" +
             $"Draw: {stats.DrawCallCount} | Batches: {stats.InstancedBatchCount} | Tris: {stats.TriangleCount}\n" +
-            $"InstUpload: {stats.InstanceUploadBytes / (1024d * 1024d):0.00} MB | TexUpload: {stats.TextureUploadBytes / (1024d * 1024d):0.00} MB\n" +
+            $"TransformUpload: {stats.InstanceUploadBytes / (1024d * 1024d):0.00} MB | StateUpload: {stats.StateUploadBytes / 1024d:0.0} KB | TexUpload: {stats.TextureUploadBytes / (1024d * 1024d):0.00} MB\n" +
             $"Packet: {stats.PacketBuildMilliseconds:0.00} ms | Ser: {stats.SerializationMilliseconds:0.00} ms | Upload: {stats.UploadMilliseconds:0.00} ms | Backend: {stats.BackendMilliseconds:0.00} ms\n" +
             $"Pick: {stats.PickingMilliseconds:0.00} ms | Phys: {stats.PhysicsMilliseconds:0.00} ms | Live: {stats.LiveSnapshotMilliseconds:0.00} ms\n" +
-            $"Managed alloc: {stats.ManagedAllocatedBytes / (1024d * 1024d):0.00} MB | MeshCache: {stats.MeshCacheCount} | Registry: {stats.RegistryVersion}";
+            $"Alloc: {stats.AllocatedMegabytesPerSecond:0.00} MB/s | FrameAlloc: {stats.AllocatedBytesPerFrame / 1024d:0.0} KB | GC: {stats.Gen0Collections}/{stats.Gen1Collections}/{stats.Gen2Collections} | Heap: {stats.ManagedHeapBytes / (1024d * 1024d):0.0} MB\n" +
+            $"FPSLock: {(stats.FpsLocked ? "on" : "off")} {stats.TargetFps:0} | Interp: {(stats.FrameInterpolationEnabled ? "on" : "off")} a={stats.InterpolationAlpha:0.00} | Adaptive: {(stats.AdaptivePerformanceEnabled ? "on" : "off")} q={stats.AdaptiveQualityScale:0.00} | Delay: {stats.RenderScheduleDelayMilliseconds:0.00} ms\n" +
+            $"MeshCache: {stats.MeshCacheCount} | Registry: {stats.RegistryVersion}";
         SchedulePerformanceMetricsTextUpdate();
 
         _performanceFrameCount = 0;

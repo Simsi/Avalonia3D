@@ -9,5 +9,5 @@ internal static class Open3DPreviewCommandPackageGuids
 internal static class Open3DPreviewCommandPackageIds
 {
     public const int Open3DPreviewCommandId = 0x0100;
-    public const int Open3DPreviewContextCommandId = 0x0101;
+    public const int ShowDiagnosticsCommandId = 0x0101;
 }

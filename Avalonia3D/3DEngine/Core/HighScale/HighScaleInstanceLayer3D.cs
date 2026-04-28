@@ -11,10 +11,17 @@ namespace ThreeDEngine.Core.HighScale;
 /// Runtime layer for very large repeated-object scenes. It keeps repeated logical objects
 /// in a dense InstanceStore and a spatial chunk index instead of expanding them into
 /// thousands of Object3D parts.
+///
+/// Data-flow rule: transform/structure changes may dirty chunks; status/material/visibility
+/// telemetry changes update StateBuffer only and are surfaced through StateChanged.
+/// Renderers should update a small GPU state buffer rather than rebuilding transform batches.
 /// </summary>
 public sealed class HighScaleInstanceLayer3D : Object3D
 {
     private int _materialResolverVersion;
+    private bool _suppressStateChanged;
+    private bool _pendingStateChanged;
+    private bool _pendingStructuralChanged;
 
     public HighScaleInstanceLayer3D(CompositeTemplate3D template, int initialCapacity = 1024, float chunkCellSize = 24f)
     {
@@ -22,21 +29,26 @@ public sealed class HighScaleInstanceLayer3D : Object3D
         Instances = new InstanceStore3D(initialCapacity);
         Chunks = new HighScaleChunkIndex3D(chunkCellSize);
         LodPolicy = new HighScaleLodPolicy3D();
+        StateBuffer = new InstanceStateBuffer3D(initialCapacity);
         Name = template.Name + " Instances";
         IsPickable = false;
         IsManipulationEnabled = false;
     }
 
+    public event EventHandler? StateChanged;
+
     public CompositeTemplate3D Template { get; }
     public InstanceStore3D Instances { get; }
     public HighScaleChunkIndex3D Chunks { get; }
     public HighScaleLodPolicy3D LodPolicy { get; }
+    public InstanceStateBuffer3D StateBuffer { get; }
     public int MaterialResolverVersion => _materialResolverVersion;
 
     /// <summary>
-    /// Optional fast state-to-color hook. It is called only while rebuilding dirty GPU chunks;
-    /// avoid allocations inside this delegate. Calling MarkMaterialsDirty forces cached chunks
-    /// to be rebuilt.
+    /// Optional state-to-color hook. The retained renderer evaluates it when updating the
+    /// per-instance state-color buffer. It should be deterministic and allocation-free.
+    /// Calling MarkMaterialsDirty forces state buffers to be rewritten but does not dirty
+    /// transform/chunk buffers.
     /// </summary>
     public Func<CompositePartTemplate3D, InstanceRecord3D, ColorRgba>? ColorResolver { get; set; }
 
@@ -46,8 +58,10 @@ public sealed class HighScaleInstanceLayer3D : Object3D
     public int AddInstance(Matrix4x4 transform, int materialVariantId = 0, int dataId = -1, InstanceFlags3D flags = InstanceFlags3D.Visible | InstanceFlags3D.Pickable)
     {
         var index = Instances.Add(Template.Id, transform, materialVariantId, dataId, flags);
+        StateBuffer.SetMaterialVariant(index, materialVariantId);
+        StateBuffer.SetFlags(index, (byte)Instances[index].Flags);
         Chunks.AddInstance(index, transform, Template.LocalBounds);
-        RaiseChanged();
+        RaiseStructuralChanged();
         return index;
     }
 
@@ -67,32 +81,34 @@ public sealed class HighScaleInstanceLayer3D : Object3D
         Instances.SetTransform(index, transform);
         Chunks.UpdateInstance(index, transform, Template.LocalBounds);
         if (Chunks.RebuildRequested) Chunks.Rebuild(Instances, Template.LocalBounds);
-        RaiseChanged();
+        RaiseStructuralChanged();
     }
 
     public void SetInstanceMaterialVariant(int index, int materialVariantId)
     {
         Instances.SetMaterialVariant(index, materialVariantId);
-        Chunks.MarkInstanceDirty(index);
-        RaiseChanged();
+        if (StateBuffer.SetMaterialVariant(index, materialVariantId))
+        {
+            RaiseStateChanged();
+        }
     }
 
     public void SetInstanceVisible(int index, bool visible)
     {
         Instances.SetVisible(index, visible);
-        Chunks.MarkInstanceDirty(index);
-        RaiseChanged();
+        var stateFlags = (byte)Instances[index].Flags;
+        if (StateBuffer.SetFlags(index, stateFlags))
+        {
+            RaiseStateChanged();
+        }
     }
 
     public void MarkMaterialsDirty()
     {
         _materialResolverVersion++;
         Instances.MarkAllMaterialsDirty();
-        foreach (var chunk in Chunks.Chunks)
-        {
-            chunk.MarkDirty();
-        }
-        RaiseChanged();
+        StateBuffer.MarkAllDirty(Instances.Count);
+        RaiseStateChanged();
     }
 
     public HighScaleTelemetryBatch BeginTelemetryBatch() => new(this);
@@ -109,6 +125,63 @@ public sealed class HighScaleInstanceLayer3D : Object3D
 
     protected override Mesh3D BuildMesh() => Mesh3D.Empty;
 
+    internal bool SuppressChanged { get; set; }
+
+    internal void NotifyChanged() => RaiseStructuralChanged();
+
+    internal void BeginDeferredChanges()
+    {
+        SuppressChanged = true;
+        _suppressStateChanged = true;
+    }
+
+    internal void EndDeferredChanges()
+    {
+        SuppressChanged = false;
+        _suppressStateChanged = false;
+        FlushDeferredChanges();
+    }
+
+    private void RaiseStructuralChanged()
+    {
+        if (SuppressChanged)
+        {
+            _pendingStructuralChanged = true;
+            return;
+        }
+
+        base.RaiseChanged();
+    }
+
+    private void RaiseStateChanged()
+    {
+        if (_suppressStateChanged)
+        {
+            _pendingStateChanged = true;
+            return;
+        }
+
+        StateChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    internal void FlushDeferredChanges()
+    {
+        var structural = _pendingStructuralChanged;
+        var state = _pendingStateChanged;
+        _pendingStructuralChanged = false;
+        _pendingStateChanged = false;
+
+        if (structural)
+        {
+            base.RaiseChanged();
+        }
+
+        if (state)
+        {
+            StateChanged?.Invoke(this, EventArgs.Empty);
+        }
+    }
+
     private sealed class DeferredChangeScope : IDisposable
     {
         private readonly HighScaleInstanceLayer3D _layer;
@@ -117,27 +190,14 @@ public sealed class HighScaleInstanceLayer3D : Object3D
         public DeferredChangeScope(HighScaleInstanceLayer3D layer)
         {
             _layer = layer;
-            _layer.SuppressChanged = true;
+            _layer.BeginDeferredChanges();
         }
 
         public void Dispose()
         {
             if (_disposed) return;
             _disposed = true;
-            _layer.SuppressChanged = false;
-            _layer.NotifyChanged();
-        }
-    }
-
-    internal bool SuppressChanged { get; set; }
-
-    internal void NotifyChanged() => RaiseChanged();
-
-    protected override void RaiseChanged()
-    {
-        if (!SuppressChanged)
-        {
-            base.RaiseChanged();
+            _layer.EndDeferredChanges();
         }
     }
 }
@@ -149,7 +209,7 @@ public readonly struct HighScaleTelemetryBatch : IDisposable
     internal HighScaleTelemetryBatch(HighScaleInstanceLayer3D layer)
     {
         _layer = layer;
-        _layer.SuppressChanged = true;
+        _layer.BeginDeferredChanges();
     }
 
     public void SetMaterialVariant(int index, int materialVariantId) => _layer.SetInstanceMaterialVariant(index, materialVariantId);
@@ -158,7 +218,6 @@ public readonly struct HighScaleTelemetryBatch : IDisposable
 
     public void Dispose()
     {
-        _layer.SuppressChanged = false;
-        _layer.NotifyChanged();
+        _layer.EndDeferredChanges();
     }
 }

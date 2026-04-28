@@ -134,7 +134,8 @@ public sealed class Scene3DPreviewControl : UserControl
 
         _viewport.Scene = preview.Scene;
         BuildPartList();
-        _inspectorText.Text = $"Preview: {preview.Name}";
+        var report = PreviewComplexityReport3D.Analyze(preview.Scene);
+        _inspectorText.Text = $"Preview: {preview.Name}\n\n" + report.Summary;
     }
 
     public void ClearPreview()

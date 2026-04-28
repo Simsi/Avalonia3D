@@ -8,23 +8,26 @@
       <Group guid="guidThreeDEnginePreviewerCommandSet" id="ThreeDEnginePreviewerToolsGroup" priority="0x0600">
         <Parent guid="guidSHLMainMenu" id="IDM_VS_MENU_TOOLS" />
       </Group>
-      <Group guid="guidThreeDEnginePreviewerCommandSet" id="ThreeDEnginePreviewerEditorGroup" priority="0x0600">
-        <Parent guid="guidSHLMainMenu" id="IDM_VS_CTXT_CODEWIN" />
-      </Group>
     </Groups>
 
     <Buttons>
       <Button guid="guidThreeDEnginePreviewerCommandSet" id="cmdidOpen3DPreview" priority="0x0100" type="Button">
         <Parent guid="guidThreeDEnginePreviewerCommandSet" id="ThreeDEnginePreviewerToolsGroup" />
+        <CommandFlag>TextChanges</CommandFlag>
         <Strings>
           <ButtonText>Open 3D Preview</ButtonText>
+          <CommandName>3DEngine.Open3DPreview</CommandName>
+          <LocCanonicalName>Tools.Open3DPreview</LocCanonicalName>
         </Strings>
       </Button>
 
-      <Button guid="guidThreeDEnginePreviewerCommandSet" id="cmdidOpen3DPreviewContext" priority="0x0100" type="Button">
-        <Parent guid="guidThreeDEnginePreviewerCommandSet" id="ThreeDEnginePreviewerEditorGroup" />
+      <Button guid="guidThreeDEnginePreviewerCommandSet" id="cmdidShowDiagnostics" priority="0x0200" type="Button">
+        <Parent guid="guidThreeDEnginePreviewerCommandSet" id="ThreeDEnginePreviewerToolsGroup" />
+        <CommandFlag>TextChanges</CommandFlag>
         <Strings>
-          <ButtonText>Open 3D Preview</ButtonText>
+          <ButtonText>Show 3DEngine Previewer Diagnostics</ButtonText>
+          <CommandName>3DEngine.ShowPreviewerDiagnostics</CommandName>
+          <LocCanonicalName>Tools.ThreeDEnginePreviewerDiagnostics</LocCanonicalName>
         </Strings>
       </Button>
     </Buttons>
@@ -34,9 +37,8 @@
     <GuidSymbol name="guidThreeDEnginePreviewerPackage" value="{d9f3b129-4b58-4ae5-bd4f-1ab60a6d3f20}" />
     <GuidSymbol name="guidThreeDEnginePreviewerCommandSet" value="{ccf7cd52-f9ea-4d4f-b19d-3a739b96e3b2}">
       <IDSymbol name="ThreeDEnginePreviewerToolsGroup" value="0x1020" />
-      <IDSymbol name="ThreeDEnginePreviewerEditorGroup" value="0x1021" />
       <IDSymbol name="cmdidOpen3DPreview" value="0x0100" />
-      <IDSymbol name="cmdidOpen3DPreviewContext" value="0x0101" />
+      <IDSymbol name="cmdidShowDiagnostics" value="0x0101" />
     </GuidSymbol>
   </Symbols>
 </CommandTable>

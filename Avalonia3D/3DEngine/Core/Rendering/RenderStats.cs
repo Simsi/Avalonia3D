@@ -24,12 +24,19 @@ public sealed class RenderStats
     public int SceneTraversalCount { get; set; }
     public int TotalChunkCount { get; set; }
     public int VisibleChunkCount { get; set; }
+    public int LodDetailedCount { get; set; }
     public int LodSimplifiedCount { get; set; }
     public int LodProxyCount { get; set; }
     public int LodBillboardCount { get; set; }
+    public int LodCulledCount { get; set; }
+    public int HighScaleVisiblePartInstanceCount { get; set; }
     public int InstanceBufferUploads { get; set; }
     public int InstanceBufferSubDataUploads { get; set; }
+    public int StateBufferUploads { get; set; }
+    public int StateBufferSubDataUploads { get; set; }
     public long InstanceUploadBytes { get; set; }
+    public long TransformUploadBytes { get; set; }
+    public long StateUploadBytes { get; set; }
     public double PacketBuildMilliseconds { get; set; }
     public double SerializationMilliseconds { get; set; }
     public double UploadMilliseconds { get; set; }
@@ -37,7 +44,30 @@ public sealed class RenderStats
     public double PickingMilliseconds { get; set; }
     public double PhysicsMilliseconds { get; set; }
     public double LiveSnapshotMilliseconds { get; set; }
+    public double CpuPreparationMilliseconds { get; set; }
+    public double HighScalePlanMilliseconds { get; set; }
+    public double HighScaleBufferBuildMilliseconds { get; set; }
+    public double HighScaleUploadMilliseconds { get; set; }
+    public double SchedulerDelayMilliseconds { get; set; }
+    public double FrameTotalMilliseconds { get; set; }
+    public double RenderScheduleDelayMilliseconds { get; set; }
+    public double AllocatedMegabytesPerSecond { get; set; }
+    public long AllocatedBytesPerFrame { get; set; }
+    public long ManagedHeapBytes { get; set; }
+    public int Gen0Collections { get; set; }
+    public int Gen1Collections { get; set; }
+    public int Gen2Collections { get; set; }
+    public double AdaptiveQualityScale { get; set; } = 1d;
+    public bool FpsLocked { get; set; }
+    public double TargetFps { get; set; }
+    public bool ContinuousRendering { get; set; }
+    public bool FrameInterpolationEnabled { get; set; }
+    public bool AdaptivePerformanceEnabled { get; set; }
+    public double InterpolationAlpha { get; set; }
     public long ManagedAllocatedBytes { get; set; }
+    public int RenderTargetWidth { get; set; }
+    public int RenderTargetHeight { get; set; }
+    public int BakedHighScalePartDraws { get; set; }
 
     public static RenderStats Empty { get; } = new RenderStats();
 }

@@ -1,33 +1,24 @@
-# Integration
+# Integration notes
 
-Keep only this import in `Avalonia3D.csproj`:
+Import `VSIXConnector\EngineDrop.Exclusions.targets` from the main host csproj if PreviewerApp and VSIXConnector are stored inside the same project folder as the source-drop engine.
+
+Example:
 
 ```xml
 <Import Project="VSIXConnector\EngineDrop.Exclusions.targets" Condition="Exists('VSIXConnector\EngineDrop.Exclusions.targets')" />
 ```
 
-Remove old analyzer imports:
+This prevents the main Avalonia app from compiling PreviewerApp and VSIXConnector source files as normal application source.
 
-```xml
-<Import Project="VSIXConnector\PreviewerAnalyzer.Optional.targets" Condition="Exists('VSIXConnector\PreviewerAnalyzer.Optional.targets')" />
-```
-
-Build VSIX:
+Build VSIX separately:
 
 ```powershell
-dotnet clean .\Avalonia3D\VSIXConnector\ThreeDEngine.PreviewerVsix.csproj
-dotnet restore .\Avalonia3D\VSIXConnector\ThreeDEngine.PreviewerVsix.csproj
-dotnet build .\Avalonia3D\VSIXConnector\ThreeDEngine.PreviewerVsix.csproj -c Debug
+cd .\VSIXConnector
+dotnet build .\ThreeDEngine.PreviewerVsix.csproj -c Debug
 ```
 
-Install:
+Manual PreviewerApp build when host project name differs:
 
-```text
-Avalonia3D\VSIXConnector\bin\Debug\ThreeDEngine.PreviewerVsix.vsix
-```
-
-If that file is not present, check:
-
-```text
-Avalonia3D\VSIXConnector\bin\Debug\net472\ThreeDEngine.PreviewerVsix.vsix
+```powershell
+dotnet build .\PreviewerApp\PreviewerApp.csproj -c Debug -p:ThreeDEngineHostProject=.\MyHostProject.csproj
 ```

@@ -17,7 +17,7 @@ public sealed class CompositeTemplate3D
         : this(id, name, new Dictionary<HighScaleLodLevel3D, IReadOnlyList<CompositePartTemplate3D>>
         {
             [HighScaleLodLevel3D.Detailed] = parts,
-            [HighScaleLodLevel3D.Simplified] = parts,
+            [HighScaleLodLevel3D.Simplified] = BuildSimplifiedParts(name, parts),
             [HighScaleLodLevel3D.Proxy] = BuildProxyParts(name, parts)
         })
     {
@@ -76,6 +76,46 @@ public sealed class CompositeTemplate3D
         return part.BaseColor;
     }
 
+    public ColorRgba ResolveColor(int materialSlot, ColorRgba baseColor, int materialVariantId)
+    {
+        if (_materialVariants.TryGetValue(materialVariantId, out var variant))
+        {
+            return variant.Resolve(materialSlot, baseColor);
+        }
+
+        return baseColor;
+    }
+
+    private static IReadOnlyList<CompositePartTemplate3D> BuildSimplifiedParts(string name, IReadOnlyList<CompositePartTemplate3D> parts)
+    {
+        var bounds = ComputeBounds(parts);
+        if (!bounds.IsValid)
+        {
+            return parts;
+        }
+
+        var size = bounds.Size;
+        if (size.X <= 0f || size.Y <= 0f || size.Z <= 0f)
+        {
+            return parts;
+        }
+
+        var mesh = MeshFactory.CreateExtrudedRectangle(size.X, size.Y, size.Z);
+        var center = bounds.Center;
+        var local = Matrix4x4.CreateTranslation(center);
+        return new[]
+        {
+            new CompositePartTemplate3D(
+                name + " Simplified",
+                mesh,
+                new MeshResourceKey(mesh.ResourceKey),
+                materialSlot: 0,
+                localTransform: local,
+                baseColor: new ColorRgba(0.40f, 0.46f, 0.54f, 1f),
+                lightingMode: LightingMode.Lambert)
+        };
+    }
+
     private static IReadOnlyList<CompositePartTemplate3D> BuildProxyParts(string name, IReadOnlyList<CompositePartTemplate3D> parts)
     {
         var bounds = ComputeBounds(parts);
@@ -131,7 +171,8 @@ public sealed class CompositePartTemplate3D
         int materialSlot,
         Matrix4x4 localTransform,
         ColorRgba baseColor,
-        LightingMode lightingMode)
+        LightingMode lightingMode,
+        IReadOnlyList<ColorRgba>? materialSlotBaseColors = null)
     {
         Name = name;
         Mesh = mesh;
@@ -140,6 +181,7 @@ public sealed class CompositePartTemplate3D
         LocalTransform = localTransform;
         BaseColor = baseColor;
         LightingMode = lightingMode;
+        MaterialSlotBaseColors = materialSlotBaseColors ?? Array.Empty<ColorRgba>();
     }
 
     public string Name { get; }
@@ -149,4 +191,7 @@ public sealed class CompositePartTemplate3D
     public Matrix4x4 LocalTransform { get; }
     public ColorRgba BaseColor { get; }
     public LightingMode LightingMode { get; }
+    public IReadOnlyList<ColorRgba> MaterialSlotBaseColors { get; }
+    public bool UsesVertexMaterialSlots => Mesh.HasMaterialSlots && MaterialSlotBaseColors.Count > 0;
 }
+

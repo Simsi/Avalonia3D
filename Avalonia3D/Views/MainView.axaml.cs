@@ -39,10 +39,23 @@ public partial class MainView : UserControl
     private TextBox _simplifiedLodText = null!;
     private TextBox _proxyLodText = null!;
     private TextBox _logIntervalText = null!;
+    private TextBox _drawDistanceText = null!;
+    private TextBox _fadeDistanceText = null!;
     private CheckBox _overlayCheck = null!;
     private CheckBox _loggingCheck = null!;
     private CheckBox _telemetryCheck = null!;
     private CheckBox _animateCheck = null!;
+    private CheckBox _continuousCheck = null!;
+    private CheckBox _compactProxiesCheck = null!;
+    private CheckBox _fpsLockCheck = null!;
+    private CheckBox _frameInterpolationCheck = null!;
+    private CheckBox _adaptivePerformanceCheck = null!;
+    private TextBox _targetFpsText = null!;
+    private TextBox _unlockedMaxFpsText = null!;
+    private TextBox _frameTickFpsText = null!;
+    private TextBox _telemetryFrameBudgetText = null!;
+    private CheckBox _bakedMeshCheck = null!;
+    private CheckBox _paletteTextureCheck = null!;
 
     private HighScaleInstanceLayer3D? _layer;
     private string _scenarioName = "Simple markers";
@@ -53,8 +66,11 @@ public partial class MainView : UserControl
     private int _telemetryAppliedInWindow;
     private int _lastTelemetryAppliedPerSecond;
     private long _lastTelemetrySecondTicks;
+    private long _lastTelemetryGenerateTicks;
+    private double _telemetryGenerateRemainder;
     private StreamWriter? _csv;
     private string? _csvPath;
+    private int _csvSamplesSinceFlush;
     private SceneFrameRenderedEventArgs? _lastFrame;
     private double _lastFps;
     private double _lastAverageFrameMs;
@@ -64,6 +80,8 @@ public partial class MainView : UserControl
     private long _lastAllocatedBytes;
     private long _lastAllocationTicks;
     private double _allocatedMbPerSecond;
+    private readonly TelemetryDiffQueue3D _telemetryQueue = new();
+    private double _lastTelemetryApplyMs;
 
     public MainView()
     {
@@ -74,6 +92,14 @@ public partial class MainView : UserControl
             HorizontalAlignment = HorizontalAlignment.Stretch,
             VerticalAlignment = VerticalAlignment.Stretch,
             ShowPerformanceMetrics = true,
+            ContinuousRendering = true,
+            ContinuousRenderingFps = 60d,
+            FpsLockEnabled = true,
+            TargetFps = 60d,
+            UnlockedMaxFps = 240d,
+            FrameInterpolationEnabled = false,
+            FrameInterpolationTickFps = 20d,
+            AdaptivePerformanceEnabled = false,
             EnableSceneNavigation = true,
             Width = double.NaN,
             Height = double.NaN
@@ -88,17 +114,21 @@ public partial class MainView : UserControl
             TextWrapping = TextWrapping.Wrap
         };
 
-        _telemetryTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
+        // Synthetic benchmark telemetry is generated from the rendered-frame callback, not
+        // from an independent UI DispatcherTimer. A separate timer creates update waves
+        // that can overlap the render loop and produces exactly the periodic stalls this
+        // benchmark is meant to detect. The timer is kept for compatibility but is not
+        // started.
+        _telemetryTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
         _telemetryTimer.Tick += OnTelemetryTick;
-        _telemetryTimer.Start();
 
         _logTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         _logTimer.Tick += OnLogTick;
         _logTimer.Start();
 
         BuildUi();
+        ApplyRuntimeSettings();
         ApplyPreset(10_000, 0, 0, "Simple markers");
-        RebuildBenchmarkScene();
     }
 
     private void BuildUi()
@@ -141,11 +171,30 @@ public partial class MainView : UserControl
         _simplifiedLodText = TextBox("96");
         _proxyLodText = TextBox("320");
         _logIntervalText = TextBox("1");
+        _drawDistanceText = TextBox("5000");
+        _fadeDistanceText = TextBox("120");
         _overlayCheck = new CheckBox { Content = "Overlay", IsChecked = true, Foreground = Brushes.White };
-        _loggingCheck = new CheckBox { Content = "CSV logging", IsChecked = true, Foreground = Brushes.White };
+        _loggingCheck = new CheckBox { Content = "CSV logging", IsChecked = !IsBrowserPlatform(), Foreground = Brushes.White };
         _telemetryCheck = new CheckBox { Content = "Telemetry updates", IsChecked = true, Foreground = Brushes.White };
         _animateCheck = new CheckBox { Content = "Transform animation", IsChecked = false, Foreground = Brushes.White };
+        _continuousCheck = new CheckBox { Content = "Continuous render loop", IsChecked = true, Foreground = Brushes.White };
+        _compactProxiesCheck = new CheckBox { Content = "Compact high-scale proxies", IsChecked = true, Foreground = Brushes.White };
+        _fpsLockCheck = new CheckBox { Content = "FPS lock", IsChecked = true, Foreground = Brushes.White };
+        _frameInterpolationCheck = new CheckBox { Content = "Frame interpolation", IsChecked = false, Foreground = Brushes.White };
+        _adaptivePerformanceCheck = new CheckBox { Content = "Adaptive performance", IsChecked = false, Foreground = Brushes.White };
+        _targetFpsText = TextBox("60");
+        _unlockedMaxFpsText = TextBox("240");
+        _frameTickFpsText = TextBox("20");
+        _telemetryFrameBudgetText = TextBox("0");
+        _bakedMeshCheck = new CheckBox { Content = "Baked high-scale meshes", IsChecked = true, Foreground = Brushes.White };
+        _paletteTextureCheck = new CheckBox { Content = "GPU palette texture", IsChecked = true, Foreground = Brushes.White };
+        _bakedMeshCheck.IsCheckedChanged += (_, _) => ApplyRuntimeSettings();
+        _paletteTextureCheck.IsCheckedChanged += (_, _) => ApplyRuntimeSettings();
         _overlayCheck.IsCheckedChanged += (_, _) => _sceneControl.ShowPerformanceMetrics = _overlayCheck.IsChecked == true;
+        _continuousCheck.IsCheckedChanged += (_, _) => ApplyRuntimeSettings();
+        _fpsLockCheck.IsCheckedChanged += (_, _) => ApplyRuntimeSettings();
+        _frameInterpolationCheck.IsCheckedChanged += (_, _) => ApplyRuntimeSettings();
+        _adaptivePerformanceCheck.IsCheckedChanged += (_, _) => ApplyRuntimeSettings();
 
         var stack = new StackPanel { Spacing = 8 };
         stack.Children.Add(new TextBlock
@@ -172,14 +221,27 @@ public partial class MainView : UserControl
         stack.Children.Add(Row("LOD detailed", _detailedLodText));
         stack.Children.Add(Row("LOD simplified", _simplifiedLodText));
         stack.Children.Add(Row("LOD proxy", _proxyLodText));
+        stack.Children.Add(Row("Draw distance", _drawDistanceText));
+        stack.Children.Add(Row("Fade band", _fadeDistanceText));
         stack.Children.Add(Row("CSV interval sec", _logIntervalText));
         stack.Children.Add(_overlayCheck);
         stack.Children.Add(_loggingCheck);
         stack.Children.Add(_telemetryCheck);
         stack.Children.Add(_animateCheck);
+        stack.Children.Add(_continuousCheck);
+        stack.Children.Add(_compactProxiesCheck);
+        stack.Children.Add(_fpsLockCheck);
+        stack.Children.Add(Row("Target FPS", _targetFpsText));
+        stack.Children.Add(Row("Unlocked max FPS", _unlockedMaxFpsText));
+        stack.Children.Add(_frameInterpolationCheck);
+        stack.Children.Add(Row("Frame tick FPS", _frameTickFpsText));
+        stack.Children.Add(_adaptivePerformanceCheck);
+        stack.Children.Add(_bakedMeshCheck);
+        stack.Children.Add(_paletteTextureCheck);
+        stack.Children.Add(Row("Telemetry/frame 0=auto", _telemetryFrameBudgetText));
 
         var apply = new Button { Content = "Apply / Rebuild scene" };
-        apply.Click += (_, _) => RebuildBenchmarkScene();
+        apply.Click += (_, _) => { ApplyRuntimeSettings(); RebuildBenchmarkScene(); };
         stack.Children.Add(apply);
 
         stack.Children.Add(PresetRow(
@@ -206,6 +268,27 @@ public partial class MainView : UserControl
         return new ScrollViewer { Content = stack };
     }
 
+    private void ApplyRuntimeSettings()
+    {
+        var targetFps = Math.Clamp(ParseFloat(_targetFpsText.Text, 60f), 1f, 500f);
+        var unlockedMaxFps = Math.Clamp(ParseFloat(_unlockedMaxFpsText.Text, 240f), 1f, 500f);
+        var frameTickFps = Math.Clamp(ParseFloat(_frameTickFpsText.Text, 20f), 1f, 240f);
+        _sceneControl.ContinuousRendering = _continuousCheck.IsChecked == true;
+        _sceneControl.FpsLockEnabled = _fpsLockCheck.IsChecked == true;
+        _sceneControl.TargetFps = targetFps;
+        _sceneControl.ContinuousRenderingFps = targetFps;
+        _sceneControl.UnlockedMaxFps = unlockedMaxFps;
+        _sceneControl.FrameInterpolationEnabled = _frameInterpolationCheck.IsChecked == true;
+        _sceneControl.FrameInterpolationTickFps = frameTickFps;
+        _sceneControl.AdaptivePerformanceEnabled = _adaptivePerformanceCheck.IsChecked == true;
+        _sceneControl.Scene.FrameInterpolator.Enabled = _sceneControl.FrameInterpolationEnabled;
+        _sceneControl.Scene.FrameInterpolator.SimulationTickFps = frameTickFps;
+        _sceneControl.Scene.AdaptivePerformance.Enabled = _sceneControl.AdaptivePerformanceEnabled;
+        _sceneControl.Scene.Performance.AdaptivePerformanceEnabled = _sceneControl.AdaptivePerformanceEnabled;
+        _sceneControl.Scene.Performance.EnableBakedHighScaleDetailedMeshes = _bakedMeshCheck.IsChecked == true;
+        _sceneControl.Scene.Performance.EnableHighScalePaletteTexture = _paletteTextureCheck.IsChecked == true;
+    }
+
     private void ApplyPreset(int instances, int proxies, int telemetryPerSecond, string scenario)
     {
         _scenarioBox.SelectedIndex = scenario == "Rack composite" ? 1 : 0;
@@ -218,6 +301,8 @@ public partial class MainView : UserControl
 
     private void RebuildBenchmarkScene()
     {
+        ApplyRuntimeSettings();
+
         CloseCsv();
         _scenarioName = _scenarioBox.SelectedIndex == 1 ? "Rack composite" : "Simple markers";
         _configuredInstances = Clamp(ParseInt(_instanceText.Text, 10_000), 0, 1_500_000);
@@ -229,6 +314,8 @@ public partial class MainView : UserControl
         var detailed = Math.Max(1f, ParseFloat(_detailedLodText.Text, 24f));
         var simplified = Math.Max(detailed + 1f, ParseFloat(_simplifiedLodText.Text, 96f));
         var proxy = Math.Max(simplified + 1f, ParseFloat(_proxyLodText.Text, 320f));
+        var drawDistance = Math.Max(proxy + 1f, ParseFloat(_drawDistanceText.Text, 5000f));
+        var fadeDistance = Math.Max(0f, ParseFloat(_fadeDistanceText.Text, 120f));
 
         var scene = _sceneControl.Scene;
         using (scene.BeginUpdate())
@@ -237,6 +324,17 @@ public partial class MainView : UserControl
             scene.BackgroundColor = new ColorRgba(0.04f, 0.045f, 0.055f, 1f);
             scene.Camera.Position = new Vector3(40, 35, -70);
             scene.Camera.Target = Vector3.Zero;
+            scene.Camera.FarPlane = drawDistance + Math.Max(100f, fadeDistance * 2f);
+            scene.Performance.DrawDistance = drawDistance;
+            scene.Performance.DistanceFadeBand = fadeDistance;
+            scene.Performance.EnableDistanceFade = fadeDistance > 0f;
+            scene.Performance.AdaptivePerformanceEnabled = _adaptivePerformanceCheck.IsChecked == true;
+            scene.Performance.EnableBakedHighScaleDetailedMeshes = _bakedMeshCheck.IsChecked == true;
+            scene.Performance.EnableHighScalePaletteTexture = _paletteTextureCheck.IsChecked == true;
+            scene.FrameInterpolator.Enabled = _frameInterpolationCheck.IsChecked == true;
+            scene.FrameInterpolator.SimulationTickFps = Math.Clamp(ParseFloat(_frameTickFpsText.Text, 20f), 1f, 240f);
+            scene.AdaptivePerformance.Enabled = _adaptivePerformanceCheck.IsChecked == true;
+            scene.AdaptivePerformance.Reset(scene.Performance);
             scene.AddLight(new DirectionalLight3D
             {
                 Direction = Vector3.Normalize(new Vector3(-0.35f, -0.85f, -0.35f)),
@@ -251,8 +349,8 @@ public partial class MainView : UserControl
             });
 
             var template = _scenarioName == "Rack composite"
-                ? HighScaleTemplateCompiler.Compile(1, new BenchmarkRack3D())
-                : HighScaleTemplateCompiler.Compile(1, new BenchmarkMarker3D());
+                ? HighScaleTemplateCompiler.Compile(1, new BenchmarkRack3D(), scene.Performance.EnableBakedHighScaleDetailedMeshes && scene.Performance.EnableHighScalePaletteTexture)
+                : HighScaleTemplateCompiler.Compile(1, new BenchmarkMarker3D(), scene.Performance.EnableBakedHighScaleDetailedMeshes && scene.Performance.EnableHighScalePaletteTexture);
             template.AddMaterialVariant(1, "Warning").DefaultColor = new ColorRgba(0.95f, 0.72f, 0.20f, 1f);
             template.AddMaterialVariant(2, "Critical").DefaultColor = new ColorRgba(0.95f, 0.16f, 0.12f, 1f);
             template.AddMaterialVariant(3, "Offline").DefaultColor = new ColorRgba(0.22f, 0.24f, 0.28f, 0.55f);
@@ -264,6 +362,8 @@ public partial class MainView : UserControl
             layer.LodPolicy.DetailedDistance = detailed;
             layer.LodPolicy.SimplifiedDistance = simplified;
             layer.LodPolicy.ProxyDistance = proxy;
+            layer.LodPolicy.DrawDistance = drawDistance;
+            layer.LodPolicy.FadeDistance = fadeDistance;
             layer.AddInstances(CreateTransforms(_configuredInstances, columns, spacing));
             scene.Add(layer);
             _layer = layer;
@@ -271,10 +371,14 @@ public partial class MainView : UserControl
             CreateInteractiveProxies(scene, _configuredProxies, columns, spacing);
         }
 
+        _telemetryQueue.Clear();
+        _lastTelemetryApplyMs = 0d;
         _telemetryCursor = 0;
         _telemetryAppliedInWindow = 0;
         _lastTelemetryAppliedPerSecond = 0;
         _lastTelemetrySecondTicks = Stopwatch.GetTimestamp();
+        _lastTelemetryGenerateTicks = 0;
+        _telemetryGenerateRemainder = 0d;
         ResetPerfWindows();
         if (_loggingCheck.IsChecked == true)
         {
@@ -296,10 +400,28 @@ public partial class MainView : UserControl
         }
     }
 
-    private static void CreateInteractiveProxies(Scene3D scene, int count, int columns, float spacing)
+    private void CreateInteractiveProxies(Scene3D scene, int count, int columns, float spacing)
     {
         if (count <= 0)
         {
+            return;
+        }
+
+        if (_compactProxiesCheck.IsChecked == true)
+        {
+            var template = HighScaleTemplateCompiler.Compile(77, new BenchmarkProxy3D(), _sceneControl.Scene.Performance.EnableBakedHighScaleDetailedMeshes && _sceneControl.Scene.Performance.EnableHighScalePaletteTexture);
+            template.AddMaterialVariant(1, "Proxy").DefaultColor = new ColorRgba(0.10f, 0.45f, 0.95f, 0.45f);
+            var layer = new HighScaleInstanceLayer3D(template, count, Math.Max(8f, ParseFloat(_chunkText.Text, 32f)))
+            {
+                Name = "Compact Interaction Proxy Visual Layer"
+            };
+            layer.LodPolicy.DetailedDistance = 0.01f;
+            layer.LodPolicy.SimplifiedDistance = 0.02f;
+            layer.LodPolicy.ProxyDistance = Math.Max(10f, ParseFloat(_proxyLodText.Text, 320f));
+            layer.LodPolicy.DrawDistance = Math.Max(layer.LodPolicy.ProxyDistance + 1f, ParseFloat(_drawDistanceText.Text, 5000f));
+            layer.LodPolicy.FadeDistance = Math.Max(0f, ParseFloat(_fadeDistanceText.Text, 120f));
+            layer.AddInstances(CreateProxyTransforms(count, columns, spacing));
+            scene.Add(layer);
             return;
         }
 
@@ -332,50 +454,127 @@ public partial class MainView : UserControl
         }
     }
 
+    private static System.Collections.Generic.IEnumerable<Matrix4x4> CreateProxyTransforms(int count, int columns, float spacing)
+    {
+        var rows = Math.Max(1, (count + columns - 1) / columns);
+        var offsetX = columns * spacing * 0.5f;
+        var offsetZ = rows * spacing * 0.5f;
+        for (var i = 0; i < count; i++)
+        {
+            var x = i % columns;
+            var z = i / columns;
+            yield return Matrix4x4.CreateTranslation(x * spacing - offsetX, 0.55f, z * spacing - offsetZ);
+        }
+    }
+
+
+    private void PumpSyntheticTelemetryForFrame()
+    {
+        var layer = _layer;
+        if (layer is null || _telemetryCheck.IsChecked != true || layer.Instances.Count == 0 || _configuredTelemetryPerSecond <= 0)
+        {
+            _lastTelemetryGenerateTicks = Stopwatch.GetTimestamp();
+            _telemetryGenerateRemainder = 0d;
+            return;
+        }
+
+        var nowTicks = Stopwatch.GetTimestamp();
+        if (_lastTelemetryGenerateTicks == 0)
+        {
+            _lastTelemetryGenerateTicks = nowTicks;
+            return;
+        }
+
+        var elapsedSeconds = (nowTicks - _lastTelemetryGenerateTicks) / (double)Stopwatch.Frequency;
+        _lastTelemetryGenerateTicks = nowTicks;
+        if (elapsedSeconds <= 0d)
+        {
+            return;
+        }
+
+        var maxPerFrame = Math.Max(1, _sceneControl.Scene.Performance.TelemetryMaxUpdatesPerFrame);
+        var exact = _configuredTelemetryPerSecond * elapsedSeconds + _telemetryGenerateRemainder;
+        var updates = Math.Min(maxPerFrame, Math.Max(0, (int)exact));
+        // For smooth rendering, benchmark telemetry intentionally drops excess synthetic
+        // updates instead of building a catch-up wave. Real external telemetry should be
+        // coalesced the same way: latest state wins; visual state is paced by the frame budget.
+        _telemetryGenerateRemainder = updates < maxPerFrame ? exact - updates : 0d;
+        if (updates <= 0)
+        {
+            return;
+        }
+
+        EnqueueSyntheticTelemetry(layer, updates);
+    }
+
+    private void EnqueueSyntheticTelemetry(HighScaleInstanceLayer3D layer, int updates)
+    {
+        var animate = _animateCheck.IsChecked == true;
+        var count = layer.Instances.Count;
+        var time = (float)_runClock.Elapsed.TotalSeconds;
+        for (var i = 0; i < updates; i++)
+        {
+            var index = _telemetryCursor++ % count;
+            var currentVariant = layer.StateBuffer.GetMaterialVariant(index);
+            var variant = (currentVariant + 1 + _random.Next(3)) & 3;
+            _telemetryQueue.EnqueueMaterial(index, variant);
+            if (animate)
+            {
+                var r = layer.Instances[index];
+                var dx = MathF.Sin(time + index * 0.001f) * 0.015f;
+                var dz = MathF.Cos(time * 0.7f + index * 0.0017f) * 0.015f;
+                var t = r.Transform;
+                t.M41 += dx;
+                t.M43 += dz;
+                _telemetryQueue.EnqueueTransform(index, t);
+            }
+        }
+    }
+
     private void OnTelemetryTick(object? sender, EventArgs e)
     {
+        // Legacy/manual timer path. The benchmark does not start this timer by default;
+        // use the frame-paced path above for stable high-load measurements.
         var layer = _layer;
         if (layer is null || _telemetryCheck.IsChecked != true || layer.Instances.Count == 0)
         {
             return;
         }
 
-        var nowTicks = Stopwatch.GetTimestamp();
-        if (_lastTelemetrySecondTicks == 0)
-        {
-            _lastTelemetrySecondTicks = nowTicks;
-        }
-
         var updates = Math.Max(0, (int)(_configuredTelemetryPerSecond * _telemetryTimer.Interval.TotalSeconds));
-        if (updates == 0)
+        if (updates > 0)
         {
+            EnqueueSyntheticTelemetry(layer, updates);
+        }
+    }
+
+    private void DrainTelemetryQueueForFrame()
+    {
+        var layer = _layer;
+        if (layer is null || _telemetryQueue.Count == 0)
+        {
+            _lastTelemetryApplyMs = 0d;
             return;
         }
 
-        var animate = _animateCheck.IsChecked == true;
-        var count = layer.Instances.Count;
-        var time = (float)_runClock.Elapsed.TotalSeconds;
-        using (var batch = layer.BeginTelemetryBatch())
-        {
-            for (var i = 0; i < updates; i++)
-            {
-                var index = _telemetryCursor++ % count;
-                var variant = (index + _random.Next(4)) & 3;
-                batch.SetMaterialVariant(index, variant);
-                if (animate)
-                {
-                    var r = layer.Instances[index];
-                    var dx = MathF.Sin(time + index * 0.001f) * 0.015f;
-                    var dz = MathF.Cos(time * 0.7f + index * 0.0017f) * 0.015f;
-                    var t = r.Transform;
-                    t.M41 += dx;
-                    t.M43 += dz;
-                    batch.SetTransform(index, t);
-                }
-            }
-        }
+        var configuredBudget = ParseInt(_telemetryFrameBudgetText.Text, 0);
+        var targetFps = Math.Max(1f, ParseFloat(_targetFpsText.Text, 60f));
+        var automaticBudget = Math.Max(1, (int)Math.Ceiling(_configuredTelemetryPerSecond / targetFps * 1.10d));
+        var maxConfigured = Math.Max(1, _sceneControl.Scene.Performance.TelemetryMaxUpdatesPerFrame);
+        var maxUpdates = configuredBudget > 0
+            ? configuredBudget
+            : Math.Clamp(automaticBudget, 1, maxConfigured);
+        var applyBudgetMs = Math.Max(0.10d, _sceneControl.Scene.Performance.TelemetryApplyBudgetMilliseconds);
 
-        _telemetryAppliedInWindow += updates;
+        var start = Stopwatch.GetTimestamp();
+        var interpolationEnabled = _sceneControl.Scene.FrameInterpolator.Enabled;
+        if (interpolationEnabled) _sceneControl.Scene.BeginSimulationTick();
+        var applied = _telemetryQueue.DrainTo(layer, maxUpdates, applyBudgetMs);
+        if (interpolationEnabled) _sceneControl.Scene.EndSimulationTick();
+        _lastTelemetryApplyMs = (Stopwatch.GetTimestamp() - start) * 1000d / Stopwatch.Frequency;
+        _telemetryAppliedInWindow += applied;
+
+        var nowTicks = Stopwatch.GetTimestamp();
         var elapsed = (nowTicks - _lastTelemetrySecondTicks) / (double)Stopwatch.Frequency;
         if (elapsed >= 1d)
         {
@@ -388,6 +587,8 @@ public partial class MainView : UserControl
 
     private void OnFrameRendered(object? sender, SceneFrameRenderedEventArgs e)
     {
+        PumpSyntheticTelemetryForFrame();
+        DrainTelemetryQueueForFrame();
         _lastFrame = e;
         _frameCountWindow++;
         _frameMsWindow += e.FrameMilliseconds;
@@ -469,17 +670,22 @@ public partial class MainView : UserControl
     {
         CloseCsv();
 
+        if (IsBrowserPlatform())
+        {
+            throw new PlatformNotSupportedException("CSV logging is disabled in browser/WebAssembly builds.");
+        }
+
         var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Avalonia3D", "Benchmarks");
         Directory.CreateDirectory(dir);
 
-        var processId = Process.GetCurrentProcess().Id;
+        var runId = Guid.NewGuid().ToString("N")[..8];
         var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture);
         Exception? lastError = null;
 
         for (var attempt = 0; attempt < 1000; attempt++)
         {
             var suffix = attempt == 0 ? string.Empty : "_" + attempt.ToString("000", CultureInfo.InvariantCulture);
-            var path = Path.Combine(dir, $"benchmark_{timestamp}_p{processId}{suffix}.csv");
+            var path = Path.Combine(dir, $"benchmark_{timestamp}_{runId}{suffix}.csv");
 
             try
             {
@@ -491,7 +697,7 @@ public partial class MainView : UserControl
 
                 _csvPath = path;
                 _csv = new StreamWriter(stream);
-                _csv.WriteLine("time_s,scenario,instances,interactive_proxies,telemetry_target_s,telemetry_applied_s,fps,frame_ms,avg_frame_ms,alloc_mb_s,objects,renderables,pickables,colliders,highscale_instances,total_chunks,visible_chunks,culled,lod_simplified,lod_proxy,lod_billboard,draw_calls,batches,triangles,instance_upload_mb,backend_ms,packet_ms,serialize_ms,upload_ms,picking_ms,physics_ms,live_ms,mesh_cache,registry_version");
+                _csv.WriteLine("time_s,scenario,instances,interactive_proxies,telemetry_target_s,telemetry_applied_s,fps,frame_ms,avg_frame_ms,alloc_mb_s,alloc_frame_kb,heap_mb,gc0,gc1,gc2,continuous_render,fps_locked,target_fps,unlocked_max_fps,framegen,adaptive,quality_scale,render_w,render_h,baked_draws,telemetry_apply_ms,telemetry_queue,compact_proxies,objects,renderables,pickables,colliders,highscale_instances,total_chunks,visible_chunks,culled,lod_detailed,lod_simplified,lod_proxy,lod_billboard,lod_culled,visible_part_instances,draw_calls,batches,triangles,transform_upload_mb,state_upload_kb,backend_ms,frame_total_ms,schedule_delay_ms,hs_plan_ms,hs_build_ms,hs_upload_ms,packet_ms,serialize_ms,upload_ms,picking_ms,physics_ms,live_ms,mesh_cache,registry_version");
                 _csv.Flush();
                 return;
             }
@@ -506,8 +712,10 @@ public partial class MainView : UserControl
 
     private void CloseCsv()
     {
+        _csv?.Flush();
         _csv?.Dispose();
         _csv = null;
+        _csvSamplesSinceFlush = 0;
     }
 
     private void WriteCsvSample()
@@ -525,6 +733,24 @@ public partial class MainView : UserControl
             F(frame?.FrameMilliseconds ?? 0),
             F(_lastAverageFrameMs),
             F(_allocatedMbPerSecond),
+            F(stats.AllocatedBytesPerFrame / 1024d),
+            F(stats.ManagedHeapBytes / (1024d * 1024d)),
+            stats.Gen0Collections.ToString(CultureInfo.InvariantCulture),
+            stats.Gen1Collections.ToString(CultureInfo.InvariantCulture),
+            stats.Gen2Collections.ToString(CultureInfo.InvariantCulture),
+            ((_continuousCheck.IsChecked == true) ? "1" : "0"),
+            ((_fpsLockCheck.IsChecked == true) ? "1" : "0"),
+            F(ParseFloat(_targetFpsText.Text, 60f)),
+            F(ParseFloat(_unlockedMaxFpsText.Text, 240f)),
+            ((_frameInterpolationCheck.IsChecked == true) ? "1" : "0"),
+            ((_adaptivePerformanceCheck.IsChecked == true) ? "1" : "0"),
+            F(stats.AdaptiveQualityScale),
+            stats.RenderTargetWidth.ToString(CultureInfo.InvariantCulture),
+            stats.RenderTargetHeight.ToString(CultureInfo.InvariantCulture),
+            stats.BakedHighScalePartDraws.ToString(CultureInfo.InvariantCulture),
+            F(_lastTelemetryApplyMs),
+            _telemetryQueue.Count.ToString(CultureInfo.InvariantCulture),
+            ((_compactProxiesCheck.IsChecked == true) ? "1" : "0"),
             stats.ObjectCount.ToString(CultureInfo.InvariantCulture),
             stats.RenderableCount.ToString(CultureInfo.InvariantCulture),
             stats.PickableCount.ToString(CultureInfo.InvariantCulture),
@@ -533,14 +759,23 @@ public partial class MainView : UserControl
             stats.TotalChunkCount.ToString(CultureInfo.InvariantCulture),
             stats.VisibleChunkCount.ToString(CultureInfo.InvariantCulture),
             stats.CulledObjectCount.ToString(CultureInfo.InvariantCulture),
+            stats.LodDetailedCount.ToString(CultureInfo.InvariantCulture),
             stats.LodSimplifiedCount.ToString(CultureInfo.InvariantCulture),
             stats.LodProxyCount.ToString(CultureInfo.InvariantCulture),
             stats.LodBillboardCount.ToString(CultureInfo.InvariantCulture),
+            stats.LodCulledCount.ToString(CultureInfo.InvariantCulture),
+            stats.HighScaleVisiblePartInstanceCount.ToString(CultureInfo.InvariantCulture),
             stats.DrawCallCount.ToString(CultureInfo.InvariantCulture),
             stats.InstancedBatchCount.ToString(CultureInfo.InvariantCulture),
             stats.TriangleCount.ToString(CultureInfo.InvariantCulture),
             F(stats.InstanceUploadBytes / (1024d * 1024d)),
+            F(stats.StateUploadBytes / 1024d),
             F(stats.BackendMilliseconds),
+            F(stats.FrameTotalMilliseconds),
+            F(stats.RenderScheduleDelayMilliseconds),
+            F(stats.HighScalePlanMilliseconds),
+            F(stats.HighScaleBufferBuildMilliseconds),
+            F(stats.HighScaleUploadMilliseconds),
             F(stats.PacketBuildMilliseconds),
             F(stats.SerializationMilliseconds),
             F(stats.UploadMilliseconds),
@@ -549,7 +784,12 @@ public partial class MainView : UserControl
             F(stats.LiveSnapshotMilliseconds),
             stats.MeshCacheCount.ToString(CultureInfo.InvariantCulture),
             stats.RegistryVersion.ToString(CultureInfo.InvariantCulture)));
-        _csv?.Flush();
+        _csvSamplesSinceFlush++;
+        if (_csvSamplesSinceFlush >= 5)
+        {
+            _csv?.Flush();
+            _csvSamplesSinceFlush = 0;
+        }
     }
 
     private void UpdateStatus()
@@ -559,12 +799,16 @@ public partial class MainView : UserControl
         _statusText.Text =
             $"Scenario: {_scenarioName}\n" +
             $"Instances: {_configuredInstances:n0} | Proxies: {_configuredProxies:n0}\n" +
-            $"Telemetry: target {_configuredTelemetryPerSecond:n0}/s, applied {_lastTelemetryAppliedPerSecond:n0}/s\n" +
-            $"FPS: {_lastFps:0.0} | Frame: {(frame?.FrameMilliseconds ?? 0):0.00} ms | Avg: {_lastAverageFrameMs:0.00} ms\n" +
-            $"Alloc: {_allocatedMbPerSecond:0.00} MB/s\n" +
+            $"Telemetry: target {_configuredTelemetryPerSecond:n0}/s, applied {_lastTelemetryAppliedPerSecond:n0}/s | queue {_telemetryQueue.Count:n0}\n" +
+            $"FPS: {_lastFps:0.0} | Frame: {(frame?.FrameMilliseconds ?? 0):0.00} ms | Avg: {_lastAverageFrameMs:0.00} ms | Total: {stats.FrameTotalMilliseconds:0.00} ms\n" +
+            $"Alloc: {_allocatedMbPerSecond:0.00} MB/s | Frame alloc: {stats.AllocatedBytesPerFrame / 1024d:0.0} KB | GC: {stats.Gen0Collections}/{stats.Gen1Collections}/{stats.Gen2Collections} | Heap: {stats.ManagedHeapBytes / (1024d * 1024d):0.0} MB\n" +
+            $"Render: {(_continuousCheck.IsChecked == true ? "cont" : "dirty")} | Lock: {(_fpsLockCheck.IsChecked == true ? "on" : "off")} | Target: {ParseFloat(_targetFpsText.Text, 60f):0} | Target: {stats.RenderTargetWidth}x{stats.RenderTargetHeight} | Baked: {(_bakedMeshCheck.IsChecked == true ? "on" : "off")} | Palette: {(_paletteTextureCheck.IsChecked == true ? "on" : "off")}\n" +
+            $"Interp: {(_frameInterpolationCheck.IsChecked == true ? "on" : "off")} | Adaptive: {(_adaptivePerformanceCheck.IsChecked == true ? "on" : "off")} q={stats.AdaptiveQualityScale:0.00} | Baked draws: {stats.BakedHighScalePartDraws:n0}\n" +
+            $"Telemetry apply: {_lastTelemetryApplyMs:0.00} ms | Compact proxies: {(_compactProxiesCheck.IsChecked == true ? "on" : "off")}\n" +
             $"HighScale: {stats.HighScaleInstanceCount:n0} | Chunks: {stats.VisibleChunkCount:n0}/{stats.TotalChunkCount:n0}\n" +
             $"Draw: {stats.DrawCallCount:n0} | Batches: {stats.InstancedBatchCount:n0} | Tris: {stats.TriangleCount:n0}\n" +
-            $"Upload: {stats.InstanceUploadBytes / (1024d * 1024d):0.00} MB | Backend: {stats.BackendMilliseconds:0.00} ms\n" +
+            $"Transform upload: {stats.InstanceUploadBytes / (1024d * 1024d):0.00} MB | State upload: {stats.StateUploadBytes / 1024d:0.0} KB | Backend: {stats.BackendMilliseconds:0.00} ms | Schedule delay: {stats.RenderScheduleDelayMilliseconds:0.00} ms\n" +
+            $"LOD D/S/P/B/C: {stats.LodDetailedCount:n0}/{stats.LodSimplifiedCount:n0}/{stats.LodProxyCount:n0}/{stats.LodBillboardCount:n0}/{stats.LodCulledCount:n0} | DrawDist: {(_layer?.LodPolicy.DrawDistance ?? 0):0}\n" +
             $"CSV: {(_csvPath ?? "off")}";
     }
 
@@ -628,21 +872,19 @@ public partial class MainView : UserControl
 
     private void OpenLogFolder()
     {
+        if (IsBrowserPlatform())
+        {
+            _statusText.Text = "Log folder is not available in browser/WebAssembly builds.";
+            return;
+        }
+
         var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Avalonia3D", "Benchmarks");
         Directory.CreateDirectory(dir);
-        try
-        {
-            Process.Start(new ProcessStartInfo
-            {
-                FileName = dir,
-                UseShellExecute = true
-            });
-        }
-        catch
-        {
-            // Not critical for the benchmark.
-        }
+        _statusText.Text = "Benchmark log folder: " + dir;
     }
+
+    private static bool IsBrowserPlatform()
+        => OperatingSystem.IsBrowser();
 }
 
 public sealed class BenchmarkMarker3D : CompositeObject3D
@@ -708,4 +950,25 @@ public sealed class BenchmarkRack3D : CompositeObject3D
             BaseColor = new ColorRgba(r, g, b, 1f),
             Lighting = LightingMode.Lambert
         };
+}
+
+public sealed class BenchmarkProxy3D : CompositeObject3D
+{
+    public BenchmarkProxy3D()
+    {
+        Name = "BenchmarkProxy3D";
+    }
+
+    protected override void Build(CompositeBuilder3D b)
+    {
+        b.Box("Proxy", 0.35f, 0.35f, 0.35f)
+            .Material(new Material3D
+            {
+                BaseColor = new ColorRgba(0.10f, 0.45f, 0.95f, 0.45f),
+                Lighting = LightingMode.Unlit
+            })
+            .NoCollider()
+            .Pickable(false)
+            .Manipulation(false);
+    }
 }

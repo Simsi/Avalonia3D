@@ -15,7 +15,7 @@ internal static class WebGlScenePacketBuilder
 {
     private const int InstanceFloatStride = 20;
 
-    public static WebGlScenePacket Build(Scene3D scene, float width, float height, RenderStats? stats = null)
+    public static WebGlScenePacket Build(Scene3D scene, float width, float height, RenderStats? stats = null, List<WebGlRetainedBatchPacket>? retainedHighScaleBatches = null)
     {
         width = MathF.Max(width, 1f);
         height = MathF.Max(height, 1f);
@@ -37,7 +37,14 @@ internal static class WebGlScenePacketBuilder
                 continue;
             }
 
-            var color = ResolveColor(obj);
+            var distanceAlpha = ResolveDistanceAlpha(scene, model);
+            if (distanceAlpha <= 0.001f)
+            {
+                if (stats is not null) stats.CulledObjectCount++;
+                continue;
+            }
+
+            var color = ApplyDistanceAlpha(ResolveColor(obj), distanceAlpha);
             var lighting = obj.Material.Lighting == LightingMode.Lambert ? 1f : 0f;
             var batch = GetBatch(batchMap, mesh.ResourceKey, lighting);
             AddInstance(batch, model, color);
@@ -48,6 +55,8 @@ internal static class WebGlScenePacketBuilder
             }
         }
 
+        if (retainedHighScaleBatches is null)
+        {
         foreach (var layer in EnumerateHighScaleLayers(scene))
         {
             if (!layer.IsVisible || layer.Instances.Count == 0)
@@ -78,15 +87,19 @@ internal static class WebGlScenePacketBuilder
                     }
 
                     var lod = layer.LodPolicy.Resolve(scene.Camera.Position, record.Transform);
-                    if (lod == HighScaleLodLevel3D.Billboard)
+                    if (lod == HighScaleLodLevel3D.Culled)
                     {
-                        if (stats is not null) stats.LodBillboardCount++;
+                        if (stats is not null) { stats.LodCulledCount++; stats.CulledObjectCount++; }
                         continue;
                     }
 
-                    var parts = layer.Template.ResolveParts(lod);
+                    var renderLod = lod == HighScaleLodLevel3D.Billboard ? HighScaleLodLevel3D.Proxy : lod;
+                    if (lod == HighScaleLodLevel3D.Billboard && stats is not null) stats.LodBillboardCount++;
+
+                    var parts = layer.Template.ResolveParts(renderLod);
                     if (stats is not null)
                     {
+                        if (lod == HighScaleLodLevel3D.Detailed) stats.LodDetailedCount++;
                         if (lod == HighScaleLodLevel3D.Simplified) stats.LodSimplifiedCount++;
                         if (lod == HighScaleLodLevel3D.Proxy) stats.LodProxyCount++;
                     }
@@ -97,7 +110,9 @@ internal static class WebGlScenePacketBuilder
                         var model = part.LocalTransform * record.Transform;
                         var lighting = part.LightingMode == LightingMode.Lambert ? 1f : 0f;
                         var batch = GetBatch(batchMap, part.Mesh.ResourceKey, lighting);
-                        AddInstance(batch, model, layer.ResolveColor(part, record));
+                        var color = ApplyDistanceAlpha(layer.ResolveColor(part, record), layer.LodPolicy.ResolveFadeAlpha(scene.Camera.Position, record.Transform));
+                        if (color.A <= 0.001f) continue;
+                        AddInstance(batch, model, color);
                         if (stats is not null)
                         {
                             stats.VisibleMeshCount++;
@@ -108,6 +123,8 @@ internal static class WebGlScenePacketBuilder
                     if (stats is not null) stats.HighScaleInstanceCount++;
                 }
             }
+        }
+
         }
 
         foreach (var obj in scene.Registry.AllObjects)
@@ -138,9 +155,9 @@ internal static class WebGlScenePacketBuilder
         var batches = new List<WebGlMeshBatchPacket>(batchMap.Values);
         if (stats is not null)
         {
-            stats.DrawCallCount = batches.Count + controls.Count;
+            stats.DrawCallCount = batches.Count + (retainedHighScaleBatches?.Count ?? 0) + controls.Count;
             stats.EstimatedDrawCallCount = stats.DrawCallCount;
-            stats.InstancedBatchCount = batches.Count;
+            stats.InstancedBatchCount = batches.Count + (retainedHighScaleBatches?.Count ?? 0);
             stats.ControlPlaneCount = controls.Count;
         }
 
@@ -156,6 +173,7 @@ internal static class WebGlScenePacketBuilder
             PointLightPosition = light.PointPosition,
             PointLightColor = light.PointColor,
             Batches = batches,
+            RetainedBatches = retainedHighScaleBatches ?? new List<WebGlRetainedBatchPacket>(),
             ControlPlanes = controls
         };
     }
@@ -187,6 +205,22 @@ internal static class WebGlScenePacketBuilder
             }
         }
     }
+
+    private static float ResolveDistanceAlpha(Scene3D scene, Matrix4x4 model)
+    {
+        var drawDistance = scene.Performance.DrawDistance;
+        if (drawDistance <= 0f || float.IsPositiveInfinity(drawDistance)) return 1f;
+        var pos = new Vector3(model.M41, model.M42, model.M43);
+        var distance = Vector3.Distance(scene.Camera.Position, pos);
+        if (distance > drawDistance) return 0f;
+        if (!scene.Performance.EnableDistanceFade || scene.Performance.DistanceFadeBand <= 0.001f) return 1f;
+        var fadeStart = MathF.Max(0f, drawDistance - scene.Performance.DistanceFadeBand);
+        if (distance <= fadeStart) return 1f;
+        return System.Math.Clamp(1f - ((distance - fadeStart) / MathF.Max(scene.Performance.DistanceFadeBand, 0.001f)), 0f, 1f);
+    }
+
+    private static ColorRgba ApplyDistanceAlpha(ColorRgba color, float alpha)
+        => alpha >= 0.999f ? color : new ColorRgba(color.R, color.G, color.B, color.A * alpha);
 
     private static ColorRgba ResolveColor(Object3D obj)
     {
@@ -289,6 +323,7 @@ internal sealed class WebGlScenePacket
     public required float[] PointLightPosition { get; init; }
     public required float[] PointLightColor { get; init; }
     public required List<WebGlMeshBatchPacket> Batches { get; init; }
+    public required List<WebGlRetainedBatchPacket> RetainedBatches { get; init; }
     public required List<WebGlControlPlanePacket> ControlPlanes { get; init; }
 }
 
@@ -298,6 +333,11 @@ internal sealed class WebGlMeshBatchPacket
     public required float LightingEnabled { get; init; }
     public required List<float> InstanceData { get; init; }
     public int InstanceCount { get; set; }
+}
+
+internal sealed class WebGlRetainedBatchPacket
+{
+    public required string Id { get; init; }
 }
 
 internal sealed class WebGlControlPlanePacket

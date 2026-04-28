@@ -1,6 +1,5 @@
 using Avalonia;
 using Avalonia.Controls.ApplicationLifetimes;
-using Avalonia.Markup.Xaml.Styling;
 using Avalonia.Themes.Fluent;
 
 namespace PreviewerApp;
@@ -23,8 +22,8 @@ public sealed class App : Application
             {
                 window.ShowStartupMessage(
                     "Run PreviewerApp with:\n\n" +
-                    "dotnet run --project .\\PreviewerApp\\PreviewerApp.csproj -- --assembly .\\bin\\Debug\\net8.0\\Avalonia3D.dll --type Avalonia3D.Views.DemoServerRack3D\n\n" +
-                    "Build the host Avalonia3D project first. The demo preview type may live in Views/MainView.axaml.cs.");
+                    "dotnet run --project .\\PreviewerApp\\PreviewerApp.csproj -p:ThreeDEngineHostProject=.\\Avalonia3D.csproj -- --assembly .\\bin\\Debug\\net8.0\\Avalonia3D.dll --type MyNamespace.MyControl3D\n\n" +
+                    "The Visual Studio connector normally builds and launches this command automatically. Build the host Avalonia3D project first for manual runs.");
             }
             else
             {

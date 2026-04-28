@@ -26,6 +26,7 @@ function createProgram(gl, vertexSource, fragmentSource) {
   gl.bindAttribLocation(program, 4, 'aInstanceModel2');
   gl.bindAttribLocation(program, 5, 'aInstanceModel3');
   gl.bindAttribLocation(program, 6, 'aInstanceColor');
+  gl.bindAttribLocation(program, 7, 'aMaterialSlot');
   gl.linkProgram(program);
   gl.deleteShader(vs);
   gl.deleteShader(fs);
@@ -46,13 +47,16 @@ attribute vec4 aInstanceModel1;
 attribute vec4 aInstanceModel2;
 attribute vec4 aInstanceModel3;
 attribute vec4 aInstanceColor;
+attribute float aMaterialSlot;
 uniform mat4 uViewProj;
 uniform mat4 uModel;
 uniform vec4 uColor;
 uniform float uUseInstancing;
+uniform float uUsePalette;
 varying vec3 vWorldPos;
 varying vec3 vNormal;
 varying vec4 vColor;
+varying float vMaterialSlot;
 void main() {
   mat4 instanceModel = mat4(aInstanceModel0, aInstanceModel1, aInstanceModel2, aInstanceModel3);
   mat4 model = uUseInstancing > 0.5 ? instanceModel : uModel;
@@ -60,6 +64,7 @@ void main() {
   vWorldPos = world.xyz;
   vNormal = normalize(mat3(model) * aNormal);
   vColor = uUseInstancing > 0.5 ? aInstanceColor : uColor;
+  vMaterialSlot = aMaterialSlot;
   gl_Position = uViewProj * world;
 }
 `, `
@@ -70,11 +75,27 @@ uniform vec3 uDirectionalLightDirection;
 uniform vec3 uDirectionalLightColor;
 uniform vec4 uPointLightPosition;
 uniform vec4 uPointLightColor;
+uniform float uUsePalette;
+uniform sampler2D uPalette;
+uniform vec2 uPaletteSize;
 varying vec3 vWorldPos;
 varying vec3 vNormal;
 varying vec4 vColor;
+varying float vMaterialSlot;
 void main() {
-  vec3 outColor = vColor.rgb;
+  vec4 color = vColor;
+  if (uUsePalette > 0.5) {
+    float sx = (floor(vMaterialSlot + 0.5) + 0.5) / max(uPaletteSize.x, 1.0);
+    float sy = (floor(vColor.r + 0.5) + 0.5) / max(uPaletteSize.y, 1.0);
+    color = texture2D(uPalette, vec2(sx, sy));
+    color.a *= vColor.g * vColor.b;
+  }
+  if (color.a <= 0.001) discard;
+  if (color.a < 0.999) {
+    float threshold = mod(floor(gl_FragCoord.x) + floor(gl_FragCoord.y), 4.0) * 0.25;
+    if (threshold > color.a) discard;
+  }
+  vec3 outColor = color.rgb;
   if (uLightingEnabled > 0.5) {
     vec3 n = normalize(vNormal);
     vec3 light = uAmbientLight;
@@ -88,7 +109,7 @@ void main() {
     }
     outColor *= clamp(light, 0.0, 2.0);
   }
-  gl_FragColor = vec4(outColor, vColor.a);
+  gl_FragColor = vec4(outColor, color.a);
 }
 `);
 
@@ -130,10 +151,14 @@ void main() {
     meshInstanceModel2Location: gl.getAttribLocation(meshProgram, 'aInstanceModel2'),
     meshInstanceModel3Location: gl.getAttribLocation(meshProgram, 'aInstanceModel3'),
     meshInstanceColorLocation: gl.getAttribLocation(meshProgram, 'aInstanceColor'),
+    meshMaterialSlotLocation: gl.getAttribLocation(meshProgram, 'aMaterialSlot'),
     meshViewProjLocation: gl.getUniformLocation(meshProgram, 'uViewProj'),
     meshModelLocation: gl.getUniformLocation(meshProgram, 'uModel'),
     meshColorLocation: gl.getUniformLocation(meshProgram, 'uColor'),
     meshUseInstancingLocation: gl.getUniformLocation(meshProgram, 'uUseInstancing'),
+    meshUsePaletteLocation: gl.getUniformLocation(meshProgram, 'uUsePalette'),
+    meshPaletteLocation: gl.getUniformLocation(meshProgram, 'uPalette'),
+    meshPaletteSizeLocation: gl.getUniformLocation(meshProgram, 'uPaletteSize'),
     meshLightingEnabledLocation: gl.getUniformLocation(meshProgram, 'uLightingEnabled'),
     meshAmbientLightLocation: gl.getUniformLocation(meshProgram, 'uAmbientLight'),
     meshDirectionalLightDirectionLocation: gl.getUniformLocation(meshProgram, 'uDirectionalLightDirection'),
@@ -147,6 +172,7 @@ void main() {
     quadIndexBuffer,
     meshResources: new Map(),
     instanceBuffers: new Map(),
+    retainedBatches: new Map(),
     textureResources: new Map(),
     controlVertexBuffers: new Map(),
     elementIndexUintExt: gl.getExtension('OES_element_index_uint'),
@@ -249,9 +275,10 @@ export function destroyHost(hostId) {
   if (!host) return;
   const { gl } = host;
   for (const r of host.meshResources.values()) {
-    gl.deleteBuffer(r.vertexBuffer); gl.deleteBuffer(r.normalBuffer); gl.deleteBuffer(r.indexBuffer);
+    gl.deleteBuffer(r.vertexBuffer); gl.deleteBuffer(r.normalBuffer); gl.deleteBuffer(r.materialSlotBuffer); gl.deleteBuffer(r.indexBuffer);
   }
   for (const b of host.instanceBuffers.values()) gl.deleteBuffer(b);
+  for (const b of host.retainedBatches.values()) { gl.deleteBuffer(b.transformBuffer); gl.deleteBuffer(b.stateBuffer); if (b.paletteTexture) gl.deleteTexture(b.paletteTexture); }
   for (const t of host.textureResources.values()) gl.deleteTexture(t.texture);
   for (const b of host.controlVertexBuffers.values()) gl.deleteBuffer(b);
   gl.deleteBuffer(host.quadIndexBuffer);
@@ -331,9 +358,10 @@ export function uploadMeshGeometry(hostId, meshId, geometryJson) {
   const positions = geometry.positions;
   const normals = geometry.normals || [];
   const indices = geometry.indices;
+  const materialSlots = geometry.materialSlots || [];
   let resource = host.meshResources.get(meshId);
   if (!resource) {
-    resource = { vertexBuffer: gl.createBuffer(), normalBuffer: gl.createBuffer(), indexBuffer: gl.createBuffer(), indexCount: 0, indexType: gl.UNSIGNED_SHORT };
+    resource = { vertexBuffer: gl.createBuffer(), normalBuffer: gl.createBuffer(), materialSlotBuffer: gl.createBuffer(), indexBuffer: gl.createBuffer(), indexCount: 0, indexType: gl.UNSIGNED_SHORT };
     host.meshResources.set(meshId, resource);
   }
   gl.bindBuffer(gl.ARRAY_BUFFER, resource.vertexBuffer);
@@ -341,6 +369,9 @@ export function uploadMeshGeometry(hostId, meshId, geometryJson) {
   const normalData = normals.length === positions.length ? normals : createDefaultNormals(positions.length / 3);
   gl.bindBuffer(gl.ARRAY_BUFFER, resource.normalBuffer);
   gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(normalData), gl.STATIC_DRAW);
+  const slotData = materialSlots.length === positions.length / 3 ? materialSlots : createDefaultMaterialSlots(positions.length / 3);
+  gl.bindBuffer(gl.ARRAY_BUFFER, resource.materialSlotBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(slotData), gl.STATIC_DRAW);
   let maxIndex = 0;
   for (let i = 0; i < indices.length; i++) if (indices[i] > maxIndex) maxIndex = indices[i];
   let indexArray;
@@ -365,6 +396,12 @@ function createDefaultNormals(vertexCount) {
   return normals;
 }
 
+function createDefaultMaterialSlots(vertexCount) {
+  const slots = new Array(Math.max(0, vertexCount));
+  for (let i = 0; i < slots.length; i++) slots[i] = 0;
+  return slots;
+}
+
 function getOrCreateControlBuffer(host, id) {
   let buffer = host.controlVertexBuffers.get(id);
   if (!buffer) { buffer = host.gl.createBuffer(); host.controlVertexBuffers.set(id, buffer); }
@@ -377,16 +414,127 @@ function getOrCreateInstanceBuffer(host, id) {
   return buffer;
 }
 
+
+function decodeBase64Bytes(base64) {
+  if (!base64) return new Uint8Array(0);
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function decodeFloat32Base64(base64) {
+  const bytes = decodeBase64Bytes(base64);
+  if (bytes.byteLength === 0) return new Float32Array(0);
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  return new Float32Array(copy.buffer);
+}
+
+function getOrCreateRetainedBatch(host, batchId) {
+  let batch = host.retainedBatches.get(batchId);
+  if (!batch) {
+    const gl = host.gl;
+    batch = {
+      meshId: '',
+      lightingEnabled: 0,
+      usePalette: false,
+      instanceCount: 0,
+      transformBuffer: gl.createBuffer(),
+      stateBuffer: gl.createBuffer(),
+      paletteTexture: null,
+      paletteWidth: 1,
+      paletteHeight: 1
+    };
+    host.retainedBatches.set(batchId, batch);
+  }
+  return batch;
+}
+
+export function uploadRetainedBatchTransforms(hostId, batchId, meshId, lightingEnabled, usePalette, instanceCount, transformFloatsBase64) {
+  const host = hosts.get(hostId);
+  if (!host) return;
+  const { gl } = host;
+  const batch = getOrCreateRetainedBatch(host, batchId);
+  batch.meshId = meshId;
+  batch.lightingEnabled = lightingEnabled || 0;
+  batch.usePalette = !!usePalette;
+  batch.instanceCount = instanceCount || 0;
+  const transforms = decodeFloat32Base64(transformFloatsBase64);
+  gl.bindBuffer(gl.ARRAY_BUFFER, batch.transformBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, transforms, gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, null);
+}
+
+export function uploadRetainedBatchState(hostId, batchId, usePalette, paletteWidth, paletteHeight, stateFloatsBase64, paletteRgbaBase64) {
+  const host = hosts.get(hostId);
+  if (!host) return;
+  const { gl } = host;
+  const batch = getOrCreateRetainedBatch(host, batchId);
+  batch.usePalette = !!usePalette;
+  const states = decodeFloat32Base64(stateFloatsBase64);
+  gl.bindBuffer(gl.ARRAY_BUFFER, batch.stateBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, states, gl.DYNAMIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  if (batch.usePalette && paletteRgbaBase64) {
+    if (!batch.paletteTexture) batch.paletteTexture = gl.createTexture();
+    batch.paletteWidth = Math.max(1, paletteWidth || 1);
+    batch.paletteHeight = Math.max(1, paletteHeight || 1);
+    const rgbaBytes = decodeBase64Bytes(paletteRgbaBase64);
+    gl.bindTexture(gl.TEXTURE_2D, batch.paletteTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, batch.paletteWidth, batch.paletteHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgbaBytes);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+  }
+}
+
+export function uploadRetainedBatchStateRange(hostId, batchId, startInstance, stateFloatsBase64) {
+  const host = hosts.get(hostId);
+  if (!host) return;
+  const batch = host.retainedBatches.get(batchId);
+  if (!batch || !batch.stateBuffer) return;
+  const states = decodeFloat32Base64(stateFloatsBase64);
+  if (states.length === 0) return;
+  const { gl } = host;
+  gl.bindBuffer(gl.ARRAY_BUFFER, batch.stateBuffer);
+  gl.bufferSubData(gl.ARRAY_BUFFER, Math.max(0, startInstance | 0) * 16, states);
+  gl.bindBuffer(gl.ARRAY_BUFFER, null);
+}
+
+export function destroyRetainedBatch(hostId, batchId) {
+  const host = hosts.get(hostId);
+  if (!host) return;
+  const batch = host.retainedBatches.get(batchId);
+  if (!batch) return;
+  const { gl } = host;
+  gl.deleteBuffer(batch.transformBuffer);
+  gl.deleteBuffer(batch.stateBuffer);
+  if (batch.paletteTexture) gl.deleteTexture(batch.paletteTexture);
+  host.retainedBatches.delete(batchId);
+}
+
+export function clearRetainedBatches(hostId) {
+  const host = hosts.get(hostId);
+  if (!host) return;
+  for (const id of Array.from(host.retainedBatches.keys())) destroyRetainedBatch(hostId, id);
+}
+
 export function renderScene(hostId, packetJson) {
   const host = hosts.get(hostId);
   if (!host) return;
   const packet = JSON.parse(packetJson);
   const { gl } = host;
   const batches = packet.batches || [];
+  const retainedRefs = packet.retainedBatches || [];
   const viewProj = new Float32Array(packet.viewProjection);
   const liveMeshIds = new Set(batches.map(batch => batch.id));
+  for (const ref of retainedRefs) { const rb = host.retainedBatches.get(ref.id); if (rb && rb.meshId) liveMeshIds.add(rb.meshId); }
   for (const [id, resource] of host.meshResources.entries()) {
-    if (!liveMeshIds.has(id)) { gl.deleteBuffer(resource.vertexBuffer); gl.deleteBuffer(resource.normalBuffer); gl.deleteBuffer(resource.indexBuffer); host.meshResources.delete(id); }
+    if (!liveMeshIds.has(id)) { gl.deleteBuffer(resource.vertexBuffer); gl.deleteBuffer(resource.normalBuffer); gl.deleteBuffer(resource.materialSlotBuffer); gl.deleteBuffer(resource.indexBuffer); host.meshResources.delete(id); }
   }
   const liveControlIds = new Set(packet.controlPlanes.map(plane => plane.id));
   const liveTextureIds = new Set(packet.controlPlanes.map(plane => plane.textureId));
@@ -409,6 +557,7 @@ export function renderScene(hostId, packetJson) {
   gl.uniformMatrix4fv(host.meshViewProjLocation, false, viewProj);
 
   for (const batch of batches) drawMeshBatch(host, batch);
+  for (const ref of retainedRefs) drawRetainedBatch(host, ref.id);
   drawControlPlanes(host, packet, viewProj);
 
   gl.bindBuffer(gl.ARRAY_BUFFER, null);
@@ -417,18 +566,60 @@ export function renderScene(hostId, packetJson) {
   gl.useProgram(null);
 }
 
-function drawMeshBatch(host, batch) {
+
+function bindMeshGeometry(host, resource) {
   const { gl } = host;
-  const resource = host.meshResources.get(batch.id);
-  if (!resource || resource.indexCount === 0 || !batch.instanceData || batch.instanceCount <= 0) return;
   gl.bindBuffer(gl.ARRAY_BUFFER, resource.normalBuffer);
   gl.enableVertexAttribArray(host.meshNormalLocation);
   gl.vertexAttribPointer(host.meshNormalLocation, 3, gl.FLOAT, false, 0, 0);
   gl.bindBuffer(gl.ARRAY_BUFFER, resource.vertexBuffer);
   gl.enableVertexAttribArray(host.meshPositionLocation);
   gl.vertexAttribPointer(host.meshPositionLocation, 3, gl.FLOAT, false, 0, 0);
+  if (host.meshMaterialSlotLocation >= 0) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, resource.materialSlotBuffer);
+    gl.enableVertexAttribArray(host.meshMaterialSlotLocation);
+    gl.vertexAttribPointer(host.meshMaterialSlotLocation, 1, gl.FLOAT, false, 0, 0);
+  }
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, resource.indexBuffer);
+}
+
+function drawRetainedBatch(host, batchId) {
+  const { gl } = host;
+  const batch = host.retainedBatches.get(batchId);
+  if (!batch || batch.instanceCount <= 0 || !host.instancing) return;
+  const resource = host.meshResources.get(batch.meshId);
+  if (!resource || resource.indexCount === 0) return;
+  bindMeshGeometry(host, resource);
   gl.uniform1f(host.meshLightingEnabledLocation, batch.lightingEnabled || 0);
+  gl.uniform1f(host.meshUsePaletteLocation, 0);
+  gl.uniform1f(host.meshUseInstancingLocation, 1);
+  gl.uniform1f(host.meshUsePaletteLocation, batch.usePalette ? 1 : 0);
+  if (batch.usePalette && batch.paletteTexture) {
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, batch.paletteTexture);
+    gl.uniform1i(host.meshPaletteLocation, 1);
+    gl.uniform2f(host.meshPaletteSizeLocation, batch.paletteWidth || 1, batch.paletteHeight || 1);
+    gl.activeTexture(gl.TEXTURE0);
+  }
+  gl.bindBuffer(gl.ARRAY_BUFFER, batch.transformBuffer);
+  setInstanceAttributeWithStride(host, host.meshInstanceModel0Location, 4, 0, 64);
+  setInstanceAttributeWithStride(host, host.meshInstanceModel1Location, 4, 16, 64);
+  setInstanceAttributeWithStride(host, host.meshInstanceModel2Location, 4, 32, 64);
+  setInstanceAttributeWithStride(host, host.meshInstanceModel3Location, 4, 48, 64);
+  gl.bindBuffer(gl.ARRAY_BUFFER, batch.stateBuffer);
+  setInstanceAttributeWithStride(host, host.meshInstanceColorLocation, 4, 0, 16);
+  host.instancing.drawElementsInstancedANGLE(gl.TRIANGLES, resource.indexCount, resource.indexType, 0, batch.instanceCount);
+  resetInstanceDivisors(host);
+  gl.uniform1f(host.meshUsePaletteLocation, 0);
+}
+
+function drawMeshBatch(host, batch) {
+  const { gl } = host;
+  const resource = host.meshResources.get(batch.id);
+  if (!resource || resource.indexCount === 0 || !batch.instanceData || batch.instanceCount <= 0) return;
+  bindMeshGeometry(host, resource);
+  gl.uniform1f(host.meshLightingEnabledLocation, batch.lightingEnabled || 0);
+  gl.uniform1f(host.meshUsePaletteLocation, 0);
 
   if (host.instancing) {
     const buffer = getOrCreateInstanceBuffer(host, batch.id + '|l:' + (batch.lightingEnabled || 0));
@@ -455,10 +646,14 @@ function drawMeshBatch(host, batch) {
 }
 
 function setInstanceAttribute(host, location, size, offset) {
+  setInstanceAttributeWithStride(host, location, size, offset, 80);
+}
+
+function setInstanceAttributeWithStride(host, location, size, offset, stride) {
   if (location < 0) return;
   const { gl } = host;
   gl.enableVertexAttribArray(location);
-  gl.vertexAttribPointer(location, size, gl.FLOAT, false, 80, offset);
+  gl.vertexAttribPointer(location, size, gl.FLOAT, false, stride, offset);
   host.instancing.vertexAttribDivisorANGLE(location, 1);
 }
 

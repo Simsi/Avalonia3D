@@ -6,11 +6,28 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>PreviewerApp</RootNamespace>
     <AssemblyName>PreviewerApp</AssemblyName>
+    <IsPackable>false</IsPackable>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+
+    <!--
+      VSIX passes this property explicitly when the main project is not named Avalonia3D.csproj.
+      Manual build example:
+      dotnet build .\PreviewerApp\PreviewerApp.csproj -p:ThreeDEngineHostProject=.\Avalonia3D.csproj
+    -->
+    <ThreeDEngineHostProject Condition="'$(ThreeDEngineHostProject)' == '' and Exists('..\Avalonia3D.csproj')">..\Avalonia3D.csproj</ThreeDEngineHostProject>
   </PropertyGroup>
 
+  <PropertyGroup Condition="'$(AvaloniaVersion)' == ''">
+    <!-- Fallback only. Host projects with Directory.Build.props can override AvaloniaVersion. -->
+    <AvaloniaVersion>11.2.5</AvaloniaVersion>
+  </PropertyGroup>
+
+  <Target Name="ValidateThreeDEngineHostProject" BeforeTargets="ResolveReferences" Condition="'$(ThreeDEngineHostProject)' == '' or !Exists('$(ThreeDEngineHostProject)')">
+    <Error Text="PreviewerApp requires a host Avalonia3D project. Pass -p:ThreeDEngineHostProject=&lt;path-to-main-csproj&gt; or place PreviewerApp next to Avalonia3D.csproj." />
+  </Target>
+
   <ItemGroup>
-    <!-- The previewer is intentionally a separate process but reuses the host app assembly/project. -->
-    <ProjectReference Include="..\Avalonia3D.csproj" />
+    <ProjectReference Include="$(ThreeDEngineHostProject)" />
     <PackageReference Include="Avalonia.Desktop" Version="$(AvaloniaVersion)" />
     <PackageReference Include="Avalonia.Themes.Fluent" Version="$(AvaloniaVersion)" />
   </ItemGroup>

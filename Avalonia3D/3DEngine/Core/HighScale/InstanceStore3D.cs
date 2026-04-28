@@ -46,13 +46,11 @@ public sealed class InstanceStore3D
             Transform = transform,
             MaterialVariantId = materialVariantId,
             DataId = dataId,
-            Flags = flags | InstanceFlags3D.DirtyTransform | InstanceFlags3D.DirtyMaterial | InstanceFlags3D.DirtyVisibility,
+            Flags = flags | InstanceFlags3D.DirtyTransform,
             TransformVersion = TransformVersion,
             MaterialVersion = MaterialVersion
         };
         MarkTransformDirty(index);
-        MarkMaterialDirty(index);
-        MarkVisibilityDirty(index);
         return index;
     }
 
@@ -81,8 +79,6 @@ public sealed class InstanceStore3D
         MaterialVersion++;
         _version++;
         record.MaterialVersion = MaterialVersion;
-        record.Flags |= InstanceFlags3D.DirtyMaterial;
-        MarkMaterialDirty(index);
     }
 
     public void SetVisible(int index, bool visible)
@@ -105,8 +101,6 @@ public sealed class InstanceStore3D
 
         VisibilityVersion++;
         _version++;
-        record.Flags |= InstanceFlags3D.DirtyVisibility;
-        MarkVisibilityDirty(index);
     }
 
     public void MarkAllMaterialsDirty()
@@ -115,9 +109,7 @@ public sealed class InstanceStore3D
         _version++;
         for (var i = 0; i < Count; i++)
         {
-            _records[i].Flags |= InstanceFlags3D.DirtyMaterial;
             _records[i].MaterialVersion = MaterialVersion;
-            MarkMaterialDirty(i);
         }
     }
 

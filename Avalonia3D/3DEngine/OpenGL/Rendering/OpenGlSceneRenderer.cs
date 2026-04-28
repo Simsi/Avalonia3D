@@ -1,6 +1,6 @@
 using System;
 using System.Collections.Generic;
-using System.Linq;
+using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using Avalonia;
@@ -21,6 +21,7 @@ internal sealed class OpenGlSceneRenderer
 {
     private const int GlColorBufferBit = 0x00004000;
     private const int GlDepthBufferBit = 0x00000100;
+    private const int GlFramebuffer = 0x8D40;
     private const int GlTriangles = 0x0004;
     private const int GlFloat = 0x1406;
     private const int GlUnsignedInt = 0x1405;
@@ -32,10 +33,12 @@ internal sealed class OpenGlSceneRenderer
     private const int GlBlend = 0x0BE2;
     private const int GlTexture2D = 0x0DE1;
     private const int GlTexture0 = 0x84C0;
+    private const int GlTexture1 = 0x84C1;
     private const int GlTextureMinFilter = 0x2801;
     private const int GlTextureMagFilter = 0x2800;
     private const int GlTextureWrapS = 0x2802;
     private const int GlTextureWrapT = 0x2803;
+    private const int GlNearest = 0x2600;
     private const int GlLinear = 0x2601;
     private const int GlClampToEdge = 0x812F;
     private const int GlRgba = 0x1908;
@@ -46,14 +49,23 @@ internal sealed class OpenGlSceneRenderer
     private const int GlOneMinusSrcAlpha = 0x0303;
     private const int InstanceFloatStride = 20;
     private const int InstanceByteStride = InstanceFloatStride * sizeof(float);
+    private const int HighScaleTransformFloatStride = 16;
+    private const int HighScaleTransformByteStride = HighScaleTransformFloatStride * sizeof(float);
+    private const int HighScaleStateFloatStride = 4;
+    private const int HighScaleStateByteStride = HighScaleStateFloatStride * sizeof(float);
+    private const int MaxHighScaleMaterialVariants = 32;
+    private static readonly HighScaleChunkKey3D AggregateChunkKey = new(int.MinValue, int.MinValue, int.MinValue);
 
     private readonly Dictionary<string, MeshGpuResource> _meshResources = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ControlTextureResource> _controlTextures = new(StringComparer.Ordinal);
     private readonly Dictionary<string, MeshBatchData> _meshBatches = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, HighScaleGpuBatchData> _highScaleGpuBatches = new(StringComparer.Ordinal);
+    private readonly Dictionary<HighScaleBatchKey, HighScaleGpuBatchData> _highScaleGpuBatches = new();
     private readonly float[] _matrixUploadBuffer = new float[16];
     private readonly float[] _controlVertexData = new float[20];
+    private readonly List<string> _meshSweepScratch = new();
+    private readonly List<string> _textureSweepScratch = new();
     private int _lastSweptRegistryVersion = -1;
+    private int _highScaleTransformBatchUploadsThisFrame;
 
     private int _meshProgram;
     private int _texturedProgram;
@@ -64,6 +76,8 @@ internal sealed class OpenGlSceneRenderer
     private int _meshInstanceModel2Location;
     private int _meshInstanceModel3Location;
     private int _meshInstanceColorLocation;
+    private int _meshInstanceStateColorLocation;
+    private int _meshMaterialSlotLocation;
     private int _meshAmbientLightLocation;
     private int _meshDirectionalLightDirectionLocation;
     private int _meshDirectionalLightColorLocation;
@@ -76,6 +90,12 @@ internal sealed class OpenGlSceneRenderer
     private int _meshViewProjLocation;
     private int _meshPartLocalLocation;
     private int _meshUsePartLocalLocation;
+    private int _meshUseHighScaleStateLocation;
+    private int _meshUsePaletteTextureLocation;
+    private int _meshPaletteTextureLocation;
+    private int _meshPaletteWidthLocation;
+    private int _meshPaletteHeightLocation;
+    private readonly int[] _meshVariantColorLocations = new int[MaxHighScaleMaterialVariants];
     private int _texturePositionLocation;
     private int _textureUvLocation;
     private int _textureSamplerLocation;
@@ -83,6 +103,8 @@ internal sealed class OpenGlSceneRenderer
     private int _controlVertexBuffer;
     private int _controlIndexBuffer;
     private int _meshInstanceBuffer;
+    private int _paletteTexture;
+    private byte[] _paletteUploadBuffer = Array.Empty<byte>();
     private bool _initialized;
     private bool _supportsInstancing;
     private GlBlendFuncDelegate? _blendFunc;
@@ -95,6 +117,7 @@ internal sealed class OpenGlSceneRenderer
     private GlUniformMatrix4fvDelegate? _uniformMatrix4fv;
     private GlVertexAttribDivisorDelegate? _vertexAttribDivisor;
     private GlDrawElementsInstancedDelegate? _drawElementsInstanced;
+    private GlBufferSubDataDelegate? _bufferSubData;
 
     public void Initialize(GlInterface gl)
     {
@@ -112,11 +135,12 @@ internal sealed class OpenGlSceneRenderer
                                 ?? LoadDelegate<GlVertexAttribDivisorDelegate>(gl, "glVertexAttribDivisorARB");
         _drawElementsInstanced = LoadDelegate<GlDrawElementsInstancedDelegate>(gl, "glDrawElementsInstanced")
                                  ?? LoadDelegate<GlDrawElementsInstancedDelegate>(gl, "glDrawElementsInstancedARB");
+        _bufferSubData = LoadDelegate<GlBufferSubDataDelegate>(gl, "glBufferSubData");
         _supportsInstancing = _vertexAttribDivisor is not null && _drawElementsInstanced is not null;
 
         _meshProgram = CreateProgram(gl, MeshVertexSource, MeshFragmentSource,
             (0, "aPosition"), (1, "aNormal"), (2, "aInstanceModel0"), (3, "aInstanceModel1"),
-            (4, "aInstanceModel2"), (5, "aInstanceModel3"), (6, "aInstanceColor"));
+            (4, "aInstanceModel2"), (5, "aInstanceModel3"), (6, "aInstanceColor"), (7, "aInstanceState"), (8, "aMaterialSlot"));
         _meshPositionLocation = gl.GetAttribLocationString(_meshProgram, "aPosition");
         _meshNormalLocation = gl.GetAttribLocationString(_meshProgram, "aNormal");
         _meshInstanceModel0Location = gl.GetAttribLocationString(_meshProgram, "aInstanceModel0");
@@ -124,6 +148,8 @@ internal sealed class OpenGlSceneRenderer
         _meshInstanceModel2Location = gl.GetAttribLocationString(_meshProgram, "aInstanceModel2");
         _meshInstanceModel3Location = gl.GetAttribLocationString(_meshProgram, "aInstanceModel3");
         _meshInstanceColorLocation = gl.GetAttribLocationString(_meshProgram, "aInstanceColor");
+        _meshInstanceStateColorLocation = gl.GetAttribLocationString(_meshProgram, "aInstanceState");
+        _meshMaterialSlotLocation = gl.GetAttribLocationString(_meshProgram, "aMaterialSlot");
         _meshColorLocation = gl.GetUniformLocationString(_meshProgram, "uColor");
         _meshUseInstancingLocation = gl.GetUniformLocationString(_meshProgram, "uUseInstancing");
         _meshLightingEnabledLocation = gl.GetUniformLocationString(_meshProgram, "uLightingEnabled");
@@ -131,6 +157,15 @@ internal sealed class OpenGlSceneRenderer
         _meshViewProjLocation = gl.GetUniformLocationString(_meshProgram, "uViewProj");
         _meshPartLocalLocation = gl.GetUniformLocationString(_meshProgram, "uPartLocal");
         _meshUsePartLocalLocation = gl.GetUniformLocationString(_meshProgram, "uUsePartLocal");
+        _meshUseHighScaleStateLocation = gl.GetUniformLocationString(_meshProgram, "uUseHighScaleState");
+        _meshUsePaletteTextureLocation = gl.GetUniformLocationString(_meshProgram, "uUsePaletteTexture");
+        _meshPaletteTextureLocation = gl.GetUniformLocationString(_meshProgram, "uPaletteTexture");
+        _meshPaletteWidthLocation = gl.GetUniformLocationString(_meshProgram, "uPaletteWidth");
+        _meshPaletteHeightLocation = gl.GetUniformLocationString(_meshProgram, "uPaletteHeight");
+        for (var i = 0; i < _meshVariantColorLocations.Length; i++)
+        {
+            _meshVariantColorLocations[i] = gl.GetUniformLocationString(_meshProgram, $"uVariantColors[{i}]");
+        }
         _meshAmbientLightLocation = gl.GetUniformLocationString(_meshProgram, "uAmbientLight");
         _meshDirectionalLightDirectionLocation = gl.GetUniformLocationString(_meshProgram, "uDirectionalLightDirection");
         _meshDirectionalLightColorLocation = gl.GetUniformLocationString(_meshProgram, "uDirectionalLightColor");
@@ -144,6 +179,7 @@ internal sealed class OpenGlSceneRenderer
         _textureViewProjLocation = gl.GetUniformLocationString(_texturedProgram, "uViewProj");
 
         _meshInstanceBuffer = gl.GenBuffer();
+        _paletteTexture = gl.GenTexture();
         _controlVertexBuffer = gl.GenBuffer();
         _controlIndexBuffer = gl.GenBuffer();
         gl.BindBuffer(GlElementArrayBuffer, _controlIndexBuffer);
@@ -157,14 +193,22 @@ internal sealed class OpenGlSceneRenderer
         if (!_initialized) Initialize(gl);
         var width = System.Math.Max((int)System.Math.Ceiling(bounds.Width), 1);
         var height = System.Math.Max((int)System.Math.Ceiling(bounds.Height), 1);
+        var stats = RenderSceneCore(gl, framebuffer, width, height, scene);
+        stats.RenderTargetWidth = width;
+        stats.RenderTargetHeight = height;
+        return stats;
+    }
 
-        gl.BindFramebuffer(0x8D40, framebuffer);
+    private RenderStats RenderSceneCore(GlInterface gl, int framebuffer, int width, int height, Scene3D scene)
+    {
+        gl.BindFramebuffer(GlFramebuffer, framebuffer);
         gl.Viewport(0, 0, width, height);
         gl.Enable(GlDepthTest);
         gl.ClearColor(scene.BackgroundColor.R, scene.BackgroundColor.G, scene.BackgroundColor.B, scene.BackgroundColor.A);
         gl.Clear(GlColorBufferBit | GlDepthBufferBit);
 
         var aspect = (float)width / height;
+        scene.FrameInterpolator.UpdateAlpha();
         var viewProjection = scene.Camera.GetViewMatrix() * scene.Camera.GetProjectionMatrix(aspect);
 
         SweepUnusedResources(gl, scene);
@@ -177,7 +221,8 @@ internal sealed class OpenGlSceneRenderer
             DynamicBodyCount = scene.Registry.DynamicBodies.Count,
             StaticColliderCount = scene.Registry.StaticColliders.Count,
             RegistryVersion = scene.Registry.Version,
-            MeshCacheCount = MeshCache3D.Shared.Count
+            MeshCacheCount = MeshCache3D.Shared.Count,
+            InterpolationAlpha = scene.FrameInterpolator.Alpha
         };
 
         DrawMeshes(gl, scene, viewProjection, stats);
@@ -199,11 +244,13 @@ internal sealed class OpenGlSceneRenderer
         _controlTextures.Clear();
         _highScaleGpuBatches.Clear();
         if (_meshInstanceBuffer != 0) gl.DeleteBuffer(_meshInstanceBuffer);
+        if (_paletteTexture != 0) gl.DeleteTexture(_paletteTexture);
         if (_controlVertexBuffer != 0) gl.DeleteBuffer(_controlVertexBuffer);
         if (_controlIndexBuffer != 0) gl.DeleteBuffer(_controlIndexBuffer);
         if (_meshProgram != 0) gl.DeleteProgram(_meshProgram);
         if (_texturedProgram != 0) gl.DeleteProgram(_texturedProgram);
         _meshInstanceBuffer = _controlVertexBuffer = _controlIndexBuffer = _meshProgram = _texturedProgram = 0;
+        _paletteTexture = 0;
         _initialized = false;
     }
 
@@ -216,6 +263,7 @@ internal sealed class OpenGlSceneRenderer
         _meshBatches.Clear();
         _highScaleGpuBatches.Clear();
         _meshInstanceBuffer = _controlVertexBuffer = _controlIndexBuffer = _meshProgram = _texturedProgram = 0;
+        _paletteTexture = 0;
         _lastSweptRegistryVersion = -1;
     }
 
@@ -235,13 +283,26 @@ internal sealed class OpenGlSceneRenderer
         {
             if (obj is ControlPlane3D plane && plane.IsVisible && plane.Snapshot is not null) liveControlPlanes.Add(plane.Id);
         }
-        foreach (var pair in _meshResources.ToArray())
+        _meshSweepScratch.Clear();
+        foreach (var pair in _meshResources)
         {
-            if (!liveMeshes.Contains(pair.Key)) { pair.Value.Dispose(gl); _meshResources.Remove(pair.Key); }
+            if (!liveMeshes.Contains(pair.Key)) _meshSweepScratch.Add(pair.Key);
         }
-        foreach (var pair in _controlTextures.ToArray())
+        foreach (var key in _meshSweepScratch)
         {
-            if (!liveControlPlanes.Contains(pair.Key)) { pair.Value.Dispose(gl); _controlTextures.Remove(pair.Key); }
+            _meshResources[key].Dispose(gl);
+            _meshResources.Remove(key);
+        }
+
+        _textureSweepScratch.Clear();
+        foreach (var pair in _controlTextures)
+        {
+            if (!liveControlPlanes.Contains(pair.Key)) _textureSweepScratch.Add(pair.Key);
+        }
+        foreach (var key in _textureSweepScratch)
+        {
+            _controlTextures[key].Dispose(gl);
+            _controlTextures.Remove(key);
         }
         _lastSweptRegistryVersion = registryVersion;
     }
@@ -256,6 +317,8 @@ internal sealed class OpenGlSceneRenderer
         UploadLighting(scene);
         UploadMatrix(_uniformMatrix4fv, _meshViewProjLocation, viewProjection, _matrixUploadBuffer);
         UploadFloat(_uniform1f, _meshUsePartLocalLocation, 0f);
+        UploadFloat(_uniform1f, _meshUseHighScaleStateLocation, 0f);
+        UploadFloat(_uniform1f, _meshUsePaletteTextureLocation, 0f);
 
         if (_supportsInstancing)
         {
@@ -267,7 +330,10 @@ internal sealed class OpenGlSceneRenderer
         {
             UploadFloat(_uniform1f, _meshUseInstancingLocation, 0f);
             DrawLegacyBatches(gl, stats);
-            DrawHighScaleLayersLegacy(gl, scene, viewProjection, stats);
+            if (hasHighScale)
+            {
+                stats.HighScaleInstanceCount = 0;
+            }
         }
     }
 
@@ -278,13 +344,19 @@ internal sealed class OpenGlSceneRenderer
         foreach (var obj in scene.Registry.Renderables)
         {
             var mesh = obj.GetMesh();
-            var model = obj.GetModelMatrix();
+            var model = scene.FrameInterpolator.TryGetInterpolatedModel(obj.Id, out var interpolatedModel) ? interpolatedModel : obj.GetModelMatrix();
             if (!FrustumCuller3D.IntersectsLocalBounds(mesh.LocalBounds, model, viewProjection))
             {
                 stats.CulledObjectCount++;
                 continue;
             }
-            var color = ResolveColor(obj);
+            var distanceAlpha = ResolveDistanceAlpha(scene, model);
+            if (distanceAlpha <= 0.001f)
+            {
+                stats.CulledObjectCount++;
+                continue;
+            }
+            var color = ApplyDistanceAlpha(ResolveColor(obj), distanceAlpha);
             var lighting = obj.Material.Lighting == LightingMode.Lambert ? 1 : 0;
             var batch = GetBatch(mesh.ResourceKey, mesh, lighting);
             batch.Add(model, color);
@@ -373,23 +445,42 @@ internal sealed class OpenGlSceneRenderer
         gl.BindBuffer(GlArrayBuffer, resource.NormalBuffer);
         gl.EnableVertexAttribArray(_meshNormalLocation);
         gl.VertexAttribPointer(_meshNormalLocation, 3, GlFloat, 0, sizeof(float) * 3, IntPtr.Zero);
+        if (_meshMaterialSlotLocation >= 0)
+        {
+            gl.BindBuffer(GlArrayBuffer, resource.MaterialSlotBuffer);
+            gl.EnableVertexAttribArray(_meshMaterialSlotLocation);
+            gl.VertexAttribPointer(_meshMaterialSlotLocation, 1, GlFloat, 0, sizeof(float), IntPtr.Zero);
+            _vertexAttribDivisor?.Invoke(_meshMaterialSlotLocation, 0);
+        }
         gl.BindBuffer(GlElementArrayBuffer, resource.IndexBuffer);
     }
 
     private void EnableInstanceAttributes(GlInterface gl)
     {
-        EnableInstanceAttribute(gl, _meshInstanceModel0Location, 4, 0);
-        EnableInstanceAttribute(gl, _meshInstanceModel1Location, 4, sizeof(float) * 4);
-        EnableInstanceAttribute(gl, _meshInstanceModel2Location, 4, sizeof(float) * 8);
-        EnableInstanceAttribute(gl, _meshInstanceModel3Location, 4, sizeof(float) * 12);
-        EnableInstanceAttribute(gl, _meshInstanceColorLocation, 4, sizeof(float) * 16);
+        EnableInstanceAttribute(gl, _meshInstanceModel0Location, 4, InstanceByteStride, 0);
+        EnableInstanceAttribute(gl, _meshInstanceModel1Location, 4, InstanceByteStride, sizeof(float) * 4);
+        EnableInstanceAttribute(gl, _meshInstanceModel2Location, 4, InstanceByteStride, sizeof(float) * 8);
+        EnableInstanceAttribute(gl, _meshInstanceModel3Location, 4, InstanceByteStride, sizeof(float) * 12);
+        EnableInstanceAttribute(gl, _meshInstanceColorLocation, 4, InstanceByteStride, sizeof(float) * 16);
     }
 
-    private void EnableInstanceAttribute(GlInterface gl, int location, int size, int offset)
+    private void EnableHighScaleInstanceAttributes(GlInterface gl, HighScaleGpuBatchData batch)
+    {
+        gl.BindBuffer(GlArrayBuffer, batch.TransformBuffer);
+        EnableInstanceAttribute(gl, _meshInstanceModel0Location, 4, HighScaleTransformByteStride, 0);
+        EnableInstanceAttribute(gl, _meshInstanceModel1Location, 4, HighScaleTransformByteStride, sizeof(float) * 4);
+        EnableInstanceAttribute(gl, _meshInstanceModel2Location, 4, HighScaleTransformByteStride, sizeof(float) * 8);
+        EnableInstanceAttribute(gl, _meshInstanceModel3Location, 4, HighScaleTransformByteStride, sizeof(float) * 12);
+
+        gl.BindBuffer(GlArrayBuffer, batch.StateBuffer);
+        EnableInstanceAttribute(gl, _meshInstanceStateColorLocation, 4, HighScaleStateByteStride, 0);
+    }
+
+    private void EnableInstanceAttribute(GlInterface gl, int location, int size, int stride, int offset)
     {
         if (location < 0) return;
         gl.EnableVertexAttribArray(location);
-        gl.VertexAttribPointer(location, size, GlFloat, 0, InstanceByteStride, new IntPtr(offset));
+        gl.VertexAttribPointer(location, size, GlFloat, 0, stride, new IntPtr(offset));
         _vertexAttribDivisor?.Invoke(location, 1);
     }
 
@@ -400,6 +491,8 @@ internal sealed class OpenGlSceneRenderer
         ResetDivisor(_meshInstanceModel2Location);
         ResetDivisor(_meshInstanceModel3Location);
         ResetDivisor(_meshInstanceColorLocation);
+        ResetDivisor(_meshInstanceStateColorLocation);
+        ResetDivisor(_meshMaterialSlotLocation);
     }
 
     private void ResetDivisor(int location)
@@ -410,6 +503,9 @@ internal sealed class OpenGlSceneRenderer
     private void DrawHighScaleLayers(GlInterface gl, Scene3D scene, Matrix4x4 viewProjection, RenderStats stats)
     {
         UploadFloat(_uniform1f, _meshUsePartLocalLocation, 1f);
+        UploadFloat(_uniform1f, _meshUseHighScaleStateLocation, 1f);
+        var cameraPosition = scene.Camera.Position;
+        _highScaleTransformBatchUploadsThisFrame = 0;
         foreach (var layer in EnumerateHighScaleLayers(scene))
         {
             if (!layer.IsVisible || layer.Instances.Count == 0) continue;
@@ -418,120 +514,641 @@ internal sealed class OpenGlSceneRenderer
                 layer.Chunks.Rebuild(layer.Instances, layer.Template.LocalBounds);
             }
 
+            if (ShouldUseAggregateLayerBatches(layer, scene.Performance))
+            {
+                DrawHighScaleAggregateLayer(gl, scene, layer, cameraPosition, scene.Performance, stats);
+                layer.StateBuffer.ClearDirty();
+                continue;
+            }
+
             var visibleChunks = layer.Chunks.QueryVisible(viewProjection);
             stats.TotalChunkCount += layer.Chunks.Chunks.Count;
-            stats.VisibleChunkCount += visibleChunks.Count;
+            var visibleChunkLimit = scene.Performance.MaxVisibleHighScaleChunks > 0 ? System.Math.Min(scene.Performance.MaxVisibleHighScaleChunks, visibleChunks.Count) : visibleChunks.Count;
+            stats.VisibleChunkCount += visibleChunkLimit;
 
-            foreach (var chunk in visibleChunks)
+            for (var visibleChunkIndex = 0; visibleChunkIndex < visibleChunkLimit; visibleChunkIndex++)
             {
-                foreach (var lod in new[] { HighScaleLodLevel3D.Detailed, HighScaleLodLevel3D.Simplified, HighScaleLodLevel3D.Proxy })
-                {
-                    var parts = layer.Template.ResolveParts(lod);
-                    for (var partIndex = 0; partIndex < parts.Count; partIndex++)
-                    {
-                        var part = parts[partIndex];
-                        var batch = EnsureHighScaleGpuBatch(gl, layer, chunk, lod, partIndex, part, scene.Camera.Position, stats);
-                        if (batch.InstanceCount == 0) continue;
-                        var meshResource = EnsureMeshResource(gl, part.Mesh.ResourceKey, 0, part.Mesh, stats);
-                        BindMeshAttributes(gl, meshResource);
-                        gl.BindBuffer(GlArrayBuffer, batch.InstanceBuffer);
-                        EnableInstanceAttributes(gl);
-                        UploadMatrix(_uniformMatrix4fv, _meshPartLocalLocation, part.LocalTransform, _matrixUploadBuffer);
-                        UploadFloat(_uniform1f, _meshLightingEnabledLocation, part.LightingMode == LightingMode.Lambert ? 1f : 0f);
-                        _drawElementsInstanced?.Invoke(GlTriangles, meshResource.IndexCount, GlUnsignedInt, IntPtr.Zero, batch.InstanceCount);
-                        stats.DrawCallCount++;
-                        stats.EstimatedDrawCallCount++;
-                        stats.InstancedBatchCount++;
-                        stats.VisibleMeshCount += batch.InstanceCount;
-                        stats.TriangleCount += (part.Mesh.Indices.Length / 3) * batch.InstanceCount;
-                    }
-                }
+                var chunk = visibleChunks[visibleChunkIndex];
+                var planStart = Stopwatch.GetTimestamp();
+                var plan = BuildHighScaleChunkPlan(layer, chunk, cameraPosition, stats, scene.Performance);
+                stats.HighScalePlanMilliseconds += GetElapsedMilliseconds(planStart);
+
+                DrawHighScaleLod(gl, layer, chunk, HighScaleLodLevel3D.Detailed, plan.Detailed, cameraPosition, scene.Performance, stats);
+                DrawHighScaleLod(gl, layer, chunk, HighScaleLodLevel3D.Simplified, plan.Simplified, cameraPosition, scene.Performance, stats);
+                DrawHighScaleLod(gl, layer, chunk, HighScaleLodLevel3D.Proxy, plan.Proxy, cameraPosition, scene.Performance, stats);
+                DrawHighScaleLod(gl, layer, chunk, HighScaleLodLevel3D.Billboard, plan.Billboard, cameraPosition, scene.Performance, stats);
+                chunk.MarkClean();
             }
+
+            layer.StateBuffer.ClearDirty();
+
         }
+        UploadFloat(_uniform1f, _meshUseHighScaleStateLocation, 0f);
+        UploadFloat(_uniform1f, _meshUsePaletteTextureLocation, 0f);
         UploadFloat(_uniform1f, _meshUsePartLocalLocation, 0f);
         ResetInstanceAttributeDivisors();
     }
 
-    private void DrawHighScaleLayersLegacy(GlInterface gl, Scene3D scene, Matrix4x4 viewProjection, RenderStats stats)
+
+    private static bool ShouldUseAggregateLayerBatches(HighScaleInstanceLayer3D layer, ScenePerformanceOptions performance)
+        => performance.EnableHighScaleAggregateLayerBatches &&
+           layer.Instances.Count > 0 &&
+           layer.Instances.Count <= performance.HighScaleAggregateLayerInstanceThreshold;
+
+    private void DrawHighScaleAggregateLayer(
+        GlInterface gl,
+        Scene3D scene,
+        HighScaleInstanceLayer3D layer,
+        Vector3 cameraPosition,
+        ScenePerformanceOptions performance,
+        RenderStats stats)
     {
-        UploadFloat(_uniform1f, _meshUsePartLocalLocation, 0f);
-        foreach (var layer in EnumerateHighScaleLayers(scene))
+        stats.TotalChunkCount += layer.Chunks.Chunks.Count;
+        stats.VisibleChunkCount += layer.Chunks.Chunks.Count;
+
+        var planStart = Stopwatch.GetTimestamp();
+        var plan = BuildHighScaleLayerPlan(layer, cameraPosition, stats, performance);
+        stats.HighScalePlanMilliseconds += GetElapsedMilliseconds(planStart);
+
+        DrawHighScaleAggregateLod(gl, layer, HighScaleLodLevel3D.Detailed, plan.Detailed, cameraPosition, performance, stats);
+        DrawHighScaleAggregateLod(gl, layer, HighScaleLodLevel3D.Simplified, plan.Simplified, cameraPosition, performance, stats);
+        DrawHighScaleAggregateLod(gl, layer, HighScaleLodLevel3D.Proxy, plan.Proxy, cameraPosition, performance, stats);
+        DrawHighScaleAggregateLod(gl, layer, HighScaleLodLevel3D.Billboard, plan.Billboard, cameraPosition, performance, stats);
+    }
+
+    private HighScaleChunkFramePlan BuildHighScaleLayerPlan(HighScaleInstanceLayer3D layer, Vector3 cameraPosition, RenderStats stats, ScenePerformanceOptions performance)
+    {
+        var plan = HighScaleChunkFramePlan.Shared;
+        plan.Reset();
+
+        var count = layer.Instances.Count;
+        for (var index = 0; index < count; index++)
         {
-            if (!layer.IsVisible || layer.Instances.Count == 0) continue;
-            if (layer.Chunks.RebuildRequested) layer.Chunks.Rebuild(layer.Instances, layer.Template.LocalBounds);
-            var visibleChunks = layer.Chunks.QueryVisible(viewProjection);
-            stats.TotalChunkCount += layer.Chunks.Chunks.Count;
-            stats.VisibleChunkCount += visibleChunks.Count;
-            foreach (var chunk in visibleChunks)
+            var record = layer.Instances[index];
+
+            if (performance.MaxHighScaleVisibleInstances > 0 && stats.HighScaleInstanceCount >= performance.MaxHighScaleVisibleInstances)
             {
-                foreach (var index in chunk.InstanceIndices)
-                {
-                    var record = layer.Instances[index];
-                    if ((record.Flags & InstanceFlags3D.Visible) == 0) continue;
-                    var lod = layer.LodPolicy.Resolve(scene.Camera.Position, record.Transform);
-                    if (lod == HighScaleLodLevel3D.Billboard) { stats.LodBillboardCount++; continue; }
-                    var parts = layer.Template.ResolveParts(lod);
-                    for (var i = 0; i < parts.Count; i++)
-                    {
-                        var part = parts[i];
-                        var resource = EnsureMeshResource(gl, part.Mesh.ResourceKey, 0, part.Mesh, stats);
-                        BindMeshAttributes(gl, resource);
-                        var model = part.LocalTransform * record.Transform;
-                        UploadMatrix(_uniformMatrix4fv, _meshModelLocation, model, _matrixUploadBuffer);
-                        UploadColor(_uniform4f, _meshColorLocation, layer.ResolveColor(part, record));
-                        UploadFloat(_uniform1f, _meshLightingEnabledLocation, part.LightingMode == LightingMode.Lambert ? 1f : 0f);
-                        gl.DrawElements(GlTriangles, resource.IndexCount, GlUnsignedInt, IntPtr.Zero);
-                        stats.DrawCallCount++;
-                        stats.VisibleMeshCount++;
-                        stats.TriangleCount += part.Mesh.Indices.Length / 3;
-                    }
-                    stats.HighScaleInstanceCount++;
-                }
+                stats.LodCulledCount++;
+                stats.CulledObjectCount++;
+                continue;
             }
+
+            var lod = layer.LodPolicy.Resolve(cameraPosition, record.Transform);
+            if (lod == HighScaleLodLevel3D.Culled)
+            {
+                stats.LodCulledCount++;
+                stats.CulledObjectCount++;
+                continue;
+            }
+
+            stats.HighScaleInstanceCount++;
+            if (lod == HighScaleLodLevel3D.Detailed)
+            {
+                stats.LodDetailedCount++;
+                plan.Detailed.Add(index);
+            }
+            else if (lod == HighScaleLodLevel3D.Simplified)
+            {
+                stats.LodSimplifiedCount++;
+                plan.Simplified.Add(index);
+            }
+            else if (lod == HighScaleLodLevel3D.Proxy)
+            {
+                stats.LodProxyCount++;
+                plan.Proxy.Add(index);
+            }
+            else if (lod == HighScaleLodLevel3D.Billboard)
+            {
+                stats.LodBillboardCount++;
+                plan.Billboard.Add(index);
+            }
+        }
+
+        return plan;
+    }
+
+    private void DrawHighScaleAggregateLod(
+        GlInterface gl,
+        HighScaleInstanceLayer3D layer,
+        HighScaleLodLevel3D lod,
+        List<int> instanceIndices,
+        Vector3 cameraPosition,
+        ScenePerformanceOptions performance,
+        RenderStats stats)
+    {
+        if (instanceIndices.Count == 0) return;
+
+        var buildStart = Stopwatch.GetTimestamp();
+        var key = new HighScaleBatchKey(layer.Id, AggregateChunkKey, lod);
+        var batch = EnsureHighScaleGpuBatch(gl, layer, key, false, lod, instanceIndices, cameraPosition, performance, stats);
+        stats.HighScaleBufferBuildMilliseconds += GetElapsedMilliseconds(buildStart);
+        if (batch.InstanceCount == 0) return;
+
+        var parts = layer.Template.ResolveParts(lod);
+        for (var partIndex = 0; partIndex < parts.Count; partIndex++)
+        {
+            var part = parts[partIndex];
+            var meshResource = EnsureMeshResource(gl, part.Mesh.ResourceKey, 0, part.Mesh, stats);
+            BindMeshAttributes(gl, meshResource);
+            EnableHighScaleInstanceAttributes(gl, batch);
+            UploadHighScalePalette(gl, layer, part, performance, stats);
+            UploadMatrix(_uniformMatrix4fv, _meshPartLocalLocation, part.LocalTransform, _matrixUploadBuffer);
+            UploadFloat(_uniform1f, _meshLightingEnabledLocation, part.LightingMode == LightingMode.Lambert ? 1f : 0f);
+            _drawElementsInstanced?.Invoke(GlTriangles, meshResource.IndexCount, GlUnsignedInt, IntPtr.Zero, batch.InstanceCount);
+            stats.DrawCallCount++;
+            stats.EstimatedDrawCallCount++;
+            stats.InstancedBatchCount++;
+            stats.VisibleMeshCount += batch.InstanceCount;
+            stats.HighScaleVisiblePartInstanceCount += batch.InstanceCount;
+            if (part.UsesVertexMaterialSlots) stats.BakedHighScalePartDraws++;
+            stats.TriangleCount += (part.Mesh.Indices.Length / 3) * batch.InstanceCount;
+        }
+    }
+
+    private HighScaleChunkFramePlan BuildHighScaleChunkPlan(HighScaleInstanceLayer3D layer, HighScaleChunk3D chunk, Vector3 cameraPosition, RenderStats stats, ScenePerformanceOptions performance)
+    {
+        var plan = HighScaleChunkFramePlan.Shared;
+        plan.Reset();
+
+        if (ShouldUseChunkLevelLodPlanning(layer, chunk, performance))
+        {
+            AddChunkAsSingleLod(layer, chunk, cameraPosition, stats, performance, plan);
+            return plan;
+        }
+
+        foreach (var index in chunk.InstanceIndices)
+        {
+            var record = layer.Instances[index];
+
+            if (performance.MaxHighScaleVisibleInstances > 0 && stats.HighScaleInstanceCount >= performance.MaxHighScaleVisibleInstances)
+            {
+                stats.LodCulledCount++;
+                stats.CulledObjectCount++;
+                continue;
+            }
+
+            var lod = layer.LodPolicy.Resolve(cameraPosition, record.Transform);
+            if (lod == HighScaleLodLevel3D.Culled)
+            {
+                stats.LodCulledCount++;
+                stats.CulledObjectCount++;
+                continue;
+            }
+
+            stats.HighScaleInstanceCount++;
+            if (lod == HighScaleLodLevel3D.Detailed)
+            {
+                stats.LodDetailedCount++;
+                plan.Detailed.Add(index);
+            }
+            else if (lod == HighScaleLodLevel3D.Simplified)
+            {
+                stats.LodSimplifiedCount++;
+                plan.Simplified.Add(index);
+            }
+            else if (lod == HighScaleLodLevel3D.Proxy)
+            {
+                stats.LodProxyCount++;
+                plan.Proxy.Add(index);
+            }
+            else if (lod == HighScaleLodLevel3D.Billboard)
+            {
+                stats.LodBillboardCount++;
+                plan.Billboard.Add(index);
+            }
+        }
+
+        return plan;
+    }
+
+    private static bool ShouldUseChunkLevelLodPlanning(HighScaleInstanceLayer3D layer, HighScaleChunk3D chunk, ScenePerformanceOptions performance)
+    {
+        if (!performance.EnableHighScaleChunkLodPlanning) return false;
+        if (layer.Instances.Count < performance.HighScaleChunkLodPlanningInstanceThreshold) return false;
+        return chunk.InstanceIndices.Count >= performance.HighScaleChunkLodPlanningChunkThreshold;
+    }
+
+    private static void AddChunkAsSingleLod(HighScaleInstanceLayer3D layer, HighScaleChunk3D chunk, Vector3 cameraPosition, RenderStats stats, ScenePerformanceOptions performance, HighScaleChunkFramePlan plan)
+    {
+        var lod = ResolveChunkLod(layer, chunk, cameraPosition);
+        var indices = chunk.InstanceIndices;
+        var remaining = performance.MaxHighScaleVisibleInstances > 0
+            ? System.Math.Max(0, performance.MaxHighScaleVisibleInstances - stats.HighScaleInstanceCount)
+            : indices.Count;
+        var count = System.Math.Min(indices.Count, remaining);
+
+        if (count <= 0 || lod == HighScaleLodLevel3D.Culled)
+        {
+            stats.LodCulledCount += indices.Count;
+            stats.CulledObjectCount += indices.Count;
+            return;
+        }
+
+        var target = lod == HighScaleLodLevel3D.Detailed ? plan.Detailed :
+            lod == HighScaleLodLevel3D.Simplified ? plan.Simplified :
+            lod == HighScaleLodLevel3D.Billboard ? plan.Billboard :
+            plan.Proxy;
+
+        for (var i = 0; i < count; i++)
+        {
+            target.Add(indices[i]);
+        }
+
+        stats.HighScaleInstanceCount += count;
+        if (lod == HighScaleLodLevel3D.Detailed) stats.LodDetailedCount += count;
+        else if (lod == HighScaleLodLevel3D.Simplified) stats.LodSimplifiedCount += count;
+        else if (lod == HighScaleLodLevel3D.Proxy) stats.LodProxyCount += count;
+        else if (lod == HighScaleLodLevel3D.Billboard) stats.LodBillboardCount += count;
+
+        if (count < indices.Count)
+        {
+            var culled = indices.Count - count;
+            stats.LodCulledCount += culled;
+            stats.CulledObjectCount += culled;
+        }
+    }
+
+    private static HighScaleLodLevel3D ResolveChunkLod(HighScaleInstanceLayer3D layer, HighScaleChunk3D chunk, Vector3 cameraPosition)
+    {
+        var center = chunk.Bounds.Center;
+        var d2 = Vector3.DistanceSquared(cameraPosition, center);
+        var policy = layer.LodPolicy;
+        if (d2 > policy.DrawDistance * policy.DrawDistance) return HighScaleLodLevel3D.Culled;
+        if (d2 <= policy.DetailedDistance * policy.DetailedDistance) return HighScaleLodLevel3D.Detailed;
+        if (d2 <= policy.SimplifiedDistance * policy.SimplifiedDistance) return HighScaleLodLevel3D.Simplified;
+        if (d2 <= policy.ProxyDistance * policy.ProxyDistance) return HighScaleLodLevel3D.Proxy;
+        return policy.EnableBillboardFallback ? HighScaleLodLevel3D.Billboard : HighScaleLodLevel3D.Proxy;
+    }
+
+    private void DrawHighScaleLod(
+        GlInterface gl,
+        HighScaleInstanceLayer3D layer,
+        HighScaleChunk3D chunk,
+        HighScaleLodLevel3D lod,
+        List<int> instanceIndices,
+        Vector3 cameraPosition,
+        ScenePerformanceOptions performance,
+        RenderStats stats)
+    {
+        if (instanceIndices.Count == 0) return;
+
+        var buildStart = Stopwatch.GetTimestamp();
+        var key = new HighScaleBatchKey(layer.Id, chunk.Key, lod);
+        var batch = EnsureHighScaleGpuBatch(gl, layer, key, chunk.IsDirty, lod, instanceIndices, cameraPosition, performance, stats);
+        stats.HighScaleBufferBuildMilliseconds += GetElapsedMilliseconds(buildStart);
+        if (batch.InstanceCount == 0) return;
+
+        var parts = layer.Template.ResolveParts(lod);
+        for (var partIndex = 0; partIndex < parts.Count; partIndex++)
+        {
+            var part = parts[partIndex];
+            var meshResource = EnsureMeshResource(gl, part.Mesh.ResourceKey, 0, part.Mesh, stats);
+            BindMeshAttributes(gl, meshResource);
+            EnableHighScaleInstanceAttributes(gl, batch);
+            UploadHighScalePalette(gl, layer, part, performance, stats);
+            UploadMatrix(_uniformMatrix4fv, _meshPartLocalLocation, part.LocalTransform, _matrixUploadBuffer);
+            UploadFloat(_uniform1f, _meshLightingEnabledLocation, part.LightingMode == LightingMode.Lambert ? 1f : 0f);
+            _drawElementsInstanced?.Invoke(GlTriangles, meshResource.IndexCount, GlUnsignedInt, IntPtr.Zero, batch.InstanceCount);
+            stats.DrawCallCount++;
+            stats.EstimatedDrawCallCount++;
+            stats.InstancedBatchCount++;
+            stats.VisibleMeshCount += batch.InstanceCount;
+            stats.HighScaleVisiblePartInstanceCount += batch.InstanceCount;
+            if (part.UsesVertexMaterialSlots) stats.BakedHighScalePartDraws++;
+            stats.TriangleCount += (part.Mesh.Indices.Length / 3) * batch.InstanceCount;
         }
     }
 
     private HighScaleGpuBatchData EnsureHighScaleGpuBatch(
         GlInterface gl,
         HighScaleInstanceLayer3D layer,
-        HighScaleChunk3D chunk,
+        HighScaleBatchKey key,
+        bool structuralDirty,
         HighScaleLodLevel3D lod,
-        int partIndex,
-        CompositePartTemplate3D part,
+        List<int> instanceIndices,
         Vector3 cameraPosition,
+        ScenePerformanceOptions performance,
         RenderStats stats)
     {
-        var key = layer.Id + "|" + chunk.Key + "|" + lod + "|" + partIndex + "|" + part.Mesh.ResourceKey;
         if (!_highScaleGpuBatches.TryGetValue(key, out var batch))
         {
-            batch = new HighScaleGpuBatchData { InstanceBuffer = gl.GenBuffer() };
+            batch = new HighScaleGpuBatchData
+            {
+                TransformBuffer = gl.GenBuffer(),
+                StateBuffer = gl.GenBuffer()
+            };
             _highScaleGpuBatches[key] = batch;
         }
 
-        var requiredVersion = HashCode.Combine(chunk.Version, layer.Instances.Version, layer.MaterialResolverVersion, (int)lod, partIndex);
-        if (!chunk.IsDirty && batch.Version == requiredVersion && batch.InstanceCount > 0)
+        var dynamicFadeState = performance.EnableHighScaleDynamicFadeState;
+        var fadeVersion = dynamicFadeState ? QuantizeCameraForFade(cameraPosition) : 0;
+        var rebuildNeeded = structuralDirty || !batch.Matches(instanceIndices);
+        if (rebuildNeeded)
         {
+            var uploadLimit = performance.HighScaleMaxTransformBatchUploadsPerFrame;
+            if (uploadLimit > 0 && _highScaleTransformBatchUploadsThisFrame >= uploadLimit)
+            {
+                return batch;
+            }
+
+            RebuildHighScaleGpuBatch(gl, layer, instanceIndices, cameraPosition, batch, fadeVersion, dynamicFadeState, stats);
+            _highScaleTransformBatchUploadsThisFrame++;
             return batch;
         }
 
-        batch.ResetCpuData();
-        foreach (var index in chunk.InstanceIndices)
+        if (batch.StateVersion != layer.StateBuffer.Version ||
+            batch.MaterialResolverVersion != layer.MaterialResolverVersion ||
+            batch.LodPolicyVersion != layer.LodPolicy.Version ||
+            batch.FadeVersion != fadeVersion)
         {
-            var record = layer.Instances[index];
-            if ((record.Flags & InstanceFlags3D.Visible) == 0) continue;
-            var resolvedLod = layer.LodPolicy.Resolve(cameraPosition, record.Transform);
-            if (resolvedLod != lod) continue;
-            batch.Add(record.Transform, layer.ResolveColor(part, record));
+            var stateStart = Stopwatch.GetTimestamp();
+            UpdateHighScaleStateBuffer(gl, layer, cameraPosition, batch, fadeVersion, dynamicFadeState, performance, stats);
+            stats.HighScaleUploadMilliseconds += GetElapsedMilliseconds(stateStart);
         }
 
-        gl.BindBuffer(GlArrayBuffer, batch.InstanceBuffer);
-        UploadFloats(gl, GlArrayBuffer, batch.Data, batch.FloatCount, GlDynamicDraw);
-        batch.Version = requiredVersion;
-        batch.MarkUploaded();
-        stats.InstanceBufferUploads++;
-        stats.InstanceUploadBytes += batch.FloatCount * sizeof(float);
         return batch;
     }
+
+    private void RebuildHighScaleGpuBatch(
+        GlInterface gl,
+        HighScaleInstanceLayer3D layer,
+        List<int> instanceIndices,
+        Vector3 cameraPosition,
+        HighScaleGpuBatchData batch,
+        int fadeVersion,
+        bool dynamicFadeState,
+        RenderStats stats)
+    {
+        batch.ResetCpuData();
+        for (var i = 0; i < instanceIndices.Count; i++)
+        {
+            var instanceIndex = instanceIndices[i];
+            var record = layer.Instances[instanceIndex];
+            batch.Add(
+                instanceIndex,
+                record.Transform,
+                record.MaterialVariantId,
+                IsHighScaleVisible(record),
+                ResolveHighScaleStateAlpha(layer, record, cameraPosition, dynamicFadeState));
+        }
+
+        var uploadStart = Stopwatch.GetTimestamp();
+        gl.BindBuffer(GlArrayBuffer, batch.TransformBuffer);
+        UploadFloats(gl, GlArrayBuffer, batch.TransformData, batch.TransformFloatCount, GlStaticDraw);
+        gl.BindBuffer(GlArrayBuffer, batch.StateBuffer);
+        UploadFloats(gl, GlArrayBuffer, batch.StateData, batch.StateFloatCount, GlDynamicDraw);
+        stats.HighScaleUploadMilliseconds += GetElapsedMilliseconds(uploadStart);
+
+        batch.StateVersion = layer.StateBuffer.Version;
+        batch.MaterialResolverVersion = layer.MaterialResolverVersion;
+        batch.LodPolicyVersion = layer.LodPolicy.Version;
+        batch.FadeVersion = fadeVersion;
+        batch.TransformBufferCapacityBytes = batch.TransformFloatCount * sizeof(float);
+        batch.StateBufferCapacityBytes = batch.StateFloatCount * sizeof(float);
+        stats.InstanceBufferUploads++;
+        stats.StateBufferUploads++;
+        stats.InstanceUploadBytes += batch.TransformBufferCapacityBytes;
+        stats.StateUploadBytes += batch.StateBufferCapacityBytes;
+    }
+
+    private void UpdateHighScaleStateBuffer(
+        GlInterface gl,
+        HighScaleInstanceLayer3D layer,
+        Vector3 cameraPosition,
+        HighScaleGpuBatchData batch,
+        int fadeVersion,
+        bool dynamicFadeState,
+        ScenePerformanceOptions performance,
+        RenderStats stats)
+    {
+        if (batch.InstanceCount == 0)
+        {
+            batch.StateVersion = layer.StateBuffer.Version;
+            batch.MaterialResolverVersion = layer.MaterialResolverVersion;
+            batch.LodPolicyVersion = layer.LodPolicy.Version;
+            batch.FadeVersion = fadeVersion;
+            return;
+        }
+
+        var dirtyIndices = layer.StateBuffer.DirtyIndices;
+        var resolverChanged = batch.MaterialResolverVersion != layer.MaterialResolverVersion;
+        var lodPolicyChanged = batch.LodPolicyVersion != layer.LodPolicy.Version;
+        var fadeChanged = batch.FadeVersion != fadeVersion;
+
+        // Important: dirtyIndices is global for the layer, while this batch contains only
+        // one visible chunk/LOD subset. The previous implementation compared the global
+        // dirty count with this batch size and therefore forced a full state upload for
+        // almost every visible batch under telemetry load. That made state upload scale
+        // like visible part/batch work instead of changed logical instances.
+        var forceFullUpdate = resolverChanged || lodPolicyChanged || fadeChanged || _bufferSubData is null ||
+                              (dirtyIndices.Count == 0 && batch.StateVersion != layer.StateBuffer.Version);
+
+        if (!forceFullUpdate)
+        {
+            batch.ResetDirtyOffsets();
+            for (var i = 0; i < dirtyIndices.Count; i++)
+            {
+                var instanceIndex = dirtyIndices[i];
+                if (!batch.TryGetOffset(instanceIndex, out var offset))
+                {
+                    continue;
+                }
+
+                var record = layer.Instances[instanceIndex];
+                batch.WriteState(offset, record.MaterialVariantId, IsHighScaleVisible(record), ResolveHighScaleStateAlpha(layer, record, cameraPosition, dynamicFadeState));
+                batch.AddDirtyOffset(offset);
+            }
+
+            // Decide full-vs-partial per batch after we know how many dirty instances
+            // actually belong to this batch. This is the core fix for 10k/50k telemetry.
+            forceFullUpdate = batch.DirtyOffsetCount > System.Math.Max(32, batch.InstanceCount / 3);
+        }
+
+        if (forceFullUpdate)
+        {
+            for (var offset = 0; offset < batch.InstanceCount; offset++)
+            {
+                var instanceIndex = batch.GetInstanceIndexAt(offset);
+                var record = layer.Instances[instanceIndex];
+                batch.WriteState(offset, record.MaterialVariantId, IsHighScaleVisible(record), ResolveHighScaleStateAlpha(layer, record, cameraPosition, dynamicFadeState));
+            }
+
+            gl.BindBuffer(GlArrayBuffer, batch.StateBuffer);
+            if (_bufferSubData is not null && batch.StateBufferCapacityBytes >= batch.StateFloatCount * sizeof(float))
+            {
+                UploadFloatsSubData(GlArrayBuffer, 0, batch.StateData, 0, batch.StateFloatCount);
+                stats.StateBufferSubDataUploads++;
+            }
+            else
+            {
+                UploadFloats(gl, GlArrayBuffer, batch.StateData, batch.StateFloatCount, GlDynamicDraw);
+                batch.StateBufferCapacityBytes = batch.StateFloatCount * sizeof(float);
+                stats.StateBufferUploads++;
+            }
+
+            stats.StateUploadBytes += batch.StateFloatCount * sizeof(float);
+        }
+        else if (batch.DirtyOffsetCount > 0)
+        {
+            gl.BindBuffer(GlArrayBuffer, batch.StateBuffer);
+            batch.SortDirtyOffsets();
+
+            var mergeGap = System.Math.Max(0, performance.HighScalePartialStateMergeGap);
+            var rangeStart = batch.GetDirtyOffsetAt(0);
+            var previous = rangeStart;
+            for (var i = 1; i <= batch.DirtyOffsetCount; i++)
+            {
+                var current = i < batch.DirtyOffsetCount ? batch.GetDirtyOffsetAt(i) : -1;
+                if (current >= 0 && current <= previous + 1 + mergeGap)
+                {
+                    previous = current;
+                    continue;
+                }
+
+                var floatOffset = rangeStart * HighScaleStateFloatStride;
+                var floatCount = (previous - rangeStart + 1) * HighScaleStateFloatStride;
+                UploadFloatsSubData(GlArrayBuffer, floatOffset * sizeof(float), batch.StateData, floatOffset, floatCount);
+                stats.StateBufferSubDataUploads++;
+                stats.StateUploadBytes += floatCount * sizeof(float);
+                rangeStart = current;
+                previous = current;
+            }
+        }
+
+        batch.StateVersion = layer.StateBuffer.Version;
+        batch.MaterialResolverVersion = layer.MaterialResolverVersion;
+        batch.LodPolicyVersion = layer.LodPolicy.Version;
+        batch.FadeVersion = fadeVersion;
+    }
+
+    private void UploadHighScalePalette(GlInterface gl, HighScaleInstanceLayer3D layer, CompositePartTemplate3D part, ScenePerformanceOptions performance, RenderStats stats)
+    {
+        if (part.UsesVertexMaterialSlots && _paletteTexture != 0)
+        {
+            UploadFloat(_uniform1f, _meshUsePaletteTextureLocation, 1f);
+            UploadHighScalePaletteTexture(gl, layer, part);
+            return;
+        }
+
+        UploadFloat(_uniform1f, _meshUsePaletteTextureLocation, 0f);
+        var count = ResolveActiveVariantSlotCount(layer);
+        for (var i = 0; i < count; i++)
+        {
+            UploadColor(_uniform4f, _meshVariantColorLocations[i], layer.Template.ResolveColor(part, i));
+        }
+    }
+
+    private void UploadHighScalePaletteTexture(GlInterface gl, HighScaleInstanceLayer3D layer, CompositePartTemplate3D part)
+    {
+        var variantCount = ResolveActiveVariantSlotCount(layer);
+        var slotCount = System.Math.Clamp(part.MaterialSlotBaseColors.Count, 1, 64);
+        var required = variantCount * slotCount * 4;
+        if (_paletteUploadBuffer.Length < required)
+        {
+            _paletteUploadBuffer = new byte[required];
+        }
+
+        for (var variant = 0; variant < variantCount; variant++)
+        {
+            for (var slot = 0; slot < slotCount; slot++)
+            {
+                var baseColor = slot < part.MaterialSlotBaseColors.Count ? part.MaterialSlotBaseColors[slot] : part.BaseColor;
+                var color = layer.Template.ResolveColor(slot, baseColor, variant);
+                var offset = ((variant * slotCount) + slot) * 4;
+                _paletteUploadBuffer[offset] = ToByte(color.R);
+                _paletteUploadBuffer[offset + 1] = ToByte(color.G);
+                _paletteUploadBuffer[offset + 2] = ToByte(color.B);
+                _paletteUploadBuffer[offset + 3] = ToByte(color.A);
+            }
+        }
+
+        var handle = GCHandle.Alloc(_paletteUploadBuffer, GCHandleType.Pinned);
+        try
+        {
+            gl.ActiveTexture(GlTexture1);
+            gl.BindTexture(GlTexture2D, _paletteTexture);
+            gl.TexParameteri(GlTexture2D, GlTextureMinFilter, GlNearest);
+            gl.TexParameteri(GlTexture2D, GlTextureMagFilter, GlNearest);
+            gl.TexParameteri(GlTexture2D, GlTextureWrapS, GlClampToEdge);
+            gl.TexParameteri(GlTexture2D, GlTextureWrapT, GlClampToEdge);
+            gl.TexImage2D(GlTexture2D, 0, GlRgba, slotCount, variantCount, 0, GlRgba, GlUnsignedByte, handle.AddrOfPinnedObject());
+            if (_meshPaletteTextureLocation >= 0) _uniform1i?.Invoke(_meshPaletteTextureLocation, 1);
+            UploadFloat(_uniform1f, _meshPaletteWidthLocation, slotCount);
+            UploadFloat(_uniform1f, _meshPaletteHeightLocation, variantCount);
+            gl.ActiveTexture(GlTexture0);
+        }
+        finally
+        {
+            handle.Free();
+        }
+    }
+
+    private static byte ToByte(float value)
+        => (byte)System.Math.Clamp((int)System.MathF.Round(System.Math.Clamp(value, 0f, 1f) * 255f), 0, 255);
+
+    private static int ResolveActiveVariantSlotCount(HighScaleInstanceLayer3D layer)
+    {
+        var max = 0;
+        foreach (var id in layer.Template.MaterialVariants.Keys)
+        {
+            if (id > max) max = id;
+        }
+
+        return System.Math.Clamp(max + 1, 1, MaxHighScaleMaterialVariants);
+    }
+
+    private static bool IsHighScaleVisible(InstanceRecord3D record)
+        => (record.Flags & InstanceFlags3D.Visible) != 0;
+
+    private static float ResolveHighScaleStateAlpha(HighScaleInstanceLayer3D layer, InstanceRecord3D record, Vector3 cameraPosition, bool dynamicFadeState)
+    {
+        if (!IsHighScaleVisible(record)) return 0f;
+        return dynamicFadeState ? layer.LodPolicy.ResolveFadeAlpha(cameraPosition, record.Transform) : 1f;
+    }
+
+    private static int QuantizeCameraForFade(Vector3 cameraPosition)
+    {
+        // Fade alpha is allowed to update less frequently than raw camera motion.
+        // This keeps retained transform batches stable while still preventing abrupt draw-distance popping.
+        const float cell = 2f;
+        return HashCode.Combine(
+            (int)System.MathF.Floor(cameraPosition.X / cell),
+            (int)System.MathF.Floor(cameraPosition.Y / cell),
+            (int)System.MathF.Floor(cameraPosition.Z / cell));
+    }
+
+    private static float ResolveDistanceAlpha(Scene3D scene, Matrix4x4 model)
+    {
+        var drawDistance = scene.Performance.DrawDistance;
+        if (drawDistance <= 0f || float.IsPositiveInfinity(drawDistance))
+        {
+            return 1f;
+        }
+
+        var camera = scene.Camera.Position;
+        var pos = new Vector3(model.M41, model.M42, model.M43);
+        var distance = Vector3.Distance(camera, pos);
+        if (distance > drawDistance)
+        {
+            return 0f;
+        }
+
+        if (!scene.Performance.EnableDistanceFade || scene.Performance.DistanceFadeBand <= 0.001f)
+        {
+            return 1f;
+        }
+
+        var fadeStart = System.MathF.Max(0f, drawDistance - scene.Performance.DistanceFadeBand);
+        if (distance <= fadeStart)
+        {
+            return 1f;
+        }
+
+        return System.Math.Clamp(1f - ((distance - fadeStart) / System.MathF.Max(scene.Performance.DistanceFadeBand, 0.001f)), 0f, 1f);
+    }
+
+    private static ColorRgba ApplyDistanceAlpha(ColorRgba color, float alpha)
+        => alpha >= 0.999f ? color : new ColorRgba(color.R, color.G, color.B, color.A * alpha);
 
     private static ColorRgba ResolveColor(Object3D obj)
     {
@@ -594,6 +1211,7 @@ internal sealed class OpenGlSceneRenderer
             GeometryVersion = geometryVersion,
             VertexBuffer = gl.GenBuffer(),
             NormalBuffer = gl.GenBuffer(),
+            MaterialSlotBuffer = gl.GenBuffer(),
             IndexBuffer = gl.GenBuffer(),
             IndexCount = mesh.Indices.Length
         };
@@ -601,6 +1219,8 @@ internal sealed class OpenGlSceneRenderer
         UploadVector3(gl, GlArrayBuffer, mesh.Positions, GlStaticDraw);
         gl.BindBuffer(GlArrayBuffer, resource.NormalBuffer);
         UploadVector3(gl, GlArrayBuffer, GetNormalsOrDefault(mesh), GlStaticDraw);
+        gl.BindBuffer(GlArrayBuffer, resource.MaterialSlotBuffer);
+        UploadFloats(gl, GlArrayBuffer, GetMaterialSlotsOrDefault(mesh), mesh.Positions.Length, GlStaticDraw);
         gl.BindBuffer(GlElementArrayBuffer, resource.IndexBuffer);
         UploadInts(gl, GlElementArrayBuffer, mesh.Indices, GlStaticDraw);
         _meshResources[id] = resource;
@@ -678,6 +1298,21 @@ internal sealed class OpenGlSceneRenderer
         finally { handle.Free(); }
     }
 
+    private void UploadFloatsSubData(int target, int byteOffset, float[] data, int floatOffset, int count)
+    {
+        if (count <= 0 || _bufferSubData is null) return;
+        var handle = GCHandle.Alloc(data, GCHandleType.Pinned);
+        try
+        {
+            var source = IntPtr.Add(handle.AddrOfPinnedObject(), floatOffset * sizeof(float));
+            _bufferSubData(target, new IntPtr(byteOffset), new IntPtr(count * sizeof(float)), source);
+        }
+        finally
+        {
+            handle.Free();
+        }
+    }
+
     private static void UploadVector3(GlInterface gl, int target, Vector3[] data, int usage)
     {
         var floats = new float[data.Length * 3];
@@ -724,6 +1359,12 @@ internal sealed class OpenGlSceneRenderer
         }
         UploadVector4(_uniform4f, _meshPointLightPositionLocation, pointPosition);
         UploadVector4(_uniform4f, _meshPointLightColorLocation, pointColor);
+    }
+
+    private static float[] GetMaterialSlotsOrDefault(Mesh3D mesh)
+    {
+        if (mesh.MaterialSlots.Length == mesh.Positions.Length) return mesh.MaterialSlots;
+        return new float[mesh.Positions.Length];
     }
 
     private static Vector3[] GetNormalsOrDefault(Mesh3D mesh)
@@ -780,6 +1421,11 @@ internal sealed class OpenGlSceneRenderer
         buffer[offset + 12] = matrix.M41; buffer[offset + 13] = matrix.M42; buffer[offset + 14] = matrix.M43; buffer[offset + 15] = matrix.M44;
     }
 
+
+    private static double GetElapsedMilliseconds(long startTimestamp)
+    {
+        return (Stopwatch.GetTimestamp() - startTimestamp) * 1000d / Stopwatch.Frequency;
+    }
     private static int CreateProgram(GlInterface gl, string vertexSource, string fragmentSource, params (int Location, string Name)[] attributes)
     {
         var vertexShader = gl.CreateShader(GlVertexShader);
@@ -815,17 +1461,41 @@ internal sealed class OpenGlSceneRenderer
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlUniformMatrix4fvDelegate(int location, int count, byte transpose, IntPtr value);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlVertexAttribDivisorDelegate(int index, int divisor);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlDrawElementsInstancedDelegate(int mode, int count, int type, IntPtr indices, int instanceCount);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlBufferSubDataDelegate(int target, IntPtr offset, IntPtr size, IntPtr data);
 
+
+    private sealed class HighScaleChunkFramePlan
+    {
+        [ThreadStatic]
+        private static HighScaleChunkFramePlan? _shared;
+
+        public static HighScaleChunkFramePlan Shared => _shared ??= new HighScaleChunkFramePlan();
+
+        public readonly List<int> Detailed = new(256);
+        public readonly List<int> Simplified = new(1024);
+        public readonly List<int> Proxy = new(1024);
+        public readonly List<int> Billboard = new(1024);
+
+        public void Reset()
+        {
+            Detailed.Clear();
+            Simplified.Clear();
+            Proxy.Clear();
+            Billboard.Clear();
+        }
+    }
     private sealed class MeshGpuResource
     {
         public int GeometryVersion { get; init; }
         public int VertexBuffer { get; init; }
         public int NormalBuffer { get; init; }
+        public int MaterialSlotBuffer { get; init; }
         public int IndexBuffer { get; init; }
         public int IndexCount { get; init; }
         public void Dispose(GlInterface gl)
         {
             if (NormalBuffer != 0) gl.DeleteBuffer(NormalBuffer);
+            if (MaterialSlotBuffer != 0) gl.DeleteBuffer(MaterialSlotBuffer);
             if (VertexBuffer != 0) gl.DeleteBuffer(VertexBuffer);
             if (IndexBuffer != 0) gl.DeleteBuffer(IndexBuffer);
         }
@@ -859,37 +1529,124 @@ internal sealed class OpenGlSceneRenderer
         }
     }
 
+    private readonly struct HighScaleBatchKey : IEquatable<HighScaleBatchKey>
+    {
+        private readonly string _layerId;
+        private readonly HighScaleChunkKey3D _chunkKey;
+        private readonly HighScaleLodLevel3D _lod;
+
+        public HighScaleBatchKey(string layerId, HighScaleChunkKey3D chunkKey, HighScaleLodLevel3D lod)
+        {
+            _layerId = layerId;
+            _chunkKey = chunkKey;
+            _lod = lod;
+        }
+
+        public bool Equals(HighScaleBatchKey other)
+            => string.Equals(_layerId, other._layerId, StringComparison.Ordinal) &&
+               _chunkKey.Equals(other._chunkKey) &&
+               _lod == other._lod;
+
+        public override bool Equals(object? obj) => obj is HighScaleBatchKey other && Equals(other);
+
+        public override int GetHashCode() => HashCode.Combine(_layerId, _chunkKey, _lod);
+    }
+
     private sealed class HighScaleGpuBatchData
     {
-        private float[] _data = new float[InstanceFloatStride * 128];
-        public int InstanceBuffer { get; init; }
-        public int Version { get; set; }
+        private float[] _transformData = new float[HighScaleTransformFloatStride * 128];
+        private float[] _stateData = new float[HighScaleStateFloatStride * 128];
+        private int[] _instanceIndices = new int[128];
+        private readonly Dictionary<int, int> _offsetByInstanceIndex = new();
+        private readonly List<int> _dirtyOffsets = new(256);
+
+        public int TransformBuffer { get; init; }
+        public int StateBuffer { get; init; }
+        public int StateVersion { get; set; }
+        public int MaterialResolverVersion { get; set; }
+        public int LodPolicyVersion { get; set; }
+        public int FadeVersion { get; set; }
+        public int TransformBufferCapacityBytes { get; set; }
+        public int StateBufferCapacityBytes { get; set; }
         public int InstanceCount { get; private set; }
-        public int FloatCount => InstanceCount * InstanceFloatStride;
-        public float[] Data => _data;
-        public void ResetCpuData() => InstanceCount = 0;
-        public void Add(Matrix4x4 model, ColorRgba color)
+        public int TransformFloatCount => InstanceCount * HighScaleTransformFloatStride;
+        public int StateFloatCount => InstanceCount * HighScaleStateFloatStride;
+        public float[] TransformData => _transformData;
+        public float[] StateData => _stateData;
+        public int DirtyOffsetCount => _dirtyOffsets.Count;
+
+        public bool Matches(IReadOnlyList<int> indices)
         {
-            EnsureCapacity((InstanceCount + 1) * InstanceFloatStride);
-            var offset = InstanceCount * InstanceFloatStride;
-            WriteMatrix(_data, offset, model);
-            _data[offset + 16] = color.R;
-            _data[offset + 17] = color.G;
-            _data[offset + 18] = color.B;
-            _data[offset + 19] = color.A;
+            if (InstanceCount != indices.Count)
+            {
+                return false;
+            }
+
+            for (var i = 0; i < indices.Count; i++)
+            {
+                if (_instanceIndices[i] != indices[i])
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        public void ResetCpuData()
+        {
+            InstanceCount = 0;
+            _offsetByInstanceIndex.Clear();
+            _dirtyOffsets.Clear();
+        }
+
+        public void Add(int instanceIndex, Matrix4x4 model, int materialVariantId, bool visible, float fadeAlpha)
+        {
+            EnsureCapacity(InstanceCount + 1);
+            _instanceIndices[InstanceCount] = instanceIndex;
+            _offsetByInstanceIndex[instanceIndex] = InstanceCount;
+
+            var transformOffset = InstanceCount * HighScaleTransformFloatStride;
+            WriteMatrix(_transformData, transformOffset, model);
+            WriteState(InstanceCount, materialVariantId, visible, fadeAlpha);
             InstanceCount++;
         }
-        public void MarkUploaded() { }
+
+        public int GetInstanceIndexAt(int offset) => _instanceIndices[offset];
+
+        public bool TryGetOffset(int instanceIndex, out int offset) => _offsetByInstanceIndex.TryGetValue(instanceIndex, out offset);
+
+        public void WriteState(int offset, int materialVariantId, bool visible, float fadeAlpha)
+        {
+            var stateOffset = offset * HighScaleStateFloatStride;
+            _stateData[stateOffset] = System.Math.Clamp(materialVariantId, 0, MaxHighScaleMaterialVariants - 1);
+            _stateData[stateOffset + 1] = visible ? 1f : 0f;
+            _stateData[stateOffset + 2] = System.Math.Clamp(fadeAlpha, 0f, 1f);
+            _stateData[stateOffset + 3] = 0f;
+        }
+
+        public void ResetDirtyOffsets() => _dirtyOffsets.Clear();
+
+        public void AddDirtyOffset(int offset) => _dirtyOffsets.Add(offset);
+
+        public void SortDirtyOffsets() => _dirtyOffsets.Sort();
+
+        public int GetDirtyOffsetAt(int index) => _dirtyOffsets[index];
+
         public void Dispose(GlInterface gl)
         {
-            if (InstanceBuffer != 0) gl.DeleteBuffer(InstanceBuffer);
+            if (TransformBuffer != 0) gl.DeleteBuffer(TransformBuffer);
+            if (StateBuffer != 0) gl.DeleteBuffer(StateBuffer);
         }
-        private void EnsureCapacity(int required)
+
+        private void EnsureCapacity(int requiredInstances)
         {
-            if (_data.Length >= required) return;
-            var next = _data.Length;
-            while (next < required) next *= 2;
-            Array.Resize(ref _data, next);
+            if (_instanceIndices.Length >= requiredInstances) return;
+            var next = _instanceIndices.Length;
+            while (next < requiredInstances) next *= 2;
+            Array.Resize(ref _instanceIndices, next);
+            Array.Resize(ref _transformData, next * HighScaleTransformFloatStride);
+            Array.Resize(ref _stateData, next * HighScaleStateFloatStride);
         }
     }
 
@@ -909,15 +1666,23 @@ attribute vec4 aInstanceModel1;
 attribute vec4 aInstanceModel2;
 attribute vec4 aInstanceModel3;
 attribute vec4 aInstanceColor;
+attribute vec4 aInstanceState;
+attribute float aMaterialSlot;
 uniform mat4 uModel;
 uniform mat4 uPartLocal;
 uniform mat4 uViewProj;
 uniform vec4 uColor;
 uniform float uUseInstancing;
 uniform float uUsePartLocal;
+uniform float uUseHighScaleState;
+uniform float uUsePaletteTexture;
+uniform vec4 uVariantColors[32];
 varying vec3 vWorldPos;
 varying vec3 vNormal;
 varying vec4 vColor;
+varying float vVariantIndex;
+varying float vMaterialSlot;
+varying float vUsePaletteTexture;
 void main()
 {
     mat4 instanceModel = mat4(aInstanceModel0, aInstanceModel1, aInstanceModel2, aInstanceModel3);
@@ -926,7 +1691,30 @@ void main()
     vec4 world = model * vec4(aPosition, 1.0);
     vWorldPos = world.xyz;
     vNormal = normalize(mat3(model) * aNormal);
-    vColor = uUseInstancing > 0.5 ? aInstanceColor : uColor;
+    vVariantIndex = 0.0;
+    vMaterialSlot = aMaterialSlot;
+    vUsePaletteTexture = 0.0;
+    if (uUseHighScaleState > 0.5)
+    {
+        float variantIndex = clamp(aInstanceState.x, 0.0, 31.0);
+        vVariantIndex = floor(variantIndex + 0.5);
+        vUsePaletteTexture = uUsePaletteTexture;
+        if (uUsePaletteTexture > 0.5)
+        {
+            vColor = vec4(1.0, 1.0, 1.0, aInstanceState.y * aInstanceState.z);
+        }
+        else
+        {
+            int variantUniformIndex = int(vVariantIndex);
+            vec4 stateColor = uVariantColors[variantUniformIndex];
+            stateColor.a *= aInstanceState.y * aInstanceState.z;
+            vColor = stateColor;
+        }
+    }
+    else
+    {
+        vColor = uUseInstancing > 0.5 ? aInstanceColor : uColor;
+    }
     gl_Position = uViewProj * world;
 }";
 
@@ -939,12 +1727,33 @@ uniform vec3 uDirectionalLightDirection;
 uniform vec3 uDirectionalLightColor;
 uniform vec4 uPointLightPosition;
 uniform vec4 uPointLightColor;
+uniform sampler2D uPaletteTexture;
+uniform float uPaletteWidth;
+uniform float uPaletteHeight;
 varying vec3 vWorldPos;
 varying vec3 vNormal;
 varying vec4 vColor;
+varying float vVariantIndex;
+varying float vMaterialSlot;
+varying float vUsePaletteTexture;
 void main()
 {
-    vec3 outColor = vColor.rgb;
+    vec4 materialColor = vColor;
+    if (vUsePaletteTexture > 0.5)
+    {
+        float slot = clamp(floor(vMaterialSlot + 0.5), 0.0, max(uPaletteWidth - 1.0, 0.0));
+        float variant = clamp(floor(vVariantIndex + 0.5), 0.0, max(uPaletteHeight - 1.0, 0.0));
+        vec2 uv = vec2((slot + 0.5) / max(uPaletteWidth, 1.0), (variant + 0.5) / max(uPaletteHeight, 1.0));
+        vec4 paletteColor = texture2D(uPaletteTexture, uv);
+        materialColor = vec4(paletteColor.rgb, paletteColor.a * vColor.a);
+    }
+    if (materialColor.a <= 0.001) discard;
+    if (materialColor.a < 0.999)
+    {
+        float threshold = mod(floor(gl_FragCoord.x) + floor(gl_FragCoord.y), 4.0) * 0.25;
+        if (threshold > materialColor.a) discard;
+    }
+    vec3 outColor = materialColor.rgb;
     if (uLightingEnabled > 0.5)
     {
         vec3 n = normalize(vNormal);
@@ -960,7 +1769,7 @@ void main()
         }
         outColor *= clamp(light, 0.0, 2.0);
     }
-    gl_FragColor = vec4(outColor, vColor.a);
+    gl_FragColor = vec4(outColor, materialColor.a);
 }";
 
     private const string TexturedVertexSource = @"attribute vec3 aPosition;
