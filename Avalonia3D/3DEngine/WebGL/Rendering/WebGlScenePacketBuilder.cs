@@ -26,6 +26,8 @@ internal static class WebGlScenePacketBuilder
 
         var batchMap = new Dictionary<string, WebGlMeshBatchPacket>(StringComparer.Ordinal);
         var controls = new List<WebGlControlPlanePacket>();
+        var liveMeshIds = CollectLiveMeshIds(scene);
+        var liveTextureIds = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var obj in scene.Registry.Renderables)
         {
@@ -141,6 +143,7 @@ internal static class WebGlScenePacketBuilder
             WriteControlVertex(vertices, 10, corners[2], 1f, 1f);
             WriteControlVertex(vertices, 15, corners[3], 0f, 1f);
 
+            liveTextureIds.Add(plane.Id);
             controls.Add(new WebGlControlPlanePacket
             {
                 Id = plane.Id,
@@ -174,8 +177,32 @@ internal static class WebGlScenePacketBuilder
             PointLightColor = light.PointColor,
             Batches = batches,
             RetainedBatches = retainedHighScaleBatches ?? new List<WebGlRetainedBatchPacket>(),
-            ControlPlanes = controls
+            ControlPlanes = controls,
+            LiveMeshIds = new List<string>(liveMeshIds),
+            LiveTextureIds = new List<string>(liveTextureIds)
         };
+    }
+
+    private static HashSet<string> CollectLiveMeshIds(Scene3D scene)
+    {
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var obj in scene.Registry.Renderables)
+        {
+            ids.Add(obj.GetMesh().ResourceKey);
+        }
+
+        foreach (var layer in EnumerateHighScaleLayers(scene))
+        {
+            foreach (var lod in new[] { HighScaleLodLevel3D.Detailed, HighScaleLodLevel3D.Simplified, HighScaleLodLevel3D.Proxy, HighScaleLodLevel3D.Billboard })
+            {
+                foreach (var part in layer.Template.ResolveParts(lod))
+                {
+                    ids.Add(part.Mesh.ResourceKey);
+                }
+            }
+        }
+
+        return ids;
     }
 
     private static WebGlMeshBatchPacket GetBatch(Dictionary<string, WebGlMeshBatchPacket> batches, string meshId, float lightingEnabled)
@@ -325,6 +352,8 @@ internal sealed class WebGlScenePacket
     public required List<WebGlMeshBatchPacket> Batches { get; init; }
     public required List<WebGlRetainedBatchPacket> RetainedBatches { get; init; }
     public required List<WebGlControlPlanePacket> ControlPlanes { get; init; }
+    public required List<string> LiveMeshIds { get; init; }
+    public required List<string> LiveTextureIds { get; init; }
 }
 
 internal sealed class WebGlMeshBatchPacket

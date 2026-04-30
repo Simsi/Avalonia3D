@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using ThreeDEngine.Core.HighScale;
 using ThreeDEngine.Core.Scene;
 

@@ -46,9 +46,12 @@ public sealed class TelemetryDiffQueue3D
     }
 
     public int DrainTo(HighScaleInstanceLayer3D layer, int maxUpdates)
-        => DrainTo(layer, maxUpdates, 0d);
+        => DrainTo(layer, maxUpdates, 0d, applyTransforms: true);
 
     public int DrainTo(HighScaleInstanceLayer3D layer, int maxUpdates, double maxMilliseconds)
+        => DrainTo(layer, maxUpdates, maxMilliseconds, applyTransforms: true);
+
+    public int DrainTo(HighScaleInstanceLayer3D layer, int maxUpdates, double maxMilliseconds, bool applyTransforms)
     {
         if (Count == 0 || maxUpdates <= 0) return 0;
 
@@ -78,7 +81,7 @@ public sealed class TelemetryDiffQueue3D
 
             if (diff.HasMaterial) batch.SetMaterialVariant(key, diff.MaterialVariantId);
             if (diff.HasVisibility) batch.SetVisible(key, diff.Visible);
-            if (diff.HasTransform) batch.SetTransform(key, diff.Transform);
+            if (applyTransforms && diff.HasTransform) batch.SetTransform(key, diff.Transform);
             applied++;
         }
 

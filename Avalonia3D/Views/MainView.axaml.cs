@@ -287,6 +287,7 @@ public partial class MainView : UserControl
         _sceneControl.Scene.Performance.AdaptivePerformanceEnabled = _sceneControl.AdaptivePerformanceEnabled;
         _sceneControl.Scene.Performance.EnableBakedHighScaleDetailedMeshes = _bakedMeshCheck.IsChecked == true;
         _sceneControl.Scene.Performance.EnableHighScalePaletteTexture = _paletteTextureCheck.IsChecked == true;
+        _sceneControl.Scene.Performance.EnableWebGlClientGpuTransformAnimation = ShouldUseBrowserGpuTransformAnimation(_lastFrame?.Backend);
     }
 
     private void ApplyPreset(int instances, int proxies, int telemetryPerSecond, string scenario)
@@ -331,6 +332,7 @@ public partial class MainView : UserControl
             scene.Performance.AdaptivePerformanceEnabled = _adaptivePerformanceCheck.IsChecked == true;
             scene.Performance.EnableBakedHighScaleDetailedMeshes = _bakedMeshCheck.IsChecked == true;
             scene.Performance.EnableHighScalePaletteTexture = _paletteTextureCheck.IsChecked == true;
+            scene.Performance.EnableWebGlClientGpuTransformAnimation = ShouldUseBrowserGpuTransformAnimation(_lastFrame?.Backend);
             scene.FrameInterpolator.Enabled = _frameInterpolationCheck.IsChecked == true;
             scene.FrameInterpolator.SimulationTickFps = Math.Clamp(ParseFloat(_frameTickFpsText.Text, 20f), 1f, 240f);
             scene.AdaptivePerformance.Enabled = _adaptivePerformanceCheck.IsChecked == true;
@@ -507,9 +509,18 @@ public partial class MainView : UserControl
         EnqueueSyntheticTelemetry(layer, updates);
     }
 
+    private bool ShouldUseBrowserGpuTransformAnimation(BackendKind? backendKind)
+        => _animateCheck.IsChecked == true &&
+           _sceneControl.Scene.Performance.EnableWebGlClientHighScaleRuntime &&
+           _configuredInstances >= 1000 &&
+           _configuredProxies == 0 &&
+           (_lastFrame is null || backendKind == BackendKind.WebGlBrowser || OperatingSystem.IsBrowser());
+
     private void EnqueueSyntheticTelemetry(HighScaleInstanceLayer3D layer, int updates)
     {
         var animate = _animateCheck.IsChecked == true;
+        var useBrowserGpuTransformAnimation = ShouldUseBrowserGpuTransformAnimation(_lastFrame?.Backend);
+        _sceneControl.Scene.Performance.EnableWebGlClientGpuTransformAnimation = useBrowserGpuTransformAnimation;
         var count = layer.Instances.Count;
         var time = (float)_runClock.Elapsed.TotalSeconds;
         for (var i = 0; i < updates; i++)
@@ -518,7 +529,7 @@ public partial class MainView : UserControl
             var currentVariant = layer.StateBuffer.GetMaterialVariant(index);
             var variant = (currentVariant + 1 + _random.Next(3)) & 3;
             _telemetryQueue.EnqueueMaterial(index, variant);
-            if (animate)
+            if (animate && !useBrowserGpuTransformAnimation)
             {
                 var r = layer.Instances[index];
                 var dx = MathF.Sin(time + index * 0.001f) * 0.015f;
@@ -569,7 +580,11 @@ public partial class MainView : UserControl
         var start = Stopwatch.GetTimestamp();
         var interpolationEnabled = _sceneControl.Scene.FrameInterpolator.Enabled;
         if (interpolationEnabled) _sceneControl.Scene.BeginSimulationTick();
-        var applied = _telemetryQueue.DrainTo(layer, maxUpdates, applyBudgetMs);
+        var applied = _telemetryQueue.DrainTo(
+            layer,
+            maxUpdates,
+            applyBudgetMs,
+            applyTransforms: !ShouldUseBrowserGpuTransformAnimation(_lastFrame?.Backend));
         if (interpolationEnabled) _sceneControl.Scene.EndSimulationTick();
         _lastTelemetryApplyMs = (Stopwatch.GetTimestamp() - start) * 1000d / Stopwatch.Frequency;
         _telemetryAppliedInWindow += applied;
@@ -587,6 +602,7 @@ public partial class MainView : UserControl
 
     private void OnFrameRendered(object? sender, SceneFrameRenderedEventArgs e)
     {
+        _sceneControl.Scene.Performance.EnableWebGlClientGpuTransformAnimation = ShouldUseBrowserGpuTransformAnimation(e.Backend);
         PumpSyntheticTelemetryForFrame();
         DrainTelemetryQueueForFrame();
         _lastFrame = e;

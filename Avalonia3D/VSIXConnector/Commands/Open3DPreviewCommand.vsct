@@ -31,7 +31,12 @@
         </Strings>
       </Button>
     </Buttons>
-  </Commands>
+</Commands>
+
+    <KeyBindings>
+      <KeyBinding guid="guidThreeDEnginePreviewerCommandSet" id="cmdidOpen3DPreview" editor="guidVSStd97" key1="Q" mod1="ALT" />
+    </KeyBindings>
+  
 
   <Symbols>
     <GuidSymbol name="guidThreeDEnginePreviewerPackage" value="{d9f3b129-4b58-4ae5-bd4f-1ab60a6d3f20}" />

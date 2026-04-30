@@ -1,7 +1,17 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0</TargetFramework>
+    <!--
+      The experimental Roslyn source exporter references Microsoft.CodeAnalysis from the
+      active .NET SDK in offline mode. When the active SDK is 9.x, those assemblies target
+      System.Runtime 9.0, so the previewer itself must also target net9.0 to avoid CS1705.
+      The host engine/project can remain net8.0 and is referenced normally.
+      Override with -p:ThreeDEnginePreviewerTargetFramework=net8.0 only when using a matching
+      net8-compatible Roslyn path, for example a .NET 8 SDK Roslyn\bincore folder.
+    -->
+    <ThreeDEnginePreviewerTargetFramework Condition="'$(ThreeDEnginePreviewerTargetFramework)' == '' and $([System.String]::Copy('$(NETCoreSdkVersion)').StartsWith('9.'))">net9.0</ThreeDEnginePreviewerTargetFramework>
+    <ThreeDEnginePreviewerTargetFramework Condition="'$(ThreeDEnginePreviewerTargetFramework)' == ''">net8.0</ThreeDEnginePreviewerTargetFramework>
+    <TargetFramework>$(ThreeDEnginePreviewerTargetFramework)</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>PreviewerApp</RootNamespace>
@@ -22,6 +32,17 @@
     <AvaloniaVersion>11.2.5</AvaloniaVersion>
   </PropertyGroup>
 
+  <PropertyGroup>
+    <!--
+      Roslyn-backed experimental source export.
+      Offline-only by default: reference Roslyn assemblies from the installed .NET SDK / MSBuild.
+      There is deliberately no Microsoft.CodeAnalysis.CSharp PackageReference here, because the
+      previewer must build in offline/VSIX handoff scenarios without contacting nuget.org.
+    -->
+    <ThreeDEngineRoslynPath Condition="'$(ThreeDEngineRoslynPath)' == '' and '$(RoslynAssembliesPath)' != ''">$(RoslynAssembliesPath)</ThreeDEngineRoslynPath>
+    <ThreeDEngineRoslynPath Condition="'$(ThreeDEngineRoslynPath)' == '' and Exists('$(MSBuildToolsPath)\Roslyn\bincore\Microsoft.CodeAnalysis.CSharp.dll')">$(MSBuildToolsPath)\Roslyn\bincore</ThreeDEngineRoslynPath>
+  </PropertyGroup>
+
   <Target Name="ValidateThreeDEngineHostProject" BeforeTargets="ResolveReferences" Condition="'$(ThreeDEngineHostProject)' == '' or !Exists('$(ThreeDEngineHostProject)')">
     <Error Text="PreviewerApp requires a host Avalonia3D project. Pass -p:ThreeDEngineHostProject=&lt;path-to-main-csproj&gt; or place PreviewerApp next to Avalonia3D.csproj." />
   </Target>
@@ -31,4 +52,19 @@
     <PackageReference Include="Avalonia.Desktop" Version="$(AvaloniaVersion)" />
     <PackageReference Include="Avalonia.Themes.Fluent" Version="$(AvaloniaVersion)" />
   </ItemGroup>
+
+  <ItemGroup Condition="Exists('$(ThreeDEngineRoslynPath)\Microsoft.CodeAnalysis.CSharp.dll')">
+    <Reference Include="Microsoft.CodeAnalysis">
+      <HintPath>$(ThreeDEngineRoslynPath)\Microsoft.CodeAnalysis.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Microsoft.CodeAnalysis.CSharp">
+      <HintPath>$(ThreeDEngineRoslynPath)\Microsoft.CodeAnalysis.CSharp.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+
+  <Target Name="ValidateThreeDEngineRoslynReferences" BeforeTargets="ResolveReferences" Condition="!Exists('$(ThreeDEngineRoslynPath)\Microsoft.CodeAnalysis.CSharp.dll')">
+    <Error Text="PreviewerApp Roslyn source export requires Microsoft.CodeAnalysis.CSharp. Offline mode expected it at '$(ThreeDEngineRoslynPath)'. Build with Visual Studio/.NET SDK installed, or pass -p:ThreeDEngineRoslynPath=&lt;path-to-Roslyn-bincore&gt;. This project intentionally does not restore Microsoft.CodeAnalysis.CSharp from NuGet." />
+  </Target>
 </Project>

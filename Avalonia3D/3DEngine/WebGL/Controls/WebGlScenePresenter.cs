@@ -44,6 +44,7 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
     private bool _performanceMetricsVisible;
     private bool _centerCursorVisible;
     private readonly WebGlRetainedHighScaleRenderer _retainedHighScale = new();
+    private readonly WebGlClientHighScaleRenderer _clientHighScale = new();
 
     public WebGlScenePresenter()
     {
@@ -272,17 +273,32 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         var packetStart = Stopwatch.GetTimestamp();
         var aspect = (float)(Bounds.Width / Math.Max(Bounds.Height, 1d));
         var viewProjection = Scene.Camera.GetViewMatrix() * Scene.Camera.GetProjectionMatrix(aspect);
-        var retainedBatches = Scene.Performance.EnableRetainedInstanceBuffers
-            ? _retainedHighScale.BuildAndUpload(_hostId, Scene, viewProjection, stats)
-            : null;
-        var packet = WebGlScenePacketBuilder.Build(Scene, (float)Bounds.Width, (float)Bounds.Height, stats, retainedBatches);
-        stats.PacketBuildMilliseconds = GetElapsedMilliseconds(packetStart);
+        if (ShouldUseClientHighScaleRuntime())
+        {
+            var serializeStart = Stopwatch.GetTimestamp();
+            _clientHighScale.RenderFrame(_hostId, Scene, (float)Bounds.Width, (float)Bounds.Height, viewProjection, stats);
+            stats.SerializationMilliseconds = GetElapsedMilliseconds(serializeStart);
+            stats.PacketBuildMilliseconds = GetElapsedMilliseconds(packetStart);
+        }
+        else
+        {
+            if (_clientHighScale.HasRuntimeState)
+            {
+                _clientHighScale.Reset(_hostId);
+            }
 
-        var serializeStart = Stopwatch.GetTimestamp();
-        var json = JsonSerializer.Serialize(packet, JsonOptions);
-        stats.SerializationMilliseconds = GetElapsedMilliseconds(serializeStart);
+            var retainedBatches = Scene.Performance.EnableRetainedInstanceBuffers
+                ? _retainedHighScale.BuildAndUpload(_hostId, Scene, viewProjection, stats)
+                : null;
+            var packet = WebGlScenePacketBuilder.Build(Scene, (float)Bounds.Width, (float)Bounds.Height, stats, retainedBatches);
+            stats.PacketBuildMilliseconds = GetElapsedMilliseconds(packetStart);
 
-        WebGlInterop.RenderScene(_hostId, json);
+            var serializeStart = Stopwatch.GetTimestamp();
+            var json = JsonSerializer.Serialize(packet, JsonOptions);
+            stats.SerializationMilliseconds = GetElapsedMilliseconds(serializeStart);
+
+            WebGlInterop.RenderScene(_hostId, json);
+        }
         stats.BackendMilliseconds = GetElapsedMilliseconds(start);
 
         // In WebAssembly, user callbacks must not invalidate Avalonia visuals
@@ -296,6 +312,46 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
                 FrameRendered?.Invoke(this, frame);
             }
         }, DispatcherPriority.Background);
+    }
+
+    private bool ShouldUseClientHighScaleRuntime()
+    {
+        if (!Scene.Performance.EnableRetainedInstanceBuffers || !Scene.Performance.EnableWebGlClientHighScaleRuntime)
+        {
+            return false;
+        }
+
+        var hasHighScale = false;
+        foreach (var layer in EnumerateHighScaleLayers())
+        {
+            if (layer.IsVisible && layer.Instances.Count > 0)
+            {
+                hasHighScale = true;
+                break;
+            }
+        }
+
+        if (!hasHighScale)
+        {
+            return false;
+        }
+
+        // v57 client runtime owns only retained high-scale drawing. Mixed scenes keep the
+        // legacy packet path until the non-high-scale/object/control-plane path is moved too.
+        if (Scene.Registry.Renderables.Count != 0)
+        {
+            return false;
+        }
+
+        foreach (var obj in Scene.Registry.AllObjects)
+        {
+            if (obj is ControlPlane3D plane && plane.IsVisible && plane.Snapshot is not null)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private void UploadDirtyMeshGeometry(RenderStats stats)
@@ -520,6 +576,7 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         if (_hostId >= 0)
         {
             _retainedHighScale.Reset(_hostId);
+            _clientHighScale.Reset(_hostId);
             WebGlInterop.DestroyHost(_hostId);
             _hostId = -1;
         }

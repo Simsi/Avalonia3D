@@ -79,9 +79,15 @@ public sealed class HighScaleInstanceLayer3D : Object3D
     public void SetInstanceTransform(int index, Matrix4x4 transform)
     {
         Instances.SetTransform(index, transform);
-        Chunks.UpdateInstance(index, transform, Template.LocalBounds);
+        var changedChunkMembership = Chunks.UpdateInstance(index, transform, Template.LocalBounds);
         if (Chunks.RebuildRequested) Chunks.Rebuild(Instances, Template.LocalBounds);
-        RaiseStructuralChanged();
+
+        // A transform update that stays inside the same chunk is high-scale runtime data,
+        // not scene structure. Raising the generic Object3D.Changed path invalidates the
+        // registry and forces browser-side framegen churn under animation. Only crossing
+        // chunk boundaries is structural.
+        if (changedChunkMembership) RaiseStructuralChanged();
+        else RaiseStateChanged();
     }
 
     public void SetInstanceMaterialVariant(int index, int materialVariantId)

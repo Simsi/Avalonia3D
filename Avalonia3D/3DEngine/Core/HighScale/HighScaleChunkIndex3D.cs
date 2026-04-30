@@ -47,7 +47,7 @@ public sealed class HighScaleChunkIndex3D
         Version++;
     }
 
-    public void UpdateInstance(int index, Matrix4x4 transform, Bounds3D templateLocalBounds)
+    public bool UpdateInstance(int index, Matrix4x4 transform, Bounds3D templateLocalBounds)
     {
         EnsureInstanceKeyCapacity(index + 1);
         var oldKey = _instanceChunkKeys[index];
@@ -55,11 +55,12 @@ public sealed class HighScaleChunkIndex3D
         if (oldKey.Equals(newKey))
         {
             MarkInstanceDirty(index);
-            return;
+            return false;
         }
 
         RebuildRequested = true;
         Version++;
+        return true;
     }
 
     public void MarkInstanceDirty(int index)

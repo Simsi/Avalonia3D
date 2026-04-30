@@ -45,6 +45,9 @@ public sealed class ScenePerformanceOptions
     public int TelemetryMaxUpdatesPerFrame { get; set; } = 192;
     public int TelemetryMaxBacklogMultiplier { get; set; } = 4;
     public bool EnableHighScaleDynamicFadeState { get; set; } = false;
+    public bool EnableWebGlClientHighScaleRuntime { get; set; } = true;
+    public bool EnableWebGlClientGpuTransformAnimation { get; set; }
+    public float WebGlClientGpuTransformAnimationAmplitude { get; set; } = 0.18f;
 
     // Visual high-scale optimization options. Baked template meshes preserve material slots
     // inside one merged mesh, allowing rack-like composites to draw as one detailed part.
@@ -91,6 +94,9 @@ public sealed class ScenePerformanceOptions
         TelemetryMaxUpdatesPerFrame = 192,
         TelemetryMaxBacklogMultiplier = 4,
         EnableHighScaleDynamicFadeState = false,
+        EnableWebGlClientHighScaleRuntime = true,
+        EnableWebGlClientGpuTransformAnimation = false,
+        WebGlClientGpuTransformAnimationAmplitude = 0.18f,
         EnableBakedHighScaleDetailedMeshes = true,
         EnableHighScalePaletteTexture = true,
         EnableHighScaleAggregateLayerBatches = false,

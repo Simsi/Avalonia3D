@@ -13,20 +13,24 @@ namespace ThreeDEngine.Avalonia.WebGL.Rendering;
 /// <summary>
 /// Browser/WebGL retained high-scale path.
 ///
-/// v43 data-flow rule: structural data is uploaded to JS/WebGL only when chunk/LOD
-/// membership changes. Status telemetry is uploaded as small dirty state ranges through
-/// gl.bufferSubData; the renderer must not rebuild every visible batch when the layer-level
-/// StateBuffer.Version changes.
+/// v56 data-flow rule:
+/// - structural GPU data is rebuilt only when chunk membership/order or mesh identity changes;
+/// - transform telemetry inside the same chunk is uploaded as partial gl.bufferSubData ranges;
+/// - state/material telemetry is uploaded as partial state-buffer ranges;
+/// - layer-wide state/version changes must not force full transform rebuilds.
 /// </summary>
 internal sealed class WebGlRetainedHighScaleRenderer
 {
     private const int TransformFloatStride = 16;
     private const int StateFloatStride = 4;
+    private const int RetainedBatchInvisibilityGraceFrames = 600;
     private readonly Dictionary<string, RetainedBatchState> _batches = new(StringComparer.Ordinal);
     private readonly HashSet<string> _liveBatchIds = new(StringComparer.Ordinal);
+    private int _frameId;
 
     public List<WebGlRetainedBatchPacket> BuildAndUpload(int hostId, Scene3D scene, Matrix4x4 viewProjection, RenderStats stats)
     {
+        _frameId++;
         _liveBatchIds.Clear();
         var drawBatches = new List<WebGlRetainedBatchPacket>(64);
 
@@ -44,9 +48,12 @@ internal sealed class WebGlRetainedHighScaleRenderer
 
             var visibleChunks = layer.Chunks.QueryVisible(viewProjection);
             stats.TotalChunkCount += layer.Chunks.Chunks.Count;
-            stats.VisibleChunkCount += visibleChunks.Count;
+            var visibleChunkLimit = scene.Performance.MaxVisibleHighScaleChunks > 0
+                ? System.Math.Min(scene.Performance.MaxVisibleHighScaleChunks, visibleChunks.Count)
+                : visibleChunks.Count;
+            stats.VisibleChunkCount += visibleChunkLimit;
 
-            for (var c = 0; c < visibleChunks.Count; c++)
+            for (var c = 0; c < visibleChunkLimit; c++)
             {
                 var chunk = visibleChunks[c];
                 if (chunk.InstanceIndices.Count == 0)
@@ -84,32 +91,63 @@ internal sealed class WebGlRetainedHighScaleRenderer
                     var usePalette = scene.Performance.EnableHighScalePaletteTexture && part.UsesVertexMaterialSlots && layer.ColorResolver is null;
                     var lighting = part.LightingMode == LightingMode.Lambert ? 1f : 0f;
                     var batchState = GetOrCreateBatch(batchId);
-                    var structuralVersion = HashCode.Combine(chunk.Version, layer.Instances.Version, part.Mesh.ResourceKey, p, (int)renderLod);
+                    batchState.LastLiveFrame = _frameId;
                     var instanceCount = chunk.InstanceIndices.Count;
+                    var structuralSignature = HashCode.Combine(part.Mesh.ResourceKey, p, (int)renderLod);
+                    var structuralChanged = batchState.StructuralVersion != structuralSignature ||
+                                            batchState.InstanceCount != instanceCount ||
+                                            !batchState.MatchesIndices(chunk.InstanceIndices) ||
+                                            batchState.TransformData.Length < instanceCount * TransformFloatStride;
 
-                    var structuralChanged = batchState.StructuralVersion != structuralVersion || batchState.InstanceCount != instanceCount;
                     if (structuralChanged)
                     {
                         var transforms = BuildTransformBuffer(layer, chunk.InstanceIndices, part);
                         batchState.ResetInstanceMap(chunk.InstanceIndices);
-                        WebGlInterop.UploadRetainedBatchTransforms(
+                        batchState.SetTransformData(transforms, layer, chunk.InstanceIndices);
+                        WebGlInterop.UploadRetainedBatchTransformsBytes(
                             hostId,
                             batchId,
                             part.Mesh.ResourceKey,
                             lighting,
                             usePalette,
                             instanceCount,
-                            ConvertFloatsToBase64(transforms));
+                            ConvertFloatsToBytes(transforms));
                         stats.InstanceUploadBytes += transforms.Length * sizeof(float);
                         stats.TransformUploadBytes += transforms.Length * sizeof(float);
                         stats.InstanceBufferUploads++;
-                        batchState.StructuralVersion = structuralVersion;
+                        batchState.StructuralVersion = structuralSignature;
                         batchState.InstanceCount = instanceCount;
                         batchState.StateVersion = -1;
                         batchState.MaterialResolverVersion = -1;
                         batchState.LodPolicyVersion = -1;
                         batchState.FadeAlpha = float.NaN;
                         batchState.UsePalette = usePalette;
+                    }
+                    else
+                    {
+                        var dirtyTransformCount = UpdateDirtyTransformBuffer(layer, chunk.InstanceIndices, part, batchState);
+                        if (dirtyTransformCount > 0)
+                        {
+                            if (dirtyTransformCount > System.Math.Max(32, instanceCount / 3))
+                            {
+                                WebGlInterop.UploadRetainedBatchTransformsBytes(
+                                    hostId,
+                                    batchId,
+                                    part.Mesh.ResourceKey,
+                                    lighting,
+                                    usePalette,
+                                    instanceCount,
+                                    ConvertFloatsToBytes(batchState.TransformData));
+                                stats.InstanceBufferUploads++;
+                                stats.InstanceUploadBytes += batchState.TransformData.Length * sizeof(float);
+                                stats.TransformUploadBytes += batchState.TransformData.Length * sizeof(float);
+                            }
+                            else
+                            {
+                                batchState.SortTransformDirtyOffsets();
+                                UploadDirtyTransformRanges(hostId, batchId, batchState, scene.Performance, stats);
+                            }
+                        }
                     }
 
                     var alpha = ResolveChunkFadeAlpha(scene, layer, chunk.Bounds.Center);
@@ -134,7 +172,7 @@ internal sealed class WebGlRetainedHighScaleRenderer
                         batchState.StateData = state;
                         var paletteWidth = batchState.PaletteWidth;
                         var paletteHeight = batchState.PaletteHeight;
-                        var paletteBytes = string.Empty;
+                        var paletteBytes = Array.Empty<byte>();
                         if (usePalette && (batchState.PaletteVersion != layer.MaterialResolverVersion || batchState.UsePalette != usePalette))
                         {
                             paletteBytes = BuildPaletteBytes(layer.Template, part, out paletteWidth, out paletteHeight);
@@ -148,13 +186,13 @@ internal sealed class WebGlRetainedHighScaleRenderer
                             paletteHeight = 1;
                         }
 
-                        WebGlInterop.UploadRetainedBatchState(
+                        WebGlInterop.UploadRetainedBatchStateBytes(
                             hostId,
                             batchId,
                             usePalette,
                             paletteWidth,
                             paletteHeight,
-                            ConvertFloatsToBase64(state),
+                            ConvertFloatsToBytes(state),
                             paletteBytes);
                         stats.StateBufferUploads++;
                         stats.StateUploadBytes += state.Length * sizeof(float);
@@ -171,12 +209,26 @@ internal sealed class WebGlRetainedHighScaleRenderer
                             : UpdateDirtyColorStateBuffer(layer, batchState, part, alpha);
                         if (dirtyCount > 0)
                         {
-                            batchState.SortDirtyOffsets();
-                            UploadDirtyStateRanges(hostId, batchId, batchState, stats);
+                            if (dirtyCount > System.Math.Max(32, instanceCount / 3))
+                            {
+                                WebGlInterop.UploadRetainedBatchStateBytes(
+                                    hostId,
+                                    batchId,
+                                    usePalette,
+                                    batchState.PaletteWidth,
+                                    batchState.PaletteHeight,
+                                    ConvertFloatsToBytes(batchState.StateData),
+                                    Array.Empty<byte>());
+                                stats.StateBufferUploads++;
+                                stats.StateUploadBytes += batchState.StateData.Length * sizeof(float);
+                            }
+                            else
+                            {
+                                batchState.SortStateDirtyOffsets();
+                                UploadDirtyStateRanges(hostId, batchId, batchState, scene.Performance, stats);
+                            }
                         }
 
-                        // Even if this batch did not contain any of the current dirty indices,
-                        // it has now consumed the layer state version for the current visible set.
                         batchState.StateVersion = layer.StateBuffer.Version;
                     }
 
@@ -189,10 +241,10 @@ internal sealed class WebGlRetainedHighScaleRenderer
                     stats.TriangleCount += (part.Mesh.Indices.Length / 3) * instanceCount;
                     if (part.UsesVertexMaterialSlots) stats.BakedHighScalePartDraws++;
                 }
+
+                chunk.MarkClean();
             }
 
-            // WebGL must clear dirty state after all visible batches consume it. Without this,
-            // the dirty set grows until every frame becomes a full state-buffer rewrite.
             layer.StateBuffer.ClearDirty();
         }
 
@@ -209,6 +261,7 @@ internal sealed class WebGlRetainedHighScaleRenderer
 
         _batches.Clear();
         _liveBatchIds.Clear();
+        _frameId = 0;
     }
 
     private RetainedBatchState GetOrCreateBatch(string id)
@@ -229,13 +282,21 @@ internal sealed class WebGlRetainedHighScaleRenderer
             return;
         }
 
+        var cutoffFrame = _frameId - RetainedBatchInvisibilityGraceFrames;
         var dead = new List<string>();
-        foreach (var id in _batches.Keys)
+        foreach (var kvp in _batches)
         {
-            if (!_liveBatchIds.Contains(id))
+            if (_liveBatchIds.Contains(kvp.Key))
             {
-                dead.Add(id);
+                continue;
             }
+
+            if (kvp.Value.LastLiveFrame > cutoffFrame)
+            {
+                continue;
+            }
+
+            dead.Add(kvp.Key);
         }
 
         for (var i = 0; i < dead.Count; i++)
@@ -271,16 +332,40 @@ internal sealed class WebGlRetainedHighScaleRenderer
         var data = new float[indices.Count * TransformFloatStride];
         for (var i = 0; i < indices.Count; i++)
         {
-            var record = layer.Instances[indices[i]];
-            var model = part.LocalTransform * record.Transform;
-            var o = i * TransformFloatStride;
-            data[o + 0] = model.M11; data[o + 1] = model.M12; data[o + 2] = model.M13; data[o + 3] = model.M14;
-            data[o + 4] = model.M21; data[o + 5] = model.M22; data[o + 6] = model.M23; data[o + 7] = model.M24;
-            data[o + 8] = model.M31; data[o + 9] = model.M32; data[o + 10] = model.M33; data[o + 11] = model.M34;
-            data[o + 12] = model.M41; data[o + 13] = model.M42; data[o + 14] = model.M43; data[o + 15] = model.M44;
+            WriteTransform(layer, indices[i], part, data, i * TransformFloatStride);
         }
 
         return data;
+    }
+
+    private static int UpdateDirtyTransformBuffer(HighScaleInstanceLayer3D layer, IReadOnlyList<int> indices, CompositePartTemplate3D part, RetainedBatchState batchState)
+    {
+        batchState.ResetTransformDirtyOffsets();
+        for (var offset = 0; offset < indices.Count; offset++)
+        {
+            var instanceIndex = indices[offset];
+            var record = layer.Instances[instanceIndex];
+            if (!batchState.IsTransformVersionDirty(offset, record.TransformVersion))
+            {
+                continue;
+            }
+
+            WriteTransform(layer, instanceIndex, part, batchState.TransformData, offset * TransformFloatStride);
+            batchState.SetTransformVersion(offset, record.TransformVersion);
+            batchState.AddTransformDirtyOffset(offset);
+        }
+
+        return batchState.TransformDirtyOffsetCount;
+    }
+
+    private static void WriteTransform(HighScaleInstanceLayer3D layer, int instanceIndex, CompositePartTemplate3D part, float[] destination, int destinationOffset)
+    {
+        var record = layer.Instances[instanceIndex];
+        var model = part.LocalTransform * record.Transform;
+        destination[destinationOffset + 0] = model.M11; destination[destinationOffset + 1] = model.M12; destination[destinationOffset + 2] = model.M13; destination[destinationOffset + 3] = model.M14;
+        destination[destinationOffset + 4] = model.M21; destination[destinationOffset + 5] = model.M22; destination[destinationOffset + 6] = model.M23; destination[destinationOffset + 7] = model.M24;
+        destination[destinationOffset + 8] = model.M31; destination[destinationOffset + 9] = model.M32; destination[destinationOffset + 10] = model.M33; destination[destinationOffset + 11] = model.M34;
+        destination[destinationOffset + 12] = model.M41; destination[destinationOffset + 13] = model.M42; destination[destinationOffset + 14] = model.M43; destination[destinationOffset + 15] = model.M44;
     }
 
     private static float[] BuildPaletteStateBuffer(HighScaleInstanceLayer3D layer, IReadOnlyList<int> indices, float alpha)
@@ -321,7 +406,7 @@ internal sealed class WebGlRetainedHighScaleRenderer
 
     private static int UpdateDirtyPaletteStateBuffer(HighScaleInstanceLayer3D layer, RetainedBatchState batchState, float alpha)
     {
-        batchState.ResetDirtyOffsets();
+        batchState.ResetStateDirtyOffsets();
         var dirtyIndices = layer.StateBuffer.DirtyIndices;
         for (var i = 0; i < dirtyIndices.Count; i++)
         {
@@ -338,15 +423,15 @@ internal sealed class WebGlRetainedHighScaleRenderer
             batchState.StateData[o + 1] = visible;
             batchState.StateData[o + 2] = alpha;
             batchState.StateData[o + 3] = 0f;
-            batchState.AddDirtyOffset(offset);
+            batchState.AddStateDirtyOffset(offset);
         }
 
-        return batchState.DirtyOffsetCount;
+        return batchState.StateDirtyOffsetCount;
     }
 
     private static int UpdateDirtyColorStateBuffer(HighScaleInstanceLayer3D layer, RetainedBatchState batchState, CompositePartTemplate3D part, float alpha)
     {
-        batchState.ResetDirtyOffsets();
+        batchState.ResetStateDirtyOffsets();
         var dirtyIndices = layer.StateBuffer.DirtyIndices;
         for (var i = 0; i < dirtyIndices.Count; i++)
         {
@@ -364,25 +449,56 @@ internal sealed class WebGlRetainedHighScaleRenderer
             batchState.StateData[o + 1] = color.G;
             batchState.StateData[o + 2] = color.B;
             batchState.StateData[o + 3] = color.A * alpha * visible;
-            batchState.AddDirtyOffset(offset);
+            batchState.AddStateDirtyOffset(offset);
         }
 
-        return batchState.DirtyOffsetCount;
+        return batchState.StateDirtyOffsetCount;
     }
 
-    private static void UploadDirtyStateRanges(int hostId, string batchId, RetainedBatchState batchState, RenderStats stats)
+    private static void UploadDirtyTransformRanges(int hostId, string batchId, RetainedBatchState batchState, ScenePerformanceOptions performance, RenderStats stats)
     {
-        if (batchState.DirtyOffsetCount <= 0)
+        if (batchState.TransformDirtyOffsetCount <= 0)
         {
             return;
         }
 
-        var rangeStart = batchState.GetDirtyOffsetAt(0);
+        var mergeGap = System.Math.Max(0, performance.HighScalePartialStateMergeGap);
+        var rangeStart = batchState.GetTransformDirtyOffsetAt(0);
         var previous = rangeStart;
-        for (var i = 1; i <= batchState.DirtyOffsetCount; i++)
+        for (var i = 1; i <= batchState.TransformDirtyOffsetCount; i++)
         {
-            var current = i < batchState.DirtyOffsetCount ? batchState.GetDirtyOffsetAt(i) : -1;
-            if (current >= 0 && current == previous + 1)
+            var current = i < batchState.TransformDirtyOffsetCount ? batchState.GetTransformDirtyOffsetAt(i) : -1;
+            if (current >= 0 && current <= previous + 1 + mergeGap)
+            {
+                previous = current;
+                continue;
+            }
+
+            var floatOffset = rangeStart * TransformFloatStride;
+            var floatCount = (previous - rangeStart + 1) * TransformFloatStride;
+            WebGlInterop.UploadRetainedBatchTransformsRangeBytes(hostId, batchId, rangeStart, ConvertFloatsToBytes(batchState.TransformData, floatOffset, floatCount));
+            stats.InstanceBufferSubDataUploads++;
+            stats.InstanceUploadBytes += floatCount * sizeof(float);
+            stats.TransformUploadBytes += floatCount * sizeof(float);
+            rangeStart = current;
+            previous = current;
+        }
+    }
+
+    private static void UploadDirtyStateRanges(int hostId, string batchId, RetainedBatchState batchState, ScenePerformanceOptions performance, RenderStats stats)
+    {
+        if (batchState.StateDirtyOffsetCount <= 0)
+        {
+            return;
+        }
+
+        var mergeGap = System.Math.Max(0, performance.HighScalePartialStateMergeGap);
+        var rangeStart = batchState.GetStateDirtyOffsetAt(0);
+        var previous = rangeStart;
+        for (var i = 1; i <= batchState.StateDirtyOffsetCount; i++)
+        {
+            var current = i < batchState.StateDirtyOffsetCount ? batchState.GetStateDirtyOffsetAt(i) : -1;
+            if (current >= 0 && current <= previous + 1 + mergeGap)
             {
                 previous = current;
                 continue;
@@ -390,7 +506,7 @@ internal sealed class WebGlRetainedHighScaleRenderer
 
             var floatOffset = rangeStart * StateFloatStride;
             var floatCount = (previous - rangeStart + 1) * StateFloatStride;
-            WebGlInterop.UploadRetainedBatchStateRange(hostId, batchId, rangeStart, ConvertFloatsToBase64(batchState.StateData, floatOffset, floatCount));
+            WebGlInterop.UploadRetainedBatchStateRangeBytes(hostId, batchId, rangeStart, ConvertFloatsToBytes(batchState.StateData, floatOffset, floatCount));
             stats.StateBufferSubDataUploads++;
             stats.StateUploadBytes += floatCount * sizeof(float);
             rangeStart = current;
@@ -400,6 +516,11 @@ internal sealed class WebGlRetainedHighScaleRenderer
 
     private static float ResolveChunkFadeAlpha(Scene3D scene, HighScaleInstanceLayer3D layer, Vector3 chunkCenter)
     {
+        if (!scene.Performance.EnableHighScaleDynamicFadeState)
+        {
+            return 1f;
+        }
+
         if (!scene.Performance.EnableDistanceFade || layer.LodPolicy.DrawDistance <= 0f || layer.LodPolicy.FadeDistance <= 0f)
         {
             return 1f;
@@ -420,7 +541,7 @@ internal sealed class WebGlRetainedHighScaleRenderer
         return System.Math.Clamp(1f - ((distance - fadeStart) / MathF.Max(layer.LodPolicy.FadeDistance, 0.001f)), 0f, 1f);
     }
 
-    private static string BuildPaletteBytes(CompositeTemplate3D template, CompositePartTemplate3D part, out int width, out int height)
+    private static byte[] BuildPaletteBytes(CompositeTemplate3D template, CompositePartTemplate3D part, out int width, out int height)
     {
         width = System.Math.Max(1, part.MaterialSlotBaseColors.Count);
         var maxVariant = 0;
@@ -445,33 +566,36 @@ internal sealed class WebGlRetainedHighScaleRenderer
             }
         }
 
-        return Convert.ToBase64String(bytes);
+        return bytes;
     }
 
     private static byte ToByte(float value) => (byte)System.Math.Clamp((int)MathF.Round(System.Math.Clamp(value, 0f, 1f) * 255f), 0, 255);
 
     private static bool NearlyEqual(float a, float b) => MathF.Abs(a - b) <= 0.0001f;
 
-    private static string ConvertFloatsToBase64(float[] values)
-        => ConvertFloatsToBase64(values, 0, values.Length);
+    private static byte[] ConvertFloatsToBytes(float[] values)
+        => ConvertFloatsToBytes(values, 0, values.Length);
 
-    private static string ConvertFloatsToBase64(float[] values, int start, int count)
+    private static byte[] ConvertFloatsToBytes(float[] values, int start, int count)
     {
         if (count <= 0)
         {
-            return string.Empty;
+            return Array.Empty<byte>();
         }
 
         var bytes = new byte[count * sizeof(float)];
         Buffer.BlockCopy(values, start * sizeof(float), bytes, 0, bytes.Length);
-        return Convert.ToBase64String(bytes);
+        return bytes;
     }
 
     private sealed class RetainedBatchState
     {
         private readonly Dictionary<int, int> _instanceOffsetMap = new();
-        private int[] _dirtyOffsets = Array.Empty<int>();
-        private int _dirtyOffsetCount;
+        private int[] _orderedInstanceIndices = Array.Empty<int>();
+        private int[] _stateDirtyOffsets = Array.Empty<int>();
+        private int _stateDirtyOffsetCount;
+        private int[] _transformDirtyOffsets = Array.Empty<int>();
+        private int _transformDirtyOffsetCount;
 
         public int StructuralVersion = -1;
         public int StateVersion = -1;
@@ -483,34 +607,107 @@ internal sealed class WebGlRetainedHighScaleRenderer
         public int PaletteVersion = -1;
         public int PaletteWidth = 1;
         public int PaletteHeight = 1;
+        public float[] TransformData = Array.Empty<float>();
+        public int[] TransformVersions = Array.Empty<int>();
         public float[] StateData = Array.Empty<float>();
-        public int DirtyOffsetCount => _dirtyOffsetCount;
+        public int LastLiveFrame;
+        public int StateDirtyOffsetCount => _stateDirtyOffsetCount;
+        public int TransformDirtyOffsetCount => _transformDirtyOffsetCount;
 
         public void ResetInstanceMap(IReadOnlyList<int> indices)
         {
             _instanceOffsetMap.Clear();
+            if (_orderedInstanceIndices.Length < indices.Count)
+            {
+                Array.Resize(ref _orderedInstanceIndices, indices.Count);
+            }
+
             for (var i = 0; i < indices.Count; i++)
             {
-                _instanceOffsetMap[indices[i]] = i;
+                var index = indices[i];
+                _orderedInstanceIndices[i] = index;
+                _instanceOffsetMap[index] = i;
             }
+        }
+
+        public bool MatchesIndices(IReadOnlyList<int> indices)
+        {
+            if (InstanceCount != indices.Count)
+            {
+                return false;
+            }
+
+            if (_orderedInstanceIndices.Length < indices.Count)
+            {
+                return false;
+            }
+
+            for (var i = 0; i < indices.Count; i++)
+            {
+                if (_orderedInstanceIndices[i] != indices[i])
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        public void SetTransformData(float[] transforms, HighScaleInstanceLayer3D layer, IReadOnlyList<int> indices)
+        {
+            TransformData = transforms;
+            if (TransformVersions.Length < indices.Count)
+            {
+                Array.Resize(ref TransformVersions, indices.Count);
+            }
+
+            for (var i = 0; i < indices.Count; i++)
+            {
+                TransformVersions[i] = layer.Instances[indices[i]].TransformVersion;
+            }
+        }
+
+        public bool IsTransformVersionDirty(int offset, int transformVersion)
+            => offset >= TransformVersions.Length || TransformVersions[offset] != transformVersion;
+
+        public void SetTransformVersion(int offset, int transformVersion)
+        {
+            if (TransformVersions.Length <= offset)
+            {
+                Array.Resize(ref TransformVersions, Math.Max(offset + 1, Math.Max(16, TransformVersions.Length * 2)));
+            }
+
+            TransformVersions[offset] = transformVersion;
         }
 
         public bool TryGetOffset(int instanceIndex, out int offset) => _instanceOffsetMap.TryGetValue(instanceIndex, out offset);
 
-        public void ResetDirtyOffsets() => _dirtyOffsetCount = 0;
+        public void ResetStateDirtyOffsets() => _stateDirtyOffsetCount = 0;
+        public void ResetTransformDirtyOffsets() => _transformDirtyOffsetCount = 0;
 
-        public void AddDirtyOffset(int offset)
+        public void AddStateDirtyOffset(int offset)
         {
-            if (_dirtyOffsets.Length <= _dirtyOffsetCount)
+            if (_stateDirtyOffsets.Length <= _stateDirtyOffsetCount)
             {
-                Array.Resize(ref _dirtyOffsets, Math.Max(16, _dirtyOffsets.Length * 2));
+                Array.Resize(ref _stateDirtyOffsets, Math.Max(16, _stateDirtyOffsets.Length * 2));
             }
 
-            _dirtyOffsets[_dirtyOffsetCount++] = offset;
+            _stateDirtyOffsets[_stateDirtyOffsetCount++] = offset;
         }
 
-        public void SortDirtyOffsets() => Array.Sort(_dirtyOffsets, 0, _dirtyOffsetCount);
+        public void AddTransformDirtyOffset(int offset)
+        {
+            if (_transformDirtyOffsets.Length <= _transformDirtyOffsetCount)
+            {
+                Array.Resize(ref _transformDirtyOffsets, Math.Max(16, _transformDirtyOffsets.Length * 2));
+            }
 
-        public int GetDirtyOffsetAt(int index) => _dirtyOffsets[index];
+            _transformDirtyOffsets[_transformDirtyOffsetCount++] = offset;
+        }
+
+        public void SortStateDirtyOffsets() => Array.Sort(_stateDirtyOffsets, 0, _stateDirtyOffsetCount);
+        public void SortTransformDirtyOffsets() => Array.Sort(_transformDirtyOffsets, 0, _transformDirtyOffsetCount);
+        public int GetStateDirtyOffsetAt(int index) => _stateDirtyOffsets[index];
+        public int GetTransformDirtyOffsetAt(int index) => _transformDirtyOffsets[index];
     }
 }

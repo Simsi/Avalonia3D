@@ -68,6 +68,22 @@ public sealed class RenderStats
     public int RenderTargetWidth { get; set; }
     public int RenderTargetHeight { get; set; }
     public int BakedHighScalePartDraws { get; set; }
+    public bool WebGlClientHighScaleRuntime { get; set; }
+    public bool WebGlClientGpuTransformAnimation { get; set; }
+    public int WebGlVersion { get; set; }
+    public double JsCullMilliseconds { get; set; }
+    public double JsDrawMilliseconds { get; set; }
+    public double JsFrameMilliseconds { get; set; }
+    public double JsPatchMilliseconds { get; set; }
+    public int JsDrawBatchCount { get; set; }
+    public int JsTransformPatchRanges { get; set; }
+    public int JsStatePatchRanges { get; set; }
+    public long JsTransformPatchBytes { get; set; }
+    public long JsStatePatchBytes { get; set; }
+    public int JsAnimationUploadBatches { get; set; }
+    public long JsAnimationUploadBytes { get; set; }
+    public int JsTexturePayloadErrors { get; set; }
+    public int JsPalettePayloadErrors { get; set; }
 
     public static RenderStats Empty { get; } = new RenderStats();
 }
