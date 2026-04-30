@@ -3,4 +3,15 @@
     <Nullable>enable</Nullable>
     <AvaloniaVersion>11.1.0</AvaloniaVersion>
   </PropertyGroup>
+
+  <!--
+    Source-drop helper projects live under Avalonia3D/. The main Avalonia3D.csproj
+    must not compile PreviewerApp, SmokeTests, VSIXConnector, bin or obj sources.
+    This is an early SDK glob guard; Avalonia3D.csproj also contains explicit Remove
+    items so command-line and Visual Studio builds behave the same.
+  -->
+  <PropertyGroup Condition="Exists('$(MSBuildProjectDirectory)\3DEngine') and Exists('$(MSBuildProjectDirectory)\PreviewerApp')">
+    <DefaultItemExcludes>$(DefaultItemExcludes);PreviewerApp\**;PreviewerApp\**\*;SmokeTests\**;SmokeTests\**\*;VSIXConnector\**;VSIXConnector\**\*;bin\**;bin\**\*;obj\**;obj\**\*;PreviewerApp/**;PreviewerApp/**/*;SmokeTests/**;SmokeTests/**/*;VSIXConnector/**;VSIXConnector/**/*;bin/**;bin/**/*;obj/**;obj/**/*</DefaultItemExcludes>
+    <DefaultItemExcludesInProjectFolder>$(DefaultItemExcludesInProjectFolder);PreviewerApp\**;PreviewerApp\**\*;SmokeTests\**;SmokeTests\**\*;VSIXConnector\**;VSIXConnector\**\*;bin\**;bin\**\*;obj\**;obj\**\*;PreviewerApp/**;PreviewerApp/**/*;SmokeTests/**;SmokeTests/**/*;VSIXConnector/**;VSIXConnector/**/*;bin/**;bin/**/*;obj/**;obj/**/*</DefaultItemExcludesInProjectFolder>
+  </PropertyGroup>
 </Project>

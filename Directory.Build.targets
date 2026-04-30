@@ -1,0 +1,27 @@
+<Project>
+  <Target Name="ThreeDEngineRemoveSourceDropUtilityCompileItems"
+          BeforeTargets="CoreCompile;Csc"
+          Condition="Exists('$(MSBuildProjectDirectory)\3DEngine') and Exists('$(MSBuildProjectDirectory)\PreviewerApp')">
+    <ItemGroup>
+      <ThreeDEngineCompileItemsToRemove Include="@(Compile)"
+        Condition="$([System.String]::Copy('%(Compile.FullPath)').Contains('\PreviewerApp\'))
+                   Or $([System.String]::Copy('%(Compile.FullPath)').Contains('/PreviewerApp/'))
+                   Or $([System.String]::Copy('%(Compile.FullPath)').Contains('\SmokeTests\'))
+                   Or $([System.String]::Copy('%(Compile.FullPath)').Contains('/SmokeTests/'))
+                   Or $([System.String]::Copy('%(Compile.FullPath)').Contains('\VSIXConnector\'))
+                   Or $([System.String]::Copy('%(Compile.FullPath)').Contains('/VSIXConnector/'))
+                   Or $([System.String]::Copy('%(Compile.FullPath)').Contains('\obj\'))
+                   Or $([System.String]::Copy('%(Compile.FullPath)').Contains('/obj/'))
+                   Or $([System.String]::Copy('%(Compile.FullPath)').Contains('\bin\'))
+                   Or $([System.String]::Copy('%(Compile.FullPath)').Contains('/bin/'))" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <Compile Remove="@(ThreeDEngineCompileItemsToRemove)" />
+      <None Remove="PreviewerApp\**;SmokeTests\**;VSIXConnector\**;bin\**;obj\**;PreviewerApp/**;SmokeTests/**;VSIXConnector/**;bin/**;obj/**" />
+      <Content Remove="PreviewerApp\**;SmokeTests\**;VSIXConnector\**;bin\**;obj\**;PreviewerApp/**;SmokeTests/**;VSIXConnector/**;bin/**;obj/**" />
+      <EmbeddedResource Remove="PreviewerApp\**;SmokeTests\**;VSIXConnector\**;bin\**;obj\**;PreviewerApp/**;SmokeTests/**;VSIXConnector/**;bin/**;obj/**" />
+      <AvaloniaResource Remove="PreviewerApp\**;SmokeTests\**;VSIXConnector\**;bin\**;obj\**;PreviewerApp/**;SmokeTests/**;VSIXConnector/**;bin/**;obj/**" />
+    </ItemGroup>
+  </Target>
+</Project>
