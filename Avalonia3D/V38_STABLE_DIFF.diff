@@ -1,0 +1,464 @@
+Only in /mnt/data/v38_clean/3DEngine: ARCHITECTURE_RU.md
+Only in /mnt/data/v37_extract/3DEngine: BENCHMARK_OPTIMIZATION_V23.md
+Only in /mnt/data/v37_extract/3DEngine: BENCHMARK_RUNTIME_V24.md
+Only in /mnt/data/v37_extract/3DEngine: BENCHMARK_V19.md
+Only in /mnt/data/v38_clean/3DEngine: BROWSER_WEBGL_RU.md
+diff -ru /mnt/data/v37_extract/3DEngine/Core/Rendering/RenderStats.cs /mnt/data/v38_clean/3DEngine/Core/Rendering/RenderStats.cs
+--- /mnt/data/v37_extract/3DEngine/Core/Rendering/RenderStats.cs	2026-04-27 08:30:05.000000000 +0000
++++ /mnt/data/v38_clean/3DEngine/Core/Rendering/RenderStats.cs	2026-04-27 08:54:47.651457777 +0000
+@@ -64,7 +64,6 @@
+     public bool AdaptivePerformanceEnabled { get; set; }
+     public double InterpolationAlpha { get; set; }
+     public long ManagedAllocatedBytes { get; set; }
+-    public float RenderScale { get; set; } = 1f;
+     public int RenderTargetWidth { get; set; }
+     public int RenderTargetHeight { get; set; }
+     public int BakedHighScalePartDraws { get; set; }
+diff -ru /mnt/data/v37_extract/3DEngine/Core/Scene/ScenePerformanceOptions.cs /mnt/data/v38_clean/3DEngine/Core/Scene/ScenePerformanceOptions.cs
+--- /mnt/data/v37_extract/3DEngine/Core/Scene/ScenePerformanceOptions.cs	2026-04-27 08:29:49.000000000 +0000
++++ /mnt/data/v38_clean/3DEngine/Core/Scene/ScenePerformanceOptions.cs	2026-04-27 08:54:47.652331650 +0000
+@@ -51,11 +51,6 @@
+     public bool EnableBakedHighScaleDetailedMeshes { get; set; } = true;
+     public bool EnableHighScalePaletteTexture { get; set; } = true;
+ 
+-    // Optional fullscreen/performance lever. Values below 1 render the 3D layer to a smaller
+-    // offscreen target and upscale it back to the control framebuffer when the OpenGL backend
+-    // supports framebuffer objects. Leave at 1 for native resolution.
+-    public float RenderScale { get; set; } = 1f;
+-
+     // Aggregate layer batches are experimental and are disabled by default.
+     // The v34 test showed lower GPU usage and worse FPS because this path can lose
+     // frustum/chunk locality and rebuild too much state when LOD membership changes.
+@@ -98,7 +93,6 @@
+         EnableHighScaleDynamicFadeState = false,
+         EnableBakedHighScaleDetailedMeshes = true,
+         EnableHighScalePaletteTexture = true,
+-        RenderScale = 1f,
+         EnableHighScaleAggregateLayerBatches = false,
+         HighScaleAggregateLayerInstanceThreshold = 15000
+     };
+Only in /mnt/data/v37_extract/3DEngine: FULLSCREEN_30HZ_PRESENTATION_FIX_V36_RU.md
+Only in /mnt/data/v37_extract/3DEngine: HIGHLOAD_RUNTIME_V27.md
+Only in /mnt/data/v37_extract/3DEngine: HIGHSCALE_DATAFLOW_REWRITE.md
+Only in /mnt/data/v37_extract/3DEngine: HIGHSCALE_RUNTIME_V18.md
+Only in /mnt/data/v37_extract/3DEngine: HIGHSCALE_V25_NO_LEGACY.md
+Only in /mnt/data/v38_clean/3DEngine: NEXT_CHAT_HANDOFF_RU.md
+diff -ru /mnt/data/v37_extract/3DEngine/OpenGL/Rendering/OpenGlSceneRenderer.cs /mnt/data/v38_clean/3DEngine/OpenGL/Rendering/OpenGlSceneRenderer.cs
+--- /mnt/data/v37_extract/3DEngine/OpenGL/Rendering/OpenGlSceneRenderer.cs	2026-04-27 08:34:49.000000000 +0000
++++ /mnt/data/v38_clean/3DEngine/OpenGL/Rendering/OpenGlSceneRenderer.cs	2026-04-27 08:55:09.552236584 +0000
+@@ -22,11 +22,6 @@
+     private const int GlColorBufferBit = 0x00004000;
+     private const int GlDepthBufferBit = 0x00000100;
+     private const int GlFramebuffer = 0x8D40;
+-    private const int GlColorAttachment0 = 0x8CE0;
+-    private const int GlDepthAttachment = 0x8D00;
+-    private const int GlRenderbuffer = 0x8D41;
+-    private const int GlDepthComponent16 = 0x81A5;
+-    private const int GlFramebufferComplete = 0x8CD5;
+     private const int GlTriangles = 0x0004;
+     private const int GlFloat = 0x1406;
+     private const int GlUnsignedInt = 0x1405;
+@@ -108,13 +103,6 @@
+     private int _controlVertexBuffer;
+     private int _controlIndexBuffer;
+     private int _meshInstanceBuffer;
+-    private int _renderScaleQuadVertexBuffer;
+-    private int _renderScaleQuadIndexBuffer;
+-    private int _renderScaleFramebuffer;
+-    private int _renderScaleTexture;
+-    private int _renderScaleDepthBuffer;
+-    private int _renderScaleWidth;
+-    private int _renderScaleHeight;
+     private int _paletteTexture;
+     private byte[] _paletteUploadBuffer = Array.Empty<byte>();
+     private bool _initialized;
+@@ -130,15 +118,6 @@
+     private GlVertexAttribDivisorDelegate? _vertexAttribDivisor;
+     private GlDrawElementsInstancedDelegate? _drawElementsInstanced;
+     private GlBufferSubDataDelegate? _bufferSubData;
+-    private GlGenFramebuffersDelegate? _genFramebuffers;
+-    private GlDeleteFramebuffersDelegate? _deleteFramebuffers;
+-    private GlFramebufferTexture2DDelegate? _framebufferTexture2D;
+-    private GlCheckFramebufferStatusDelegate? _checkFramebufferStatus;
+-    private GlGenRenderbuffersDelegate? _genRenderbuffers;
+-    private GlDeleteRenderbuffersDelegate? _deleteRenderbuffers;
+-    private GlBindRenderbufferDelegate? _bindRenderbuffer;
+-    private GlRenderbufferStorageDelegate? _renderbufferStorage;
+-    private GlFramebufferRenderbufferDelegate? _framebufferRenderbuffer;
+ 
+     public void Initialize(GlInterface gl)
+     {
+@@ -157,15 +136,6 @@
+         _drawElementsInstanced = LoadDelegate<GlDrawElementsInstancedDelegate>(gl, "glDrawElementsInstanced")
+                                  ?? LoadDelegate<GlDrawElementsInstancedDelegate>(gl, "glDrawElementsInstancedARB");
+         _bufferSubData = LoadDelegate<GlBufferSubDataDelegate>(gl, "glBufferSubData");
+-        _genFramebuffers = LoadDelegate<GlGenFramebuffersDelegate>(gl, "glGenFramebuffers") ?? LoadDelegate<GlGenFramebuffersDelegate>(gl, "glGenFramebuffersEXT");
+-        _deleteFramebuffers = LoadDelegate<GlDeleteFramebuffersDelegate>(gl, "glDeleteFramebuffers") ?? LoadDelegate<GlDeleteFramebuffersDelegate>(gl, "glDeleteFramebuffersEXT");
+-        _framebufferTexture2D = LoadDelegate<GlFramebufferTexture2DDelegate>(gl, "glFramebufferTexture2D") ?? LoadDelegate<GlFramebufferTexture2DDelegate>(gl, "glFramebufferTexture2DEXT");
+-        _checkFramebufferStatus = LoadDelegate<GlCheckFramebufferStatusDelegate>(gl, "glCheckFramebufferStatus") ?? LoadDelegate<GlCheckFramebufferStatusDelegate>(gl, "glCheckFramebufferStatusEXT");
+-        _genRenderbuffers = LoadDelegate<GlGenRenderbuffersDelegate>(gl, "glGenRenderbuffers") ?? LoadDelegate<GlGenRenderbuffersDelegate>(gl, "glGenRenderbuffersEXT");
+-        _deleteRenderbuffers = LoadDelegate<GlDeleteRenderbuffersDelegate>(gl, "glDeleteRenderbuffers") ?? LoadDelegate<GlDeleteRenderbuffersDelegate>(gl, "glDeleteRenderbuffersEXT");
+-        _bindRenderbuffer = LoadDelegate<GlBindRenderbufferDelegate>(gl, "glBindRenderbuffer") ?? LoadDelegate<GlBindRenderbufferDelegate>(gl, "glBindRenderbufferEXT");
+-        _renderbufferStorage = LoadDelegate<GlRenderbufferStorageDelegate>(gl, "glRenderbufferStorage") ?? LoadDelegate<GlRenderbufferStorageDelegate>(gl, "glRenderbufferStorageEXT");
+-        _framebufferRenderbuffer = LoadDelegate<GlFramebufferRenderbufferDelegate>(gl, "glFramebufferRenderbuffer") ?? LoadDelegate<GlFramebufferRenderbufferDelegate>(gl, "glFramebufferRenderbufferEXT");
+         _supportsInstancing = _vertexAttribDivisor is not null && _drawElementsInstanced is not null;
+ 
+         _meshProgram = CreateProgram(gl, MeshVertexSource, MeshFragmentSource,
+@@ -209,23 +179,11 @@
+         _textureViewProjLocation = gl.GetUniformLocationString(_texturedProgram, "uViewProj");
+ 
+         _meshInstanceBuffer = gl.GenBuffer();
+-        _renderScaleQuadVertexBuffer = gl.GenBuffer();
+-        _renderScaleQuadIndexBuffer = gl.GenBuffer();
+         _paletteTexture = gl.GenTexture();
+         _controlVertexBuffer = gl.GenBuffer();
+         _controlIndexBuffer = gl.GenBuffer();
+         gl.BindBuffer(GlElementArrayBuffer, _controlIndexBuffer);
+         UploadInts(gl, GlElementArrayBuffer, new[] { 0, 1, 2, 0, 2, 3 }, GlStaticDraw);
+-        gl.BindBuffer(GlElementArrayBuffer, _renderScaleQuadIndexBuffer);
+-        UploadInts(gl, GlElementArrayBuffer, new[] { 0, 1, 2, 0, 2, 3 }, GlStaticDraw);
+-        gl.BindBuffer(GlArrayBuffer, _renderScaleQuadVertexBuffer);
+-        UploadFloats(gl, GlArrayBuffer, new[]
+-        {
+-            -1f, -1f, 0f, 0f, 0f,
+-             1f, -1f, 0f, 1f, 0f,
+-             1f,  1f, 0f, 1f, 1f,
+-            -1f,  1f, 0f, 0f, 1f
+-        }, 20, GlStaticDraw);
+         gl.BindBuffer(GlElementArrayBuffer, 0);
+         _initialized = true;
+     }
+@@ -235,22 +193,10 @@
+         if (!_initialized) Initialize(gl);
+         var width = System.Math.Max((int)System.Math.Ceiling(bounds.Width), 1);
+         var height = System.Math.Max((int)System.Math.Ceiling(bounds.Height), 1);
+-        var scale = System.Math.Clamp(scene.Performance.RenderScale, 0.25f, 1f);
+-        if (scale < 0.999f && EnsureRenderScaleTarget(gl, width, height, scale, out var scaledWidth, out var scaledHeight))
+-        {
+-            var stats = RenderSceneCore(gl, _renderScaleFramebuffer, scaledWidth, scaledHeight, scene);
+-            stats.RenderScale = scale;
+-            stats.RenderTargetWidth = scaledWidth;
+-            stats.RenderTargetHeight = scaledHeight;
+-            DrawRenderScaleTexture(gl, framebuffer, width, height);
+-            return stats;
+-        }
+-
+-        var nativeStats = RenderSceneCore(gl, framebuffer, width, height, scene);
+-        nativeStats.RenderScale = 1f;
+-        nativeStats.RenderTargetWidth = width;
+-        nativeStats.RenderTargetHeight = height;
+-        return nativeStats;
++        var stats = RenderSceneCore(gl, framebuffer, width, height, scene);
++        stats.RenderTargetWidth = width;
++        stats.RenderTargetHeight = height;
++        return stats;
+     }
+ 
+     private RenderStats RenderSceneCore(GlInterface gl, int framebuffer, int width, int height, Scene3D scene)
+@@ -289,96 +235,6 @@
+         return stats;
+     }
+ 
+-    private bool EnsureRenderScaleTarget(GlInterface gl, int width, int height, float scale, out int scaledWidth, out int scaledHeight)
+-    {
+-        scaledWidth = System.Math.Max(1, (int)System.MathF.Ceiling(width * scale));
+-        scaledHeight = System.Math.Max(1, (int)System.MathF.Ceiling(height * scale));
+-        if (_genFramebuffers is null || _framebufferTexture2D is null || _checkFramebufferStatus is null ||
+-            _genRenderbuffers is null || _bindRenderbuffer is null || _renderbufferStorage is null || _framebufferRenderbuffer is null)
+-        {
+-            return false;
+-        }
+-
+-        if (_renderScaleFramebuffer != 0 && _renderScaleTexture != 0 && _renderScaleWidth == scaledWidth && _renderScaleHeight == scaledHeight)
+-        {
+-            return true;
+-        }
+-
+-        if (_renderScaleFramebuffer != 0)
+-        {
+-            var old = _renderScaleFramebuffer;
+-            _deleteFramebuffers?.Invoke(1, ref old);
+-            _renderScaleFramebuffer = 0;
+-        }
+-        if (_renderScaleTexture != 0)
+-        {
+-            gl.DeleteTexture(_renderScaleTexture);
+-            _renderScaleTexture = 0;
+-        }
+-        if (_renderScaleDepthBuffer != 0)
+-        {
+-            var depth = _renderScaleDepthBuffer;
+-            _deleteRenderbuffers?.Invoke(1, ref depth);
+-            _renderScaleDepthBuffer = 0;
+-        }
+-
+-        _genFramebuffers(1, out _renderScaleFramebuffer);
+-        _renderScaleTexture = gl.GenTexture();
+-        _genRenderbuffers(1, out _renderScaleDepthBuffer);
+-        _renderScaleWidth = scaledWidth;
+-        _renderScaleHeight = scaledHeight;
+-
+-        gl.BindTexture(GlTexture2D, _renderScaleTexture);
+-        gl.TexParameteri(GlTexture2D, GlTextureMinFilter, GlLinear);
+-        gl.TexParameteri(GlTexture2D, GlTextureMagFilter, GlLinear);
+-        gl.TexParameteri(GlTexture2D, GlTextureWrapS, GlClampToEdge);
+-        gl.TexParameteri(GlTexture2D, GlTextureWrapT, GlClampToEdge);
+-        gl.TexImage2D(GlTexture2D, 0, GlRgba, scaledWidth, scaledHeight, 0, GlRgba, GlUnsignedByte, IntPtr.Zero);
+-
+-        _bindRenderbuffer(GlRenderbuffer, _renderScaleDepthBuffer);
+-        _renderbufferStorage(GlRenderbuffer, GlDepthComponent16, scaledWidth, scaledHeight);
+-        gl.BindFramebuffer(GlFramebuffer, _renderScaleFramebuffer);
+-        _framebufferTexture2D(GlFramebuffer, GlColorAttachment0, GlTexture2D, _renderScaleTexture, 0);
+-        _framebufferRenderbuffer(GlFramebuffer, GlDepthAttachment, GlRenderbuffer, _renderScaleDepthBuffer);
+-        var status = _checkFramebufferStatus(GlFramebuffer);
+-        gl.BindFramebuffer(GlFramebuffer, 0);
+-        if (status == GlFramebufferComplete)
+-        {
+-            return true;
+-        }
+-
+-        var failedFbo = _renderScaleFramebuffer;
+-        var failedDepth = _renderScaleDepthBuffer;
+-        if (failedFbo != 0) _deleteFramebuffers?.Invoke(1, ref failedFbo);
+-        if (failedDepth != 0) _deleteRenderbuffers?.Invoke(1, ref failedDepth);
+-        if (_renderScaleTexture != 0) gl.DeleteTexture(_renderScaleTexture);
+-        _renderScaleFramebuffer = 0;
+-        _renderScaleTexture = 0;
+-        _renderScaleDepthBuffer = 0;
+-        _renderScaleWidth = 0;
+-        _renderScaleHeight = 0;
+-        return false;
+-    }
+-
+-    private void DrawRenderScaleTexture(GlInterface gl, int framebuffer, int width, int height)
+-    {
+-        gl.BindFramebuffer(GlFramebuffer, framebuffer);
+-        gl.Viewport(0, 0, width, height);
+-        _disable?.Invoke(GlDepthTest);
+-        gl.UseProgram(_texturedProgram);
+-        gl.ActiveTexture(GlTexture0);
+-        gl.BindTexture(GlTexture2D, _renderScaleTexture);
+-        if (_textureSamplerLocation >= 0) _uniform1i?.Invoke(_textureSamplerLocation, 0);
+-        UploadMatrix(_uniformMatrix4fv, _textureViewProjLocation, Matrix4x4.Identity, _matrixUploadBuffer);
+-        gl.BindBuffer(GlArrayBuffer, _renderScaleQuadVertexBuffer);
+-        gl.BindBuffer(GlElementArrayBuffer, _renderScaleQuadIndexBuffer);
+-        gl.EnableVertexAttribArray(_texturePositionLocation);
+-        gl.VertexAttribPointer(_texturePositionLocation, 3, GlFloat, 0, sizeof(float) * 5, IntPtr.Zero);
+-        gl.EnableVertexAttribArray(_textureUvLocation);
+-        gl.VertexAttribPointer(_textureUvLocation, 2, GlFloat, 0, sizeof(float) * 5, new IntPtr(sizeof(float) * 3));
+-        gl.DrawElements(GlTriangles, 6, GlUnsignedInt, IntPtr.Zero);
+-    }
+-
+     public void Deinitialize(GlInterface gl)
+     {
+         foreach (var resource in _meshResources.Values) resource.Dispose(gl);
+@@ -388,26 +244,13 @@
+         _controlTextures.Clear();
+         _highScaleGpuBatches.Clear();
+         if (_meshInstanceBuffer != 0) gl.DeleteBuffer(_meshInstanceBuffer);
+-        if (_renderScaleQuadVertexBuffer != 0) gl.DeleteBuffer(_renderScaleQuadVertexBuffer);
+-        if (_renderScaleQuadIndexBuffer != 0) gl.DeleteBuffer(_renderScaleQuadIndexBuffer);
+-        if (_renderScaleTexture != 0) gl.DeleteTexture(_renderScaleTexture);
+-        if (_renderScaleDepthBuffer != 0)
+-        {
+-            var depth = _renderScaleDepthBuffer;
+-            _deleteRenderbuffers?.Invoke(1, ref depth);
+-        }
+         if (_paletteTexture != 0) gl.DeleteTexture(_paletteTexture);
+-        if (_renderScaleFramebuffer != 0)
+-        {
+-            var fbo = _renderScaleFramebuffer;
+-            _deleteFramebuffers?.Invoke(1, ref fbo);
+-        }
+         if (_controlVertexBuffer != 0) gl.DeleteBuffer(_controlVertexBuffer);
+         if (_controlIndexBuffer != 0) gl.DeleteBuffer(_controlIndexBuffer);
+         if (_meshProgram != 0) gl.DeleteProgram(_meshProgram);
+         if (_texturedProgram != 0) gl.DeleteProgram(_texturedProgram);
+-        _meshInstanceBuffer = _controlVertexBuffer = _controlIndexBuffer = _renderScaleQuadVertexBuffer = _renderScaleQuadIndexBuffer = _meshProgram = _texturedProgram = 0;
+-        _renderScaleFramebuffer = _renderScaleTexture = _renderScaleDepthBuffer = _paletteTexture = 0;
++        _meshInstanceBuffer = _controlVertexBuffer = _controlIndexBuffer = _meshProgram = _texturedProgram = 0;
++        _paletteTexture = 0;
+         _initialized = false;
+     }
+ 
+@@ -419,8 +262,8 @@
+         _highScaleGpuBatches.Clear();
+         _meshBatches.Clear();
+         _highScaleGpuBatches.Clear();
+-        _meshInstanceBuffer = _controlVertexBuffer = _controlIndexBuffer = _renderScaleQuadVertexBuffer = _renderScaleQuadIndexBuffer = _meshProgram = _texturedProgram = 0;
+-        _renderScaleFramebuffer = _renderScaleTexture = _renderScaleDepthBuffer = _paletteTexture = 0;
++        _meshInstanceBuffer = _controlVertexBuffer = _controlIndexBuffer = _meshProgram = _texturedProgram = 0;
++        _paletteTexture = 0;
+         _lastSweptRegistryVersion = -1;
+     }
+ 
+@@ -1619,15 +1462,6 @@
+     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlVertexAttribDivisorDelegate(int index, int divisor);
+     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlDrawElementsInstancedDelegate(int mode, int count, int type, IntPtr indices, int instanceCount);
+     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlBufferSubDataDelegate(int target, IntPtr offset, IntPtr size, IntPtr data);
+-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlGenFramebuffersDelegate(int n, out int framebuffers);
+-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlDeleteFramebuffersDelegate(int n, ref int framebuffers);
+-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlFramebufferTexture2DDelegate(int target, int attachment, int textarget, int texture, int level);
+-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate int GlCheckFramebufferStatusDelegate(int target);
+-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlGenRenderbuffersDelegate(int n, out int renderbuffers);
+-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlDeleteRenderbuffersDelegate(int n, ref int renderbuffers);
+-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlBindRenderbufferDelegate(int target, int renderbuffer);
+-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlRenderbufferStorageDelegate(int target, int internalformat, int width, int height);
+-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlFramebufferRenderbufferDelegate(int target, int attachment, int renderbuffertarget, int renderbuffer);
+ 
+ 
+     private sealed class HighScaleChunkFramePlan
+Only in /mnt/data/v37_extract/3DEngine: PERFORMANCE_ITERATIONS.md
+Only in /mnt/data/v37_extract/3DEngine: PERFORMANCE_ITERATIONS_HIGH_SCALE_RENDERING.md
+Only in /mnt/data/v38_clean/3DEngine: PREVIEWER_VSIX_RU.md
+Only in /mnt/data/v37_extract/3DEngine: RENDER_AUDIT_V31_RU.md
+Only in /mnt/data/v37_extract/3DEngine: RENDER_AUDIT_V32_RU.md
+Only in /mnt/data/v37_extract/3DEngine: RENDER_AUDIT_V33_RU.md
+Only in /mnt/data/v37_extract/3DEngine: RENDER_AUDIT_V34_RU.md
+Only in /mnt/data/v37_extract/3DEngine: RENDER_AUDIT_V35_RU.md
+Only in /mnt/data/v37_extract/3DEngine: V37_BAKED_MESH_RENDER_SCALE_RU.md
+diff -ru /mnt/data/v37_extract/MainView.axaml.cs /mnt/data/v38_clean/MainView.axaml.cs
+--- /mnt/data/v37_extract/MainView.axaml.cs	2026-04-27 08:34:49.000000000 +0000
++++ /mnt/data/v38_clean/MainView.axaml.cs	2026-04-27 09:00:52.854057700 +0000
+@@ -54,7 +54,6 @@
+     private TextBox _unlockedMaxFpsText = null!;
+     private TextBox _frameTickFpsText = null!;
+     private TextBox _telemetryFrameBudgetText = null!;
+-    private TextBox _renderScaleText = null!;
+     private CheckBox _bakedMeshCheck = null!;
+     private CheckBox _paletteTextureCheck = null!;
+ 
+@@ -175,7 +174,7 @@
+         _drawDistanceText = TextBox("5000");
+         _fadeDistanceText = TextBox("120");
+         _overlayCheck = new CheckBox { Content = "Overlay", IsChecked = true, Foreground = Brushes.White };
+-        _loggingCheck = new CheckBox { Content = "CSV logging", IsChecked = true, Foreground = Brushes.White };
++        _loggingCheck = new CheckBox { Content = "CSV logging", IsChecked = !IsBrowserPlatform(), Foreground = Brushes.White };
+         _telemetryCheck = new CheckBox { Content = "Telemetry updates", IsChecked = true, Foreground = Brushes.White };
+         _animateCheck = new CheckBox { Content = "Transform animation", IsChecked = false, Foreground = Brushes.White };
+         _continuousCheck = new CheckBox { Content = "Continuous render loop", IsChecked = true, Foreground = Brushes.White };
+@@ -187,7 +186,6 @@
+         _unlockedMaxFpsText = TextBox("240");
+         _frameTickFpsText = TextBox("20");
+         _telemetryFrameBudgetText = TextBox("0");
+-        _renderScaleText = TextBox("1.00");
+         _bakedMeshCheck = new CheckBox { Content = "Baked high-scale meshes", IsChecked = true, Foreground = Brushes.White };
+         _paletteTextureCheck = new CheckBox { Content = "GPU palette texture", IsChecked = true, Foreground = Brushes.White };
+         _bakedMeshCheck.IsCheckedChanged += (_, _) => ApplyRuntimeSettings();
+@@ -240,7 +238,6 @@
+         stack.Children.Add(_adaptivePerformanceCheck);
+         stack.Children.Add(_bakedMeshCheck);
+         stack.Children.Add(_paletteTextureCheck);
+-        stack.Children.Add(Row("Render scale", _renderScaleText));
+         stack.Children.Add(Row("Telemetry/frame 0=auto", _telemetryFrameBudgetText));
+ 
+         var apply = new Button { Content = "Apply / Rebuild scene" };
+@@ -276,8 +273,6 @@
+         var targetFps = Math.Clamp(ParseFloat(_targetFpsText.Text, 60f), 1f, 500f);
+         var unlockedMaxFps = Math.Clamp(ParseFloat(_unlockedMaxFpsText.Text, 240f), 1f, 500f);
+         var frameTickFps = Math.Clamp(ParseFloat(_frameTickFpsText.Text, 20f), 1f, 240f);
+-        var renderScale = Math.Clamp(ParseFloat(_renderScaleText.Text, 1f), 0.25f, 1f);
+-
+         _sceneControl.ContinuousRendering = _continuousCheck.IsChecked == true;
+         _sceneControl.FpsLockEnabled = _fpsLockCheck.IsChecked == true;
+         _sceneControl.TargetFps = targetFps;
+@@ -292,7 +287,6 @@
+         _sceneControl.Scene.Performance.AdaptivePerformanceEnabled = _sceneControl.AdaptivePerformanceEnabled;
+         _sceneControl.Scene.Performance.EnableBakedHighScaleDetailedMeshes = _bakedMeshCheck.IsChecked == true;
+         _sceneControl.Scene.Performance.EnableHighScalePaletteTexture = _paletteTextureCheck.IsChecked == true;
+-        _sceneControl.Scene.Performance.RenderScale = renderScale;
+     }
+ 
+     private void ApplyPreset(int instances, int proxies, int telemetryPerSecond, string scenario)
+@@ -337,7 +331,6 @@
+             scene.Performance.AdaptivePerformanceEnabled = _adaptivePerformanceCheck.IsChecked == true;
+             scene.Performance.EnableBakedHighScaleDetailedMeshes = _bakedMeshCheck.IsChecked == true;
+             scene.Performance.EnableHighScalePaletteTexture = _paletteTextureCheck.IsChecked == true;
+-            scene.Performance.RenderScale = Math.Clamp(ParseFloat(_renderScaleText.Text, 1f), 0.25f, 1f);
+             scene.FrameInterpolator.Enabled = _frameInterpolationCheck.IsChecked == true;
+             scene.FrameInterpolator.SimulationTickFps = Math.Clamp(ParseFloat(_frameTickFpsText.Text, 20f), 1f, 240f);
+             scene.AdaptivePerformance.Enabled = _adaptivePerformanceCheck.IsChecked == true;
+@@ -677,17 +670,22 @@
+     {
+         CloseCsv();
+ 
++        if (IsBrowserPlatform())
++        {
++            throw new PlatformNotSupportedException("CSV logging is disabled in browser/WebAssembly builds.");
++        }
++
+         var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Avalonia3D", "Benchmarks");
+         Directory.CreateDirectory(dir);
+ 
+-        var processId = Process.GetCurrentProcess().Id;
++        var runId = Guid.NewGuid().ToString("N")[..8];
+         var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture);
+         Exception? lastError = null;
+ 
+         for (var attempt = 0; attempt < 1000; attempt++)
+         {
+             var suffix = attempt == 0 ? string.Empty : "_" + attempt.ToString("000", CultureInfo.InvariantCulture);
+-            var path = Path.Combine(dir, $"benchmark_{timestamp}_p{processId}{suffix}.csv");
++            var path = Path.Combine(dir, $"benchmark_{timestamp}_{runId}{suffix}.csv");
+ 
+             try
+             {
+@@ -699,7 +697,7 @@
+ 
+                 _csvPath = path;
+                 _csv = new StreamWriter(stream);
+-                _csv.WriteLine("time_s,scenario,instances,interactive_proxies,telemetry_target_s,telemetry_applied_s,fps,frame_ms,avg_frame_ms,alloc_mb_s,alloc_frame_kb,heap_mb,gc0,gc1,gc2,continuous_render,fps_locked,target_fps,unlocked_max_fps,framegen,adaptive,quality_scale,render_scale,render_w,render_h,baked_draws,telemetry_apply_ms,telemetry_queue,compact_proxies,objects,renderables,pickables,colliders,highscale_instances,total_chunks,visible_chunks,culled,lod_detailed,lod_simplified,lod_proxy,lod_billboard,lod_culled,visible_part_instances,draw_calls,batches,triangles,transform_upload_mb,state_upload_kb,backend_ms,frame_total_ms,schedule_delay_ms,hs_plan_ms,hs_build_ms,hs_upload_ms,packet_ms,serialize_ms,upload_ms,picking_ms,physics_ms,live_ms,mesh_cache,registry_version");
++                _csv.WriteLine("time_s,scenario,instances,interactive_proxies,telemetry_target_s,telemetry_applied_s,fps,frame_ms,avg_frame_ms,alloc_mb_s,alloc_frame_kb,heap_mb,gc0,gc1,gc2,continuous_render,fps_locked,target_fps,unlocked_max_fps,framegen,adaptive,quality_scale,render_w,render_h,baked_draws,telemetry_apply_ms,telemetry_queue,compact_proxies,objects,renderables,pickables,colliders,highscale_instances,total_chunks,visible_chunks,culled,lod_detailed,lod_simplified,lod_proxy,lod_billboard,lod_culled,visible_part_instances,draw_calls,batches,triangles,transform_upload_mb,state_upload_kb,backend_ms,frame_total_ms,schedule_delay_ms,hs_plan_ms,hs_build_ms,hs_upload_ms,packet_ms,serialize_ms,upload_ms,picking_ms,physics_ms,live_ms,mesh_cache,registry_version");
+                 _csv.Flush();
+                 return;
+             }
+@@ -747,7 +745,6 @@
+             ((_frameInterpolationCheck.IsChecked == true) ? "1" : "0"),
+             ((_adaptivePerformanceCheck.IsChecked == true) ? "1" : "0"),
+             F(stats.AdaptiveQualityScale),
+-            F(stats.RenderScale),
+             stats.RenderTargetWidth.ToString(CultureInfo.InvariantCulture),
+             stats.RenderTargetHeight.ToString(CultureInfo.InvariantCulture),
+             stats.BakedHighScalePartDraws.ToString(CultureInfo.InvariantCulture),
+@@ -805,7 +802,7 @@
+             $"Telemetry: target {_configuredTelemetryPerSecond:n0}/s, applied {_lastTelemetryAppliedPerSecond:n0}/s | queue {_telemetryQueue.Count:n0}\n" +
+             $"FPS: {_lastFps:0.0} | Frame: {(frame?.FrameMilliseconds ?? 0):0.00} ms | Avg: {_lastAverageFrameMs:0.00} ms | Total: {stats.FrameTotalMilliseconds:0.00} ms\n" +
+             $"Alloc: {_allocatedMbPerSecond:0.00} MB/s | Frame alloc: {stats.AllocatedBytesPerFrame / 1024d:0.0} KB | GC: {stats.Gen0Collections}/{stats.Gen1Collections}/{stats.Gen2Collections} | Heap: {stats.ManagedHeapBytes / (1024d * 1024d):0.0} MB\n" +
+-            $"Render: {(_continuousCheck.IsChecked == true ? "cont" : "dirty")} | Lock: {(_fpsLockCheck.IsChecked == true ? "on" : "off")} | Target: {ParseFloat(_targetFpsText.Text, 60f):0} | Scale: {stats.RenderScale:0.00} ({stats.RenderTargetWidth}x{stats.RenderTargetHeight}) | Baked: {(_bakedMeshCheck.IsChecked == true ? "on" : "off")} | Palette: {(_paletteTextureCheck.IsChecked == true ? "on" : "off")}\n" +
++            $"Render: {(_continuousCheck.IsChecked == true ? "cont" : "dirty")} | Lock: {(_fpsLockCheck.IsChecked == true ? "on" : "off")} | Target: {ParseFloat(_targetFpsText.Text, 60f):0} | Target: {stats.RenderTargetWidth}x{stats.RenderTargetHeight} | Baked: {(_bakedMeshCheck.IsChecked == true ? "on" : "off")} | Palette: {(_paletteTextureCheck.IsChecked == true ? "on" : "off")}\n" +
+             $"Interp: {(_frameInterpolationCheck.IsChecked == true ? "on" : "off")} | Adaptive: {(_adaptivePerformanceCheck.IsChecked == true ? "on" : "off")} q={stats.AdaptiveQualityScale:0.00} | Baked draws: {stats.BakedHighScalePartDraws:n0}\n" +
+             $"Telemetry apply: {_lastTelemetryApplyMs:0.00} ms | Compact proxies: {(_compactProxiesCheck.IsChecked == true ? "on" : "off")}\n" +
+             $"HighScale: {stats.HighScaleInstanceCount:n0} | Chunks: {stats.VisibleChunkCount:n0}/{stats.TotalChunkCount:n0}\n" +
+@@ -875,21 +872,19 @@
+ 
+     private void OpenLogFolder()
+     {
+-        var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Avalonia3D", "Benchmarks");
+-        Directory.CreateDirectory(dir);
+-        try
++        if (IsBrowserPlatform())
+         {
+-            Process.Start(new ProcessStartInfo
+-            {
+-                FileName = dir,
+-                UseShellExecute = true
+-            });
+-        }
+-        catch
+-        {
+-            // Not critical for the benchmark.
++            _statusText.Text = "Log folder is not available in browser/WebAssembly builds.";
++            return;
+         }
++
++        var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Avalonia3D", "Benchmarks");
++        Directory.CreateDirectory(dir);
++        _statusText.Text = "Benchmark log folder: " + dir;
+     }
++
++    private static bool IsBrowserPlatform()
++        => OperatingSystem.IsBrowser();
+ }
+ 
+ public sealed class BenchmarkMarker3D : CompositeObject3D
+Only in /mnt/data/v38_clean: README_STABLE_RU.md

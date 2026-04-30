@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
 using ThreeDEngine.Core.Collision;
 using ThreeDEngine.Core.Math;
@@ -20,8 +21,11 @@ public sealed class BasicPhysicsCore : IPhysicsCore
         }
 
         deltaSeconds = MathF.Min(deltaSeconds, 1f / 15f);
-        var staticObjects = scene.Registry.StaticColliders;
-        var dynamicObjects = scene.Registry.DynamicBodies;
+        // Take stable snapshots before integration. Transform changes during physics
+        // invalidate and rebuild the registry through SceneChanged events, so iterating
+        // the registry-backed lists directly can throw when a body moves under gravity.
+        var staticObjects = scene.Registry.StaticColliders.ToArray();
+        var dynamicObjects = scene.Registry.DynamicBodies.ToArray();
 
         foreach (var obj in dynamicObjects)
         {
@@ -36,9 +40,9 @@ public sealed class BasicPhysicsCore : IPhysicsCore
                 ResolveAgainstWorld(scene, obj, staticObjects);
             }
 
-            for (var i = 0; i < dynamicObjects.Count; i++)
+            for (var i = 0; i < dynamicObjects.Length; i++)
             {
-                for (var j = i + 1; j < dynamicObjects.Count; j++)
+                for (var j = i + 1; j < dynamicObjects.Length; j++)
                 {
                     ResolveDynamicPair(dynamicObjects[i], dynamicObjects[j]);
                 }
@@ -76,9 +80,10 @@ public sealed class BasicPhysicsCore : IPhysicsCore
         }
 
         var bounds = obj.Collider.GetWorldBounds(obj);
-        var candidates = scene.Registry.ColliderIndex.QueryBounds(bounds);
-        var objects = candidates.Count == 0 ? staticObjects : candidates;
-        foreach (var other in objects)
+        // During a physics step the registry can be dirty because moving bodies raise
+        // change notifications. Use the static snapshot captured at the beginning of
+        // the step instead of querying a potentially rebuilt spatial index mid-step.
+        foreach (var other in staticObjects)
         {
             if (ReferenceEquals(obj, other) || other.Collider is null)
             {

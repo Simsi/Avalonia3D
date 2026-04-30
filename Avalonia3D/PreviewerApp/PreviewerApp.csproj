@@ -18,11 +18,12 @@
     <AssemblyName>PreviewerApp</AssemblyName>
     <IsPackable>false</IsPackable>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <DefineConstants>$(DefineConstants);THREE_DENGINE_PREVIEWER_APP</DefineConstants>
 
     <!--
       VSIX passes this property explicitly when the main project is not named Avalonia3D.csproj.
       Manual build example:
-      dotnet build .\PreviewerApp\PreviewerApp.csproj -p:ThreeDEngineHostProject=.\Avalonia3D.csproj
+      dotnet build .\PreviewerApp\PreviewerApp.csproj -p:ThreeDEngineHostProject=..\Avalonia3D.csproj
     -->
     <ThreeDEngineHostProject Condition="'$(ThreeDEngineHostProject)' == '' and Exists('..\Avalonia3D.csproj')">..\Avalonia3D.csproj</ThreeDEngineHostProject>
   </PropertyGroup>
@@ -38,17 +39,38 @@
       Offline-only by default: reference Roslyn assemblies from the installed .NET SDK / MSBuild.
       There is deliberately no Microsoft.CodeAnalysis.CSharp PackageReference here, because the
       previewer must build in offline/VSIX handoff scenarios without contacting nuget.org.
+
+      Search order covers both dotnet CLI SDK layout (Roslyn\bincore) and Visual Studio
+      MSBuild layout (Roslyn without bincore, including amd64/sibling variants).
     -->
-    <ThreeDEngineRoslynPath Condition="'$(ThreeDEngineRoslynPath)' == '' and '$(RoslynAssembliesPath)' != ''">$(RoslynAssembliesPath)</ThreeDEngineRoslynPath>
+    <ThreeDEngineRoslynPath Condition="'$(ThreeDEngineRoslynPath)' == '' and '$(RoslynAssembliesPath)' != '' and Exists('$(RoslynAssembliesPath)\Microsoft.CodeAnalysis.CSharp.dll')">$(RoslynAssembliesPath)</ThreeDEngineRoslynPath>
+    <ThreeDEngineRoslynPath Condition="'$(ThreeDEngineRoslynPath)' == '' and '$(CscToolPath)' != '' and Exists('$(CscToolPath)\Microsoft.CodeAnalysis.CSharp.dll')">$(CscToolPath)</ThreeDEngineRoslynPath>
     <ThreeDEngineRoslynPath Condition="'$(ThreeDEngineRoslynPath)' == '' and Exists('$(MSBuildToolsPath)\Roslyn\bincore\Microsoft.CodeAnalysis.CSharp.dll')">$(MSBuildToolsPath)\Roslyn\bincore</ThreeDEngineRoslynPath>
+    <ThreeDEngineRoslynPath Condition="'$(ThreeDEngineRoslynPath)' == '' and Exists('$(MSBuildToolsPath)\Roslyn\Microsoft.CodeAnalysis.CSharp.dll')">$(MSBuildToolsPath)\Roslyn</ThreeDEngineRoslynPath>
+    <ThreeDEngineRoslynPath Condition="'$(ThreeDEngineRoslynPath)' == '' and Exists('$(MSBuildToolsPath)\..\Roslyn\Microsoft.CodeAnalysis.CSharp.dll')">$(MSBuildToolsPath)\..\Roslyn</ThreeDEngineRoslynPath>
+    <ThreeDEngineRoslynPath Condition="'$(ThreeDEngineRoslynPath)' == '' and '$(VsInstallRoot)' != '' and Exists('$(VsInstallRoot)MSBuild\Current\Bin\Roslyn\Microsoft.CodeAnalysis.CSharp.dll')">$(VsInstallRoot)MSBuild\Current\Bin\Roslyn</ThreeDEngineRoslynPath>
+    <ThreeDEngineRoslynPath Condition="'$(ThreeDEngineRoslynPath)' == '' and '$(VsInstallRoot)' != '' and Exists('$(VsInstallRoot)MSBuild\Current\Bin\amd64\Roslyn\Microsoft.CodeAnalysis.CSharp.dll')">$(VsInstallRoot)MSBuild\Current\Bin\amd64\Roslyn</ThreeDEngineRoslynPath>
+    <ThreeDEngineRoslynSearchedPaths>$(RoslynAssembliesPath);$(CscToolPath);$(MSBuildToolsPath)\Roslyn\bincore;$(MSBuildToolsPath)\Roslyn;$(MSBuildToolsPath)\..\Roslyn;$(VsInstallRoot)MSBuild\Current\Bin\Roslyn;$(VsInstallRoot)MSBuild\Current\Bin\amd64\Roslyn</ThreeDEngineRoslynSearchedPaths>
   </PropertyGroup>
 
   <Target Name="ValidateThreeDEngineHostProject" BeforeTargets="ResolveReferences" Condition="'$(ThreeDEngineHostProject)' == '' or !Exists('$(ThreeDEngineHostProject)')">
     <Error Text="PreviewerApp requires a host Avalonia3D project. Pass -p:ThreeDEngineHostProject=&lt;path-to-main-csproj&gt; or place PreviewerApp next to Avalonia3D.csproj." />
   </Target>
 
+  <PropertyGroup>
+    <!--
+      The host project is a source-drop style Avalonia app. When PreviewerApp builds it through
+      ProjectReference, SDK default globs in the host would otherwise pick up nested utility
+      projects such as SmokeTests/PreviewerApp/VSIXConnector and sometimes stale obj/bin output.
+      These properties are passed only to the referenced host project, so the previewer can be
+      built from the command line even when root-level Directory.Build.* files were not copied.
+    -->
+    <ThreeDEngineHostProjectReferenceProperties>DefaultItemExcludes=$(DefaultItemExcludes)%3BPreviewerApp/**%3BPreviewerApp/**/*%3B**/PreviewerApp/**%3B**/PreviewerApp/**/*%3BSmokeTests/**%3BSmokeTests/**/*%3B**/SmokeTests/**%3B**/SmokeTests/**/*%3BVSIXConnector/**%3BVSIXConnector/**/*%3B**/VSIXConnector/**%3B**/VSIXConnector/**/*%3Bbin/**%3Bbin/**/*%3B**/bin/**%3B**/bin/**/*%3Bobj/**%3Bobj/**/*%3B**/obj/**%3B**/obj/**/*%3BRoslynDebuggerSourceExporter.cs%3B**/RoslynDebuggerSourceExporter.cs;DefaultItemExcludesInProjectFolder=$(DefaultItemExcludesInProjectFolder)%3BPreviewerApp/**%3BPreviewerApp/**/*%3B**/PreviewerApp/**%3B**/PreviewerApp/**/*%3BSmokeTests/**%3BSmokeTests/**/*%3B**/SmokeTests/**%3B**/SmokeTests/**/*%3BVSIXConnector/**%3BVSIXConnector/**/*%3B**/VSIXConnector/**%3B**/VSIXConnector/**/*%3Bbin/**%3Bbin/**/*%3B**/bin/**%3B**/bin/**/*%3Bobj/**%3Bobj/**/*%3B**/obj/**%3B**/obj/**/*%3BRoslynDebuggerSourceExporter.cs%3B**/RoslynDebuggerSourceExporter.cs</ThreeDEngineHostProjectReferenceProperties>
+  </PropertyGroup>
+
   <ItemGroup>
-    <ProjectReference Include="$(ThreeDEngineHostProject)" />
+    <ProjectReference Include="$(ThreeDEngineHostProject)"
+                      AdditionalProperties="$(ThreeDEngineHostProjectReferenceProperties)" />
     <PackageReference Include="Avalonia.Desktop" Version="$(AvaloniaVersion)" />
     <PackageReference Include="Avalonia.Themes.Fluent" Version="$(AvaloniaVersion)" />
   </ItemGroup>
@@ -65,6 +87,6 @@
   </ItemGroup>
 
   <Target Name="ValidateThreeDEngineRoslynReferences" BeforeTargets="ResolveReferences" Condition="!Exists('$(ThreeDEngineRoslynPath)\Microsoft.CodeAnalysis.CSharp.dll')">
-    <Error Text="PreviewerApp Roslyn source export requires Microsoft.CodeAnalysis.CSharp. Offline mode expected it at '$(ThreeDEngineRoslynPath)'. Build with Visual Studio/.NET SDK installed, or pass -p:ThreeDEngineRoslynPath=&lt;path-to-Roslyn-bincore&gt;. This project intentionally does not restore Microsoft.CodeAnalysis.CSharp from NuGet." />
+    <Error Text="PreviewerApp Roslyn source export requires Microsoft.CodeAnalysis.CSharp. Offline mode could not find it. Searched: $(ThreeDEngineRoslynSearchedPaths). Build with Visual Studio/.NET SDK installed, or pass -p:ThreeDEngineRoslynPath=&lt;path-to-Roslyn-folder&gt;. This project intentionally does not restore Microsoft.CodeAnalysis.CSharp from NuGet." />
   </Target>
 </Project>

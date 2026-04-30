@@ -1,0 +1,216 @@
+diff -ruN /mnt/data/diff_old_v52/VSIXConnector/Commands/Open3DPreviewCommand.cs /mnt/data/diff_new_v53/VSIXConnector/Commands/Open3DPreviewCommand.cs
+--- /mnt/data/diff_old_v52/VSIXConnector/Commands/Open3DPreviewCommand.cs	2026-04-28 05:10:57.357522137 +0000
++++ /mnt/data/diff_new_v53/VSIXConnector/Commands/Open3DPreviewCommand.cs	2026-04-28 05:05:26.281532221 +0000
+@@ -25,11 +25,14 @@
+     {
+         _package = package;
+ 
+-        var commandSet = new Guid(Open3DPreviewCommandPackageGuids.CommandSetGuidString);
++        RegisterCommand(commandService, Open3DPreviewCommandPackageIds.Open3DPreviewCommandId, Execute);
++        RegisterCommand(commandService, Open3DPreviewCommandPackageIds.ShowDiagnosticsCommandId, ExecuteDiagnostics);
++    }
+ 
+-        var menuCommand = new OleMenuCommand(
+-            Execute,
+-            new CommandID(commandSet, Open3DPreviewCommandPackageIds.Open3DPreviewCommandId));
++    private static void RegisterCommand(OleMenuCommandService commandService, int commandId, EventHandler handler)
++    {
++        var commandSet = new Guid(Open3DPreviewCommandPackageGuids.CommandSetGuidString);
++        var menuCommand = new OleMenuCommand(handler, new CommandID(commandSet, commandId));
+         menuCommand.BeforeQueryStatus += OnBeforeQueryStatus;
+         commandService.AddCommand(menuCommand);
+     }
+@@ -40,7 +43,9 @@
+         {
+             command.Visible = true;
+             command.Enabled = true;
+-            command.Text = "Open 3D Preview";
++            command.Text = command.CommandID.ID == Open3DPreviewCommandPackageIds.ShowDiagnosticsCommandId
++                ? "Show 3DEngine Previewer Diagnostics"
++                : "Open 3D Preview";
+         }
+     }
+ 
+@@ -59,6 +64,59 @@
+         }).FileAndForget("ThreeDEngine/Previewer/Open3DPreview");
+     }
+ 
++    private void ExecuteDiagnostics(object sender, EventArgs e)
++    {
++        _package.JoinableTaskFactory.RunAsync(async () =>
++        {
++            await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
++            await ShowDiagnosticsAsync();
++        }).FileAndForget("ThreeDEngine/Previewer/Diagnostics");
++    }
++
++    private async Task ShowDiagnosticsAsync()
++    {
++        await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
++
++        var builder = new StringBuilder();
++        builder.AppendLine("3DEngine Previewer Connector diagnostics");
++        builder.AppendLine("VSIX assembly: " + typeof(Open3DPreviewCommand).Assembly.FullName);
++        builder.AppendLine("Package GUID: " + Open3DPreviewCommandPackageGuids.PackageGuidString);
++        builder.AppendLine("Command set GUID: " + Open3DPreviewCommandPackageGuids.CommandSetGuidString);
++        builder.AppendLine("Open command ID: 0x" + Open3DPreviewCommandPackageIds.Open3DPreviewCommandId.ToString("X4"));
++        builder.AppendLine("Diagnostics command ID: 0x" + Open3DPreviewCommandPackageIds.ShowDiagnosticsCommandId.ToString("X4"));
++        builder.AppendLine();
++
++        var dte = await _package.GetServiceAsync(typeof(DTE)) as DTE2;
++        if (dte is null)
++        {
++            builder.AppendLine("DTE service: not available");
++        }
++        else
++        {
++            builder.AppendLine("Solution: " + (dte.Solution?.FullName ?? "<none>"));
++            builder.AppendLine("Active document: " + (dte.ActiveDocument?.FullName ?? "<none>"));
++            builder.AppendLine("Active project: " + (dte.ActiveDocument?.ProjectItem?.ContainingProject?.FullName ?? "<none>"));
++
++            var projectPath = dte.ActiveDocument?.ProjectItem?.ContainingProject?.FullName;
++            if (!string.IsNullOrWhiteSpace(projectPath))
++            {
++                var projectDir = Path.GetDirectoryName(projectPath!);
++                var solutionDir = TryGetSolutionDirectory(dte);
++                var previewer = projectDir is null ? null : LocatePreviewerProject(projectDir, solutionDir);
++                builder.AppendLine("PreviewerApp: " + (previewer ?? "not found"));
++            }
++        }
++
++        builder.AppendLine();
++        builder.AppendLine("Expected UI locations after install:");
++        builder.AppendLine("- Extensions > 3DEngine > Open 3D Preview");
++        builder.AppendLine("- Tools > Open 3D Preview");
++        builder.AppendLine("- Command Window / keyboard command: Tools.Open3DPreview");
++        builder.AppendLine("- Diagnostics command: Tools.ThreeDEnginePreviewerDiagnostics");
++
++        ShowMessage(builder.ToString(), OLEMSGICON.OLEMSGICON_INFO);
++    }
++
+     private async Task ExecuteAsync()
+     {
+         await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+diff -ruN /mnt/data/diff_old_v52/VSIXConnector/Commands/Open3DPreviewCommand.vsct /mnt/data/diff_new_v53/VSIXConnector/Commands/Open3DPreviewCommand.vsct
+--- /mnt/data/diff_old_v52/VSIXConnector/Commands/Open3DPreviewCommand.vsct	2026-04-28 05:10:57.355815548 +0000
++++ /mnt/data/diff_new_v53/VSIXConnector/Commands/Open3DPreviewCommand.vsct	2026-04-28 05:03:34.080978301 +0000
+@@ -4,29 +4,61 @@
+   <Extern href="vsshlids.h" />
+ 
+   <Commands package="guidThreeDEnginePreviewerPackage">
++    <Menus>
++      <Menu guid="guidThreeDEnginePreviewerCommandSet" id="ThreeDEngineTopMenu" priority="0x0700" type="Menu">
++        <Parent guid="guidSHLMainMenu" id="IDG_VS_MM_TOOLSADDINS" />
++        <Strings>
++          <ButtonText>3DEngine</ButtonText>
++        </Strings>
++      </Menu>
++    </Menus>
++
+     <Groups>
+-      <Group guid="guidThreeDEnginePreviewerCommandSet" id="ThreeDEnginePreviewerToolsGroup" priority="0x0600">
++      <Group guid="guidThreeDEnginePreviewerCommandSet" id="ThreeDEngineTopMenuGroup" priority="0x0100">
++        <Parent guid="guidThreeDEnginePreviewerCommandSet" id="ThreeDEngineTopMenu" />
++      </Group>
++      <Group guid="guidThreeDEnginePreviewerCommandSet" id="ThreeDEngineToolsMenuGroup" priority="0x0600">
+         <Parent guid="guidSHLMainMenu" id="IDM_VS_MENU_TOOLS" />
+       </Group>
+     </Groups>
+ 
+     <Buttons>
+       <Button guid="guidThreeDEnginePreviewerCommandSet" id="cmdidOpen3DPreview" priority="0x0100" type="Button">
+-        <Parent guid="guidThreeDEnginePreviewerCommandSet" id="ThreeDEnginePreviewerToolsGroup" />
++        <Parent guid="guidThreeDEnginePreviewerCommandSet" id="ThreeDEngineTopMenuGroup" />
+         <CommandFlag>TextChanges</CommandFlag>
+         <Strings>
+           <ButtonText>Open 3D Preview</ButtonText>
++          <CommandName>3DEngine.Open3DPreview</CommandName>
+           <LocCanonicalName>Tools.Open3DPreview</LocCanonicalName>
+         </Strings>
+       </Button>
++
++      <Button guid="guidThreeDEnginePreviewerCommandSet" id="cmdidShowDiagnostics" priority="0x0200" type="Button">
++        <Parent guid="guidThreeDEnginePreviewerCommandSet" id="ThreeDEngineTopMenuGroup" />
++        <CommandFlag>TextChanges</CommandFlag>
++        <Strings>
++          <ButtonText>Show 3DEngine Previewer Diagnostics</ButtonText>
++          <CommandName>3DEngine.ShowPreviewerDiagnostics</CommandName>
++          <LocCanonicalName>Tools.ThreeDEnginePreviewerDiagnostics</LocCanonicalName>
++        </Strings>
++      </Button>
+     </Buttons>
+   </Commands>
+ 
++  <CommandPlacements>
++    <CommandPlacement guid="guidThreeDEnginePreviewerCommandSet" id="cmdidOpen3DPreview" priority="0x0600">
++      <Parent guid="guidThreeDEnginePreviewerCommandSet" id="ThreeDEngineToolsMenuGroup" />
++    </CommandPlacement>
++  </CommandPlacements>
++
+   <Symbols>
+     <GuidSymbol name="guidThreeDEnginePreviewerPackage" value="{d9f3b129-4b58-4ae5-bd4f-1ab60a6d3f20}" />
+     <GuidSymbol name="guidThreeDEnginePreviewerCommandSet" value="{ccf7cd52-f9ea-4d4f-b19d-3a739b96e3b2}">
+-      <IDSymbol name="ThreeDEnginePreviewerToolsGroup" value="0x1020" />
++      <IDSymbol name="ThreeDEngineTopMenu" value="0x1020" />
++      <IDSymbol name="ThreeDEngineTopMenuGroup" value="0x1021" />
++      <IDSymbol name="ThreeDEngineToolsMenuGroup" value="0x1022" />
+       <IDSymbol name="cmdidOpen3DPreview" value="0x0100" />
++      <IDSymbol name="cmdidShowDiagnostics" value="0x0101" />
+     </GuidSymbol>
+   </Symbols>
+ </CommandTable>
+diff -ruN /mnt/data/diff_old_v52/VSIXConnector/Commands/Open3DPreviewCommandPackageGuids.cs /mnt/data/diff_new_v53/VSIXConnector/Commands/Open3DPreviewCommandPackageGuids.cs
+--- /mnt/data/diff_old_v52/VSIXConnector/Commands/Open3DPreviewCommandPackageGuids.cs	2026-04-28 05:10:57.356450821 +0000
++++ /mnt/data/diff_new_v53/VSIXConnector/Commands/Open3DPreviewCommandPackageGuids.cs	2026-04-28 05:04:06.088324654 +0000
+@@ -9,4 +9,5 @@
+ internal static class Open3DPreviewCommandPackageIds
+ {
+     public const int Open3DPreviewCommandId = 0x0100;
++    public const int ShowDiagnosticsCommandId = 0x0101;
+ }
+diff -ruN /mnt/data/diff_old_v52/VSIXConnector/V53_COMMAND_DIAGNOSTICS_RU.md /mnt/data/diff_new_v53/VSIXConnector/V53_COMMAND_DIAGNOSTICS_RU.md
+--- /mnt/data/diff_old_v52/VSIXConnector/V53_COMMAND_DIAGNOSTICS_RU.md	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/diff_new_v53/VSIXConnector/V53_COMMAND_DIAGNOSTICS_RU.md	2026-04-28 05:06:08.360509702 +0000
+@@ -0,0 +1,18 @@
++# VSIX v53: команда и диагностика
++
++Цель v53 — не скрывать ошибку. После установки должно быть минимум три способа увидеть, что command table попала в Visual Studio:
++
++1. `Extensions > 3DEngine > Open 3D Preview`.
++2. `Tools > Open 3D Preview`.
++3. `Tools > Options > Environment > Keyboard`: команды `Tools.Open3DPreview` и `Tools.ThreeDEnginePreviewerDiagnostics`.
++
++Добавлена команда диагностики:
++
++- `Extensions > 3DEngine > Show 3DEngine Previewer Diagnostics`
++- command window / keyboard name: `Tools.ThreeDEnginePreviewerDiagnostics`
++
++Диагностика показывает GUID пакета, command set, command ids, активный документ, активный проект и найденный `PreviewerApp.csproj`.
++
++Если в Keyboard Options команды есть, но в меню нет, значит VSCT command table установлена, но Visual Studio не показывает выбранный menu placement. В этом случае назначьте временный hotkey на `Tools.Open3DPreview` и запустите команду: если handler сработает, проблема только в placement меню.
++
++Если команд нет даже в Keyboard Options, значит `.vsix` не содержит/не установил command table. Тогда нужен `ActivityLog.xml` после запуска `devenv /log`.
+diff -ruN /mnt/data/diff_old_v52/VSIXConnector/VsixPackage.cs /mnt/data/diff_new_v53/VSIXConnector/VsixPackage.cs
+--- /mnt/data/diff_old_v52/VSIXConnector/VsixPackage.cs	2026-04-28 05:10:57.358211284 +0000
++++ /mnt/data/diff_new_v53/VSIXConnector/VsixPackage.cs	2026-04-28 05:06:08.284397388 +0000
+@@ -10,7 +10,7 @@
+ namespace ThreeDEngine.PreviewerVsix;
+ 
+ [PackageRegistration(UseManagedResourcesOnly = true, AllowsBackgroundLoading = true)]
+-[InstalledProductRegistration("3DEngine Previewer Connector", "Open 3D Preview command for 3DEngine classes", "0.2.9")]
++[InstalledProductRegistration("3DEngine Previewer Connector", "Open 3D Preview command for 3DEngine classes", "0.3.0")]
+ [ProvideMenuResource("Menus.ctmenu", 1)]
+ [ProvideAutoLoad(VSConstants.UICONTEXT.ShellInitialized_string, PackageAutoLoadFlags.BackgroundLoad)]
+ [Guid(Open3DPreviewCommandPackageGuids.PackageGuidString)]
+diff -ruN /mnt/data/diff_old_v52/VSIXConnector/source.extension.vsixmanifest /mnt/data/diff_new_v53/VSIXConnector/source.extension.vsixmanifest
+--- /mnt/data/diff_old_v52/VSIXConnector/source.extension.vsixmanifest	2026-04-28 05:10:57.358900566 +0000
++++ /mnt/data/diff_new_v53/VSIXConnector/source.extension.vsixmanifest	2026-04-28 05:06:08.284952442 +0000
+@@ -1,7 +1,7 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011" xmlns:d="http://schemas.microsoft.com/developer/vsx-schema-design/2011">
+   <Metadata>
+-    <Identity Id="ThreeDEngine.PreviewerVsix" Version="0.2.9" Language="en-US" Publisher="ThreeDEngine" />
++    <Identity Id="ThreeDEngine.PreviewerVsix" Version="0.3.0" Language="en-US" Publisher="ThreeDEngine" />
+     <DisplayName>3DEngine Previewer Connector</DisplayName>
+     <Description xml:space="preserve">Adds an Open 3D Preview command to Visual Studio for classes that can be previewed by 3DEngine PreviewerApp.</Description>
+   </Metadata>

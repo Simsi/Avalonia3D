@@ -17,7 +17,7 @@ using ThreeDEngine.Core.Scene;
 
 namespace ThreeDEngine.Avalonia.OpenGL.Rendering;
 
-internal sealed class OpenGlSceneRenderer
+internal sealed class OpenGlSceneRenderer : ISceneRenderBackend, IRenderResourceCache, IDebugDrawBackend
 {
     private const int GlColorBufferBit = 0x00004000;
     private const int GlDepthBufferBit = 0x00000100;
@@ -119,6 +119,42 @@ internal sealed class OpenGlSceneRenderer
     private GlDrawElementsInstancedDelegate? _drawElementsInstanced;
     private GlBufferSubDataDelegate? _bufferSubData;
 
+    public RenderBackendCapabilities Capabilities { get; } = new(
+        BackendKind.OpenGlDesktop,
+        SupportsRetainedResources: true,
+        SupportsHighScaleRuntime: true,
+        SupportsGpuInstancing: true,
+        SupportsDebugDraw: true,
+        SupportsTransparentSorting: true);
+
+    private RendererInvalidationKind _pendingInvalidation = RendererInvalidationKind.FullFrame;
+
+    public void NotifySceneChanged(SceneChangedEventArgs change, RendererInvalidationKind invalidation)
+    {
+        _pendingInvalidation |= invalidation;
+    }
+
+    public void Invalidate(RendererInvalidationKind invalidation)
+    {
+        _pendingInvalidation |= invalidation;
+    }
+
+    public void Clear() => Reset();
+
+    public void ClearDebugPrimitives()
+    {
+    }
+
+    public void DrawSceneDebug(Scene3D scene)
+    {
+    }
+
+    public RenderStats Render(Scene3D scene, SceneRenderPacket packet)
+    {
+        throw new NotSupportedException(
+            "OpenGlSceneRenderer requires an active OpenGL context. Use the Avalonia presenter Render(...) path; the contract-only ISceneRenderBackend adapter is not wired to a GL context yet.");
+    }
+
     public void Initialize(GlInterface gl)
     {
         if (_initialized) return;
@@ -188,12 +224,17 @@ internal sealed class OpenGlSceneRenderer
         _initialized = true;
     }
 
-    public RenderStats Render(GlInterface gl, int framebuffer, Scene3D scene, Rect bounds)
+    public RenderStats Render(GlInterface gl, int framebuffer, Scene3D scene, Rect bounds, RendererInvalidationKind invalidation = RendererInvalidationKind.FullFrame)
     {
         if (!_initialized) Initialize(gl);
+        _pendingInvalidation |= invalidation;
+        var effectiveInvalidation = _pendingInvalidation;
+        ApplyRendererInvalidation(gl, scene);
         var width = System.Math.Max((int)System.Math.Ceiling(bounds.Width), 1);
         var height = System.Math.Max((int)System.Math.Ceiling(bounds.Height), 1);
         var stats = RenderSceneCore(gl, framebuffer, width, height, scene);
+        stats.RendererInvalidation = effectiveInvalidation;
+        if ((effectiveInvalidation & RendererInvalidationKind.BatchRebuild) != 0) stats.FullRebuildReason = effectiveInvalidation.ToString();
         stats.RenderTargetWidth = width;
         stats.RenderTargetHeight = height;
         return stats;
@@ -233,6 +274,29 @@ internal sealed class OpenGlSceneRenderer
         gl.BindTexture(GlTexture2D, 0);
         gl.UseProgram(0);
         return stats;
+    }
+
+    private void ApplyRendererInvalidation(GlInterface gl, Scene3D scene)
+    {
+        var invalidation = _pendingInvalidation;
+        if (invalidation == RendererInvalidationKind.None)
+        {
+            return;
+        }
+
+        if ((invalidation & RendererInvalidationKind.ResourceUpload) != 0 ||
+            (invalidation & RendererInvalidationKind.HighScaleStructure) != 0 ||
+            (invalidation & RendererInvalidationKind.FullFrame) == RendererInvalidationKind.FullFrame)
+        {
+            _lastSweptRegistryVersion = -1;
+        }
+
+        if ((invalidation & RendererInvalidationKind.BatchRebuild) != 0)
+        {
+            foreach (var batch in _meshBatches.Values) batch.Reset();
+        }
+
+        _pendingInvalidation = RendererInvalidationKind.None;
     }
 
     public void Deinitialize(GlInterface gl)

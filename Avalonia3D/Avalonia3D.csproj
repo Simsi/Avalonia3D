@@ -18,7 +18,26 @@
     <PackageReference Include="Avalonia.ReactiveUI" Version="$(AvaloniaVersion)" />
     <!--Condition below is needed to remove Avalonia.Diagnostics package from build output in Release configuration.-->
     <PackageReference Condition="'$(Configuration)' == 'Debug'" Include="Avalonia.Diagnostics" Version="$(AvaloniaVersion)" />
-    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.3.0" />
+</ItemGroup>
+
+
+  <ItemGroup>
+    <!-- Helper/test/VSIX source-drop projects must not be compiled into the host app. -->
+    <Compile Remove="PreviewerApp\**\*.cs" />
+    <Compile Remove="PreviewerApp/**/*.cs" />
+    <Compile Remove="SmokeTests\**\*.cs" />
+    <Compile Remove="SmokeTests/**/*.cs" />
+    <Compile Remove="VSIXConnector\**\*.cs" />
+    <Compile Remove="VSIXConnector/**/*.cs" />
+    <Compile Remove="bin\**\*.cs" />
+    <Compile Remove="bin/**/*.cs" />
+    <Compile Remove="obj\**\*.cs" />
+    <Compile Remove="obj/**/*.cs" />
+
+    <None Remove="PreviewerApp\**;SmokeTests\**;VSIXConnector\**;bin\**;obj\**;PreviewerApp/**;SmokeTests/**;VSIXConnector/**;bin/**;obj/**" />
+    <Content Remove="PreviewerApp\**;SmokeTests\**;VSIXConnector\**;bin\**;obj\**;PreviewerApp/**;SmokeTests/**;VSIXConnector/**;bin/**;obj/**" />
+    <EmbeddedResource Remove="PreviewerApp\**;SmokeTests\**;VSIXConnector\**;bin\**;obj\**;PreviewerApp/**;SmokeTests/**;VSIXConnector/**;bin/**;obj/**" />
+    <AvaloniaResource Remove="PreviewerApp\**;SmokeTests\**;VSIXConnector\**;bin\**;obj\**;PreviewerApp/**;SmokeTests/**;VSIXConnector/**;bin/**;obj/**" />
   </ItemGroup>
 
   <ItemGroup>

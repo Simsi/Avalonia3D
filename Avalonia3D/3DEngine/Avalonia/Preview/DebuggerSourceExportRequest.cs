@@ -16,7 +16,8 @@ public sealed class DebuggerSourceExportRequest
         bool hasBuildMethod,
         string generatedBuildMethodSource,
         string generatedClassSource,
-        string generatedEventMembersSource)
+        string generatedEventMembersSource,
+        bool previewOnly = false)
     {
         FilePath = filePath;
         ClassName = className;
@@ -27,6 +28,7 @@ public sealed class DebuggerSourceExportRequest
         GeneratedBuildMethodSource = generatedBuildMethodSource;
         GeneratedClassSource = generatedClassSource;
         GeneratedEventMembersSource = generatedEventMembersSource;
+        PreviewOnly = previewOnly;
     }
 
     public string FilePath { get; }
@@ -38,6 +40,7 @@ public sealed class DebuggerSourceExportRequest
     public string GeneratedBuildMethodSource { get; }
     public string GeneratedClassSource { get; }
     public string GeneratedEventMembersSource { get; }
+    public bool PreviewOnly { get; }
 }
 
 
@@ -63,13 +66,14 @@ public sealed class DebugEventBinding
 
 public sealed class DebuggerSourceExportResult
 {
-    public DebuggerSourceExportResult(bool success, string message, string filePath, string? backupPath = null, string? mode = null)
+    public DebuggerSourceExportResult(bool success, string message, string filePath, string? backupPath = null, string? mode = null, string? diffPreview = null)
     {
         Success = success;
         Message = message;
         FilePath = filePath;
         BackupPath = backupPath;
         Mode = mode ?? string.Empty;
+        DiffPreview = diffPreview ?? string.Empty;
     }
 
     public bool Success { get; }
@@ -77,8 +81,11 @@ public sealed class DebuggerSourceExportResult
     public string FilePath { get; }
     public string? BackupPath { get; }
     public string Mode { get; }
+    public string DiffPreview { get; }
 
     public static DebuggerSourceExportResult Failed(string message, string filePath = "") => new(false, message, filePath);
 
-    public static DebuggerSourceExportResult Completed(string message, string filePath, string backupPath, string mode) => new(true, message, filePath, backupPath, mode);
+    public static DebuggerSourceExportResult Completed(string message, string filePath, string backupPath, string mode, string? diffPreview = null) => new(true, message, filePath, backupPath, mode, diffPreview);
+
+    public static DebuggerSourceExportResult Preview(string message, string filePath, string mode, string diffPreview) => new(true, message, filePath, null, mode, diffPreview);
 }

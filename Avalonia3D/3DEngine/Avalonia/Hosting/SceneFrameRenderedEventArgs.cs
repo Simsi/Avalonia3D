@@ -18,6 +18,11 @@ public sealed class SceneFrameRenderedEventArgs : EventArgs
     }
 
     public BackendKind Backend { get; }
+
+    // Backward-compatible alias kept for existing Avalonia3D samples and host apps.
+    // New code should prefer Backend, but v90/v91 host code may still read Kind.
+    public BackendKind Kind => Backend;
+
     public double FrameMilliseconds { get; }
     public RenderStats Stats { get; }
 }

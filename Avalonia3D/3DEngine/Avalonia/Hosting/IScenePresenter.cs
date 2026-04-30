@@ -10,5 +10,6 @@ public interface IScenePresenter
     BackendKind Kind { get; }
     Control View { get; }
     Scene3D Scene { get; set; }
+    void NotifySceneChanged(SceneChangedEventArgs change, RendererInvalidationKind invalidation);
     void RequestRender();
 }

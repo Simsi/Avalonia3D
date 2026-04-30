@@ -13,5 +13,11 @@ public enum SceneChangeKind
     Camera = 8,
     Lighting = 9,
     Debug = 10,
-    HighScaleState = 11
+    HighScaleState = 11,
+    Collider = 12,
+    Rigidbody = 13,
+    Picking = 14,
+    Selection = 15,
+    DebugVisual = 16,
+    HighScaleStructure = 17
 }

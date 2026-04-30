@@ -20,6 +20,7 @@ public sealed class Scene3D
     private SceneChangedEventArgs? _pendingChange;
     private int _changeVersion;
     private int _structureVersion;
+    private float _physicsAccumulator;
 
     public Scene3D()
     {
@@ -32,6 +33,7 @@ public sealed class Scene3D
         Performance = ScenePerformanceOptions.CreateDefault();
         FrameInterpolator = new FrameInterpolator3D();
         AdaptivePerformance = new AdaptivePerformanceController3D();
+        PhysicsSettings = new PhysicsSimulationSettings();
     }
 
     public event EventHandler? SceneChanged;
@@ -52,6 +54,8 @@ public sealed class Scene3D
     public AdaptivePerformanceController3D AdaptivePerformance { get; }
 
     public IPhysicsCore? PhysicsCore { get; set; } = new BasicPhysicsCore();
+
+    public PhysicsSimulationSettings PhysicsSettings { get; }
 
     public IReadOnlyList<Object3D> Objects => _objects;
 
@@ -92,7 +96,7 @@ public sealed class Scene3D
         }
 
         _objects.Add(obj);
-        obj.Changed += OnObjectChanged;
+        obj.ChangedDetailed += OnObjectChangedDetailed;
         if (obj is HighScaleInstanceLayer3D highScaleLayer) highScaleLayer.StateChanged += OnHighScaleStateChanged;
         RaiseChanged(SceneChangeKind.Structure, obj);
         return obj;
@@ -190,7 +194,51 @@ public sealed class Scene3D
 
     public void StepPhysics(float deltaSeconds)
     {
-        PhysicsCore?.Step(this, deltaSeconds);
+        StepPhysicsInternal(deltaSeconds);
+    }
+
+    public int AdvancePhysics(float deltaSeconds)
+    {
+        if (PhysicsCore is null || PhysicsSettings.Mode == PhysicsSimulationMode.Disabled)
+        {
+            _physicsAccumulator = 0f;
+            return 0;
+        }
+
+        if (PhysicsSettings.Mode == PhysicsSimulationMode.Manual)
+        {
+            StepPhysicsInternal(deltaSeconds);
+            return 1;
+        }
+
+        deltaSeconds = PhysicsSettings.ClampDelta(deltaSeconds);
+        _physicsAccumulator = MathF.Min(_physicsAccumulator + deltaSeconds, PhysicsSettings.MaxAccumulatedSeconds);
+        var fixedDelta = MathF.Max(0.001f, PhysicsSettings.FixedDeltaSeconds);
+        var steps = 0;
+        while (_physicsAccumulator >= fixedDelta)
+        {
+            StepPhysicsInternal(fixedDelta);
+            _physicsAccumulator -= fixedDelta;
+            steps++;
+        }
+
+        return steps;
+    }
+
+    public void ResetPhysicsAccumulator() => _physicsAccumulator = 0f;
+
+    private void StepPhysicsInternal(float deltaSeconds)
+    {
+        var physics = PhysicsCore;
+        if (physics is null || deltaSeconds <= 0f)
+        {
+            return;
+        }
+
+        using (BeginUpdate())
+        {
+            physics.Step(this, deltaSeconds);
+        }
     }
 
     public void BeginSimulationTick() => FrameInterpolator.BeginTick(this);
@@ -205,7 +253,7 @@ public sealed class Scene3D
             return false;
         }
 
-        obj.Changed -= OnObjectChanged;
+        obj.ChangedDetailed -= OnObjectChangedDetailed;
         if (obj is HighScaleInstanceLayer3D highScaleLayer) highScaleLayer.StateChanged -= OnHighScaleStateChanged;
         RaiseChanged(SceneChangeKind.Structure, obj);
         return true;
@@ -215,7 +263,7 @@ public sealed class Scene3D
     {
         foreach (var obj in _objects)
         {
-            obj.Changed -= OnObjectChanged;
+            obj.ChangedDetailed -= OnObjectChangedDetailed;
             if (obj is HighScaleInstanceLayer3D highScaleLayer) highScaleLayer.StateChanged -= OnHighScaleStateChanged;
         }
 
@@ -253,6 +301,11 @@ public sealed class Scene3D
         RaiseChanged(kind, source);
     }
 
+    private void OnObjectChangedDetailed(object? sender, Object3DChangedEventArgs e)
+    {
+        RaiseChanged(e.Kind, e.Source);
+    }
+
     private void OnHighScaleStateChanged(object? sender, EventArgs e) => RaiseChanged(SceneChangeKind.HighScaleState, sender as Object3D);
     private void OnCameraChanged(object? sender, EventArgs e) => RaiseChanged(SceneChangeKind.Camera);
     private void OnLightChanged(object? sender, EventArgs e) => RaiseChanged(SceneChangeKind.Lighting);
@@ -265,7 +318,7 @@ public sealed class Scene3D
         {
             Registry.Invalidate();
         }
-        if (kind == SceneChangeKind.Structure)
+        if (kind == SceneChangeKind.Structure || kind == SceneChangeKind.HighScaleStructure)
         {
             _structureVersion++;
         }
@@ -285,10 +338,14 @@ public sealed class Scene3D
     {
         return kind == SceneChangeKind.Unknown ||
                kind == SceneChangeKind.Structure ||
+               kind == SceneChangeKind.HighScaleStructure ||
                kind == SceneChangeKind.Transform ||
                kind == SceneChangeKind.Geometry ||
                kind == SceneChangeKind.Visibility ||
                kind == SceneChangeKind.Physics ||
+               kind == SceneChangeKind.Collider ||
+               kind == SceneChangeKind.Rigidbody ||
+               kind == SceneChangeKind.Picking ||
                kind == SceneChangeKind.Control;
     }
 
@@ -304,7 +361,27 @@ public sealed class Scene3D
             return new SceneChangedEventArgs(SceneChangeKind.Structure, next.Source ?? current.Source);
         }
 
-        return new SceneChangedEventArgs(next.Kind == SceneChangeKind.Unknown ? current.Kind : next.Kind, next.Source ?? current.Source);
+        if (current.Kind == SceneChangeKind.HighScaleStructure || next.Kind == SceneChangeKind.HighScaleStructure)
+        {
+            return new SceneChangedEventArgs(SceneChangeKind.HighScaleStructure, next.Source ?? current.Source);
+        }
+
+        if (current.Kind == next.Kind)
+        {
+            return new SceneChangedEventArgs(current.Kind, next.Source ?? current.Source);
+        }
+
+        if (current.Kind == SceneChangeKind.Unknown)
+        {
+            return next;
+        }
+
+        if (next.Kind == SceneChangeKind.Unknown)
+        {
+            return current;
+        }
+
+        return new SceneChangedEventArgs(SceneChangeKind.Unknown, next.Source ?? current.Source);
     }
 
     private void EndUpdate()

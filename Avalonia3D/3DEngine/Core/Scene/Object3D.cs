@@ -50,6 +50,7 @@ public abstract class Object3D : INotifyPropertyChanged
 
     public event PropertyChangedEventHandler? PropertyChanged;
     public event EventHandler? Changed;
+    public event EventHandler<Object3DChangedEventArgs>? ChangedDetailed;
     public event EventHandler<ScenePointerEventArgs>? Clicked;
     public event EventHandler<ScenePointerEventArgs>? PointerEntered;
     public event EventHandler<ScenePointerEventArgs>? PointerExited;
@@ -80,13 +81,13 @@ public abstract class Object3D : INotifyPropertyChanged
     public string Name
     {
         get => _name;
-        set => SetField(ref _name, value);
+        set => SetField(ref _name, value, SceneChangeKind.Debug);
     }
 
     public object? DataContext
     {
         get => _dataContext;
-        set => SetField(ref _dataContext, value);
+        set => SetField(ref _dataContext, value, SceneChangeKind.Debug);
     }
 
     public Vector3 Position
@@ -107,9 +108,6 @@ public abstract class Object3D : INotifyPropertyChanged
 
             _rotationDegrees = value;
             Transform.SetEulerDegrees(value);
-            OnPropertyChanged(nameof(RotationDegrees));
-            OnPropertyChanged(nameof(Rotation));
-            RaiseChanged();
         }
     }
 
@@ -144,7 +142,7 @@ public abstract class Object3D : INotifyPropertyChanged
 
             OnPropertyChanged(nameof(Fill));
             OnPropertyChanged(nameof(Color));
-            RaiseChanged();
+            RaiseChanged(SceneChangeKind.Material, nameof(Fill));
         }
     }
 
@@ -170,7 +168,7 @@ public abstract class Object3D : INotifyPropertyChanged
             OnPropertyChanged(nameof(Material));
             OnPropertyChanged(nameof(Fill));
             OnPropertyChanged(nameof(Color));
-            RaiseChanged();
+            RaiseChanged(SceneChangeKind.Material, nameof(Material));
         }
     }
 
@@ -197,14 +195,14 @@ public abstract class Object3D : INotifyPropertyChanged
 
             MarkWorldBoundsDirtyRecursive();
             OnPropertyChanged(nameof(Collider));
-            RaiseChanged();
+            RaiseChanged(SceneChangeKind.Collider, nameof(Collider));
         }
     }
 
     public Rigidbody3D? Rigidbody
     {
         get => _rigidbody;
-        set => SetField(ref _rigidbody, value);
+        set => SetField(ref _rigidbody, value, SceneChangeKind.Rigidbody);
     }
 
     public ColorRgba Color
@@ -216,25 +214,25 @@ public abstract class Object3D : INotifyPropertyChanged
     public bool IsVisible
     {
         get => _isVisible;
-        set => SetField(ref _isVisible, value);
+        set => SetField(ref _isVisible, value, SceneChangeKind.Visibility);
     }
 
     public bool IsPickable
     {
         get => _isPickable;
-        set => SetField(ref _isPickable, value);
+        set => SetField(ref _isPickable, value, SceneChangeKind.Picking);
     }
 
     public virtual bool IsHovered
     {
         get => _isHovered;
-        set => SetField(ref _isHovered, value);
+        set => SetField(ref _isHovered, value, SceneChangeKind.DebugVisual);
     }
 
     public virtual bool IsSelected
     {
         get => _isSelected;
-        set => SetField(ref _isSelected, value);
+        set => SetField(ref _isSelected, value, SceneChangeKind.Selection);
     }
 
     public bool IsEffectivelyHovered => IsHovered || (Parent?.IsEffectivelyHovered ?? false);
@@ -244,7 +242,7 @@ public abstract class Object3D : INotifyPropertyChanged
     public bool IsManipulationEnabled
     {
         get => _isManipulationEnabled;
-        set => SetField(ref _isManipulationEnabled, value);
+        set => SetField(ref _isManipulationEnabled, value, SceneChangeKind.Picking);
     }
 
     public int GeometryVersion => _geometryVersion;
@@ -333,9 +331,11 @@ public abstract class Object3D : INotifyPropertyChanged
         InvalidateWorldCacheRecursive();
         OnPropertyChanged(nameof(Transform));
         OnPropertyChanged(nameof(Position));
+        OnPropertyChanged(nameof(RotationDegrees));
+        OnPropertyChanged(nameof(Rotation));
         OnPropertyChanged(nameof(Scale));
         OnPropertyChanged(nameof(LocalMatrix));
-        RaiseChanged();
+        RaiseChanged(SceneChangeKind.Transform, nameof(Transform));
     }
 
     private void OnMaterialChanged(object? sender, EventArgs e)
@@ -345,7 +345,7 @@ public abstract class Object3D : INotifyPropertyChanged
         OnPropertyChanged(nameof(Material));
         OnPropertyChanged(nameof(Fill));
         OnPropertyChanged(nameof(Color));
-        RaiseChanged();
+        RaiseChanged(SceneChangeKind.Material, nameof(Material));
     }
 
     protected void MarkGeometryDirty([CallerMemberName] string? propertyName = null)
@@ -353,10 +353,10 @@ public abstract class Object3D : INotifyPropertyChanged
         _meshDirty = true;
         MarkWorldBoundsDirtyRecursive();
         OnPropertyChanged(propertyName);
-        RaiseChanged();
+        RaiseChanged(SceneChangeKind.Geometry, propertyName);
     }
 
-    protected bool SetField<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
+    protected bool SetField<T>(ref T field, T value, SceneChangeKind kind = SceneChangeKind.Unknown, [CallerMemberName] string? propertyName = null)
     {
         if (EqualityComparer<T>.Default.Equals(field, value))
         {
@@ -365,7 +365,7 @@ public abstract class Object3D : INotifyPropertyChanged
 
         field = value;
         OnPropertyChanged(propertyName);
-        RaiseChanged();
+        RaiseChanged(kind, propertyName);
         return true;
     }
 
@@ -374,8 +374,10 @@ public abstract class Object3D : INotifyPropertyChanged
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
     }
 
-    protected virtual void RaiseChanged()
+    protected virtual void RaiseChanged(SceneChangeKind kind = SceneChangeKind.Unknown, string? propertyName = null)
     {
+        var args = new Object3DChangedEventArgs(this, kind, propertyName);
+        ChangedDetailed?.Invoke(this, args);
         Changed?.Invoke(this, EventArgs.Empty);
     }
 

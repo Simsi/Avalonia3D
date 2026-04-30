@@ -14,6 +14,7 @@ namespace ThreeDEngine.Avalonia.OpenGL.Controls;
 public sealed class OpenGlScenePresenter : OpenGlControlBase, IScenePresenter
 {
     private readonly OpenGlSceneRenderer _renderer = new();
+    private RendererInvalidationKind _pendingInvalidation = RendererInvalidationKind.FullFrame;
     private Scene3D _scene = new();
 
     public OpenGlScenePresenter()
@@ -33,8 +34,15 @@ public sealed class OpenGlScenePresenter : OpenGlControlBase, IScenePresenter
         set
         {
             _scene = value ?? throw new ArgumentNullException(nameof(value));
+            _pendingInvalidation = RendererInvalidationKind.FullFrame;
             RequestNextFrameRendering();
         }
+    }
+
+    public void NotifySceneChanged(SceneChangedEventArgs change, RendererInvalidationKind invalidation)
+    {
+        _pendingInvalidation |= invalidation;
+        _renderer.NotifySceneChanged(change, _pendingInvalidation);
     }
 
     public void RequestRender() => RequestNextFrameRendering();
@@ -48,7 +56,9 @@ public sealed class OpenGlScenePresenter : OpenGlControlBase, IScenePresenter
     protected override void OnOpenGlRender(GlInterface gl, int fb)
     {
         var start = Stopwatch.GetTimestamp();
-        var stats = _renderer.Render(gl, fb, Scene, Bounds);
+        var invalidation = _pendingInvalidation == RendererInvalidationKind.None ? RendererInvalidationKind.DrawOnly : _pendingInvalidation;
+        _pendingInvalidation = RendererInvalidationKind.None;
+        var stats = _renderer.Render(gl, fb, Scene, Bounds, invalidation);
         stats.BackendMilliseconds = GetElapsedMilliseconds(start);
         FrameRendered?.Invoke(this, new SceneFrameRenderedEventArgs(Kind, stats.BackendMilliseconds, stats));
     }

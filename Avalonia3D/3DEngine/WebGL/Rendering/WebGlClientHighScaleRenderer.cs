@@ -33,8 +33,16 @@ internal sealed class WebGlClientHighScaleRenderer
     private readonly List<int> _dirtyTransformIndices = new(1024);
     private int[] _dirtyTransformScratch = Array.Empty<int>();
     private readonly Stopwatch _animationClock = Stopwatch.StartNew();
+    private bool _forceStructuralRebuild;
 
     public bool HasRuntimeState => _layers.Count != 0;
+
+    public bool ForceJsOwnedRuntime { get; set; } = true;
+
+    public void InvalidateStructure()
+    {
+        _forceStructuralRebuild = true;
+    }
 
     public void Reset(int hostId)
     {
@@ -119,17 +127,18 @@ internal sealed class WebGlClientHighScaleRenderer
             var structuralVersion = BuildStructuralVersion(layer, scene);
             if (hasRuntime)
             {
-                if (runtime!.StructuralVersion == structuralVersion)
+                if (!_forceStructuralRebuild && runtime!.StructuralVersion == structuralVersion)
                 {
                     continue;
                 }
 
-                DestroyLayer(hostId, runtime);
+                DestroyLayer(hostId, runtime!);
             }
 
             runtime = BuildAndUploadLayer(hostId, layer, scene, structuralVersion, stats);
             _layers[layer.Id] = runtime;
             WebGlInterop.UploadHighScaleLayerSnapshot(hostId, layer.Id, runtime.SnapshotJson);
+            _forceStructuralRebuild = false;
             layer.StateBuffer.ClearDirty();
         }
 

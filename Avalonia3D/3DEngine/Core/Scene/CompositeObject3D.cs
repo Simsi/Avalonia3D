@@ -48,7 +48,7 @@ public abstract class CompositeObject3D : Object3D
         BuildIntoTemporaryState(out var newChildren, out var newParts);
         ReplaceChildren(newChildren, newParts);
         _built = true;
-        RaiseChanged();
+        RaiseChanged(SceneChangeKind.Structure);
     }
 
     public Object3D? FindPart(string name)
@@ -65,7 +65,7 @@ public abstract class CompositeObject3D : Object3D
         }
 
         _built = false;
-        RaiseChanged();
+        RaiseChanged(SceneChangeKind.Structure);
     }
 
     public override Bounds3D GetWorldBounds()
@@ -155,7 +155,7 @@ public abstract class CompositeObject3D : Object3D
 
         part.Name = name;
         part.Parent = this;
-        part.Changed += OnChildChanged;
+        part.ChangedDetailed += OnChildChangedDetailed;
         _children.Add(part);
         _parts.Add(name, part);
     }
@@ -186,7 +186,7 @@ public abstract class CompositeObject3D : Object3D
 
         foreach (var child in oldChildren)
         {
-            child.Changed -= OnChildChanged;
+            child.ChangedDetailed -= OnChildChangedDetailed;
             child.Parent = null;
         }
 
@@ -203,7 +203,7 @@ public abstract class CompositeObject3D : Object3D
 
             foreach (var child in newChildren)
             {
-                child.Changed -= OnChildChanged;
+                child.ChangedDetailed -= OnChildChangedDetailed;
                 child.Parent = null;
             }
         }
@@ -211,7 +211,7 @@ public abstract class CompositeObject3D : Object3D
         {
             foreach (var child in _children)
             {
-                child.Changed -= OnChildChanged;
+                child.ChangedDetailed -= OnChildChangedDetailed;
                 child.Parent = null;
             }
 
@@ -220,7 +220,7 @@ public abstract class CompositeObject3D : Object3D
             foreach (var child in oldChildren)
             {
                 child.Parent = this;
-                child.Changed += OnChildChanged;
+                child.ChangedDetailed += OnChildChangedDetailed;
                 _children.Add(child);
             }
 
@@ -247,7 +247,7 @@ public abstract class CompositeObject3D : Object3D
         foreach (var child in newChildren)
         {
             child.Parent = this;
-            child.Changed += OnChildChanged;
+            child.ChangedDetailed += OnChildChangedDetailed;
             _children.Add(child);
         }
 
@@ -264,7 +264,7 @@ public abstract class CompositeObject3D : Object3D
     {
         foreach (var child in _children)
         {
-            child.Changed -= OnChildChanged;
+            child.ChangedDetailed -= OnChildChangedDetailed;
             child.Parent = null;
         }
 
@@ -276,6 +276,13 @@ public abstract class CompositeObject3D : Object3D
     {
         _worldBoundsDirty = true;
         MarkWorldBoundsDirtyRecursive();
-        RaiseChanged();
+        RaiseChanged(SceneChangeKind.Unknown);
+    }
+
+    private void OnChildChangedDetailed(object? sender, Object3DChangedEventArgs e)
+    {
+        _worldBoundsDirty = true;
+        MarkWorldBoundsDirtyRecursive();
+        RaiseChanged(e.Kind, e.PropertyName);
     }
 }

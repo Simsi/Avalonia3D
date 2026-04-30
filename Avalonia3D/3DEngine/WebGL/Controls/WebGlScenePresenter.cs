@@ -31,6 +31,7 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
 
     private readonly Dictionary<string, int> _textureVersions = new();
     private readonly Dictionary<string, int> _meshGeometryVersions = new();
+    private RendererInvalidationKind _pendingInvalidation = RendererInvalidationKind.FullFrame;
     private Scene3D _scene = new();
     private int _hostId = -1;
     private bool _moduleReady;
@@ -71,7 +72,22 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         set
         {
             _scene = value ?? throw new ArgumentNullException(nameof(value));
+            _pendingInvalidation = RendererInvalidationKind.FullFrame;
             RequestRender();
+        }
+    }
+
+    public void NotifySceneChanged(SceneChangedEventArgs change, RendererInvalidationKind invalidation)
+    {
+        _pendingInvalidation |= invalidation;
+        if ((invalidation & RendererInvalidationKind.HighScaleStructure) != 0)
+        {
+            _clientHighScale.InvalidateStructure();
+        }
+        if ((invalidation & RendererInvalidationKind.ResourceUpload) != 0 ||
+            (invalidation & RendererInvalidationKind.FullFrame) == RendererInvalidationKind.FullFrame)
+        {
+            _lastSweptUploadRegistryVersion = -1;
         }
     }
 
@@ -263,6 +279,11 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
             MeshCacheCount = MeshCache3D.Shared.Count
         };
 
+        var invalidation = _pendingInvalidation == RendererInvalidationKind.None ? RendererInvalidationKind.DrawOnly : _pendingInvalidation;
+        stats.RendererInvalidation = invalidation;
+        if ((invalidation & RendererInvalidationKind.BatchRebuild) != 0) stats.FullRebuildReason = invalidation.ToString();
+        _pendingInvalidation = RendererInvalidationKind.None;
+        ApplyRendererInvalidation(invalidation);
         SweepUnusedUploadState();
 
         var uploadStart = Stopwatch.GetTimestamp();
@@ -273,7 +294,7 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         var packetStart = Stopwatch.GetTimestamp();
         var aspect = (float)(Bounds.Width / Math.Max(Bounds.Height, 1d));
         var viewProjection = Scene.Camera.GetViewMatrix() * Scene.Camera.GetProjectionMatrix(aspect);
-        if (ShouldUseClientHighScaleRuntime())
+        if (ShouldUseClientHighScaleRuntime(stats))
         {
             var serializeStart = Stopwatch.GetTimestamp();
             _clientHighScale.RenderFrame(_hostId, Scene, (float)Bounds.Width, (float)Bounds.Height, viewProjection, stats);
@@ -314,8 +335,29 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         }, DispatcherPriority.Background);
     }
 
-    private bool ShouldUseClientHighScaleRuntime()
+    private void ApplyRendererInvalidation(RendererInvalidationKind invalidation)
     {
+        if ((invalidation & RendererInvalidationKind.ResourceUpload) != 0 ||
+            (invalidation & RendererInvalidationKind.HighScaleStructure) != 0 ||
+            (invalidation & RendererInvalidationKind.FullFrame) == RendererInvalidationKind.FullFrame)
+        {
+            _meshGeometryVersions.Clear();
+            _textureVersions.Clear();
+            _lastSweptUploadRegistryVersion = -1;
+        }
+
+        if ((invalidation & RendererInvalidationKind.HighScaleStructure) != 0)
+        {
+            if (_clientHighScale.HasRuntimeState && _hostId >= 0)
+            {
+                _clientHighScale.Reset(_hostId);
+            }
+        }
+    }
+
+    private bool ShouldUseClientHighScaleRuntime(RenderStats stats)
+    {
+        stats.WebGlJsOwnedRuntimeRequested = Scene.Performance.EnableWebGlClientHighScaleRuntime;
         if (!Scene.Performance.EnableRetainedInstanceBuffers || !Scene.Performance.EnableWebGlClientHighScaleRuntime)
         {
             return false;
@@ -336,10 +378,11 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
             return false;
         }
 
-        // v57 client runtime owns only retained high-scale drawing. Mixed scenes keep the
-        // legacy packet path until the non-high-scale/object/control-plane path is moved too.
-        if (Scene.Registry.Renderables.Count != 0)
+        // JS-owned high-scale runtime is the default for high-scale scenes. Mixed ordinary
+        // renderables still use the legacy packet path unless the force flag is enabled.
+        if (Scene.Registry.Renderables.Count != 0 && !Scene.Performance.ForceWebGlJsOwnedHighScaleRuntime)
         {
+            stats.WebGlFallbackReason = "mixed-renderables";
             return false;
         }
 
@@ -347,6 +390,7 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         {
             if (obj is ControlPlane3D plane && plane.IsVisible && plane.Snapshot is not null)
             {
+                stats.WebGlFallbackReason = "control-plane";
                 return false;
             }
         }

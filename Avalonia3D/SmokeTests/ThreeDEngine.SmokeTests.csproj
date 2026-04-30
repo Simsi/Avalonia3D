@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <ThreeDEngineSmokeTargetFramework Condition="'$(ThreeDEngineSmokeTargetFramework)' == '' and $([System.String]::Copy('$(NETCoreSdkVersion)').StartsWith('9.'))">net9.0</ThreeDEngineSmokeTargetFramework>
+    <ThreeDEngineSmokeTargetFramework Condition="'$(ThreeDEngineSmokeTargetFramework)' == ''">net8.0</ThreeDEngineSmokeTargetFramework>
+    <TargetFramework>$(ThreeDEngineSmokeTargetFramework)</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <DefineConstants>$(DefineConstants);THREE_DENGINE_SMOKE_TESTS</DefineConstants>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <IsPackable>false</IsPackable>
+    <ThreeDEngineRoslynPath Condition="'$(ThreeDEngineRoslynPath)' == '' and '$(RoslynAssembliesPath)' != '' and Exists('$(RoslynAssembliesPath)\Microsoft.CodeAnalysis.CSharp.dll')">$(RoslynAssembliesPath)</ThreeDEngineRoslynPath>
+    <ThreeDEngineRoslynPath Condition="'$(ThreeDEngineRoslynPath)' == '' and '$(CscToolPath)' != '' and Exists('$(CscToolPath)\Microsoft.CodeAnalysis.CSharp.dll')">$(CscToolPath)</ThreeDEngineRoslynPath>
+    <ThreeDEngineRoslynPath Condition="'$(ThreeDEngineRoslynPath)' == '' and Exists('$(MSBuildToolsPath)\Roslyn\bincore\Microsoft.CodeAnalysis.CSharp.dll')">$(MSBuildToolsPath)\Roslyn\bincore</ThreeDEngineRoslynPath>
+    <ThreeDEngineRoslynPath Condition="'$(ThreeDEngineRoslynPath)' == '' and Exists('$(MSBuildToolsPath)\Roslyn\Microsoft.CodeAnalysis.CSharp.dll')">$(MSBuildToolsPath)\Roslyn</ThreeDEngineRoslynPath>
+    <ThreeDEngineRoslynPath Condition="'$(ThreeDEngineRoslynPath)' == '' and Exists('$(MSBuildToolsPath)\..\Roslyn\Microsoft.CodeAnalysis.CSharp.dll')">$(MSBuildToolsPath)\..\Roslyn</ThreeDEngineRoslynPath>
+    <ThreeDEngineRoslynPath Condition="'$(ThreeDEngineRoslynPath)' == '' and '$(VsInstallRoot)' != '' and Exists('$(VsInstallRoot)MSBuild\Current\Bin\Roslyn\Microsoft.CodeAnalysis.CSharp.dll')">$(VsInstallRoot)MSBuild\Current\Bin\Roslyn</ThreeDEngineRoslynPath>
+    <ThreeDEngineRoslynPath Condition="'$(ThreeDEngineRoslynPath)' == '' and '$(VsInstallRoot)' != '' and Exists('$(VsInstallRoot)MSBuild\Current\Bin\amd64\Roslyn\Microsoft.CodeAnalysis.CSharp.dll')">$(VsInstallRoot)MSBuild\Current\Bin\amd64\Roslyn</ThreeDEngineRoslynPath>
+    <ThreeDEngineRoslynSearchedPaths>$(RoslynAssembliesPath);$(CscToolPath);$(MSBuildToolsPath)\Roslyn\bincore;$(MSBuildToolsPath)\Roslyn;$(MSBuildToolsPath)\..\Roslyn;$(VsInstallRoot)MSBuild\Current\Bin\Roslyn;$(VsInstallRoot)MSBuild\Current\Bin\amd64\Roslyn</ThreeDEngineRoslynSearchedPaths>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="../3DEngine/Core/**/*.cs" />
+    <Compile Include="../3DEngine/Avalonia/Preview/DebuggerSourceExportRequest.cs" />
+    <Compile Include="../PreviewerApp/RoslynDebuggerSourceExporter.cs" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('$(ThreeDEngineRoslynPath)\Microsoft.CodeAnalysis.CSharp.dll')">
+    <Reference Include="Microsoft.CodeAnalysis">
+      <HintPath>$(ThreeDEngineRoslynPath)\Microsoft.CodeAnalysis.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Microsoft.CodeAnalysis.CSharp">
+      <HintPath>$(ThreeDEngineRoslynPath)\Microsoft.CodeAnalysis.CSharp.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+
+  <Target Name="ValidateThreeDEngineSmokeRoslynReferences" BeforeTargets="ResolveReferences" Condition="!Exists('$(ThreeDEngineRoslynPath)\Microsoft.CodeAnalysis.CSharp.dll')">
+    <Error Text="SmokeTests require local SDK Roslyn assemblies for source-export smoke coverage. Searched: $(ThreeDEngineRoslynSearchedPaths). Pass -p:ThreeDEngineRoslynPath=&lt;path-to-Roslyn-folder&gt;." />
+  </Target>
+</Project>

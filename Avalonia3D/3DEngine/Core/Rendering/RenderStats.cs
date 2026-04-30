@@ -2,6 +2,8 @@ namespace ThreeDEngine.Core.Rendering;
 
 public sealed class RenderStats
 {
+    public RendererInvalidationKind RendererInvalidation { get; set; }
+    public string FullRebuildReason { get; set; } = string.Empty;
     public int ObjectCount { get; set; }
     public int RenderableCount { get; set; }
     public int PickableCount { get; set; }
@@ -69,6 +71,8 @@ public sealed class RenderStats
     public int RenderTargetHeight { get; set; }
     public int BakedHighScalePartDraws { get; set; }
     public bool WebGlClientHighScaleRuntime { get; set; }
+    public bool WebGlJsOwnedRuntimeRequested { get; set; }
+    public string WebGlFallbackReason { get; set; } = string.Empty;
     public bool WebGlClientGpuTransformAnimation { get; set; }
     public int WebGlVersion { get; set; }
     public double JsCullMilliseconds { get; set; }

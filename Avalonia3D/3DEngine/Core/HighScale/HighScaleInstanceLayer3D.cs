@@ -156,7 +156,7 @@ public sealed class HighScaleInstanceLayer3D : Object3D
             return;
         }
 
-        base.RaiseChanged();
+        base.RaiseChanged(SceneChangeKind.HighScaleStructure);
     }
 
     private void RaiseStateChanged()
@@ -179,7 +179,7 @@ public sealed class HighScaleInstanceLayer3D : Object3D
 
         if (structural)
         {
-            base.RaiseChanged();
+            base.RaiseChanged(SceneChangeKind.HighScaleStructure);
         }
 
         if (state)

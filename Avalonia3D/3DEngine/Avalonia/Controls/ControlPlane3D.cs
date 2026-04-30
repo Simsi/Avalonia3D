@@ -69,7 +69,7 @@ public class ControlPlane3D : Object3D
     public bool AlwaysFaceCamera
     {
         get => _alwaysFaceCamera;
-        set => SetField(ref _alwaysFaceCamera, value);
+        set => SetField(ref _alwaysFaceCamera, value, SceneChangeKind.Control);
     }
 
     public int RenderPixelWidth
@@ -91,7 +91,7 @@ public class ControlPlane3D : Object3D
     internal void MarkSnapshotDirty()
     {
         _snapshotDirty = true;
-        RaiseChanged();
+        RaiseChanged(SceneChangeKind.Control, nameof(Snapshot));
     }
 
     internal void UpdateSnapshot(RenderTargetBitmap? bitmap, int pixelWidth, int pixelHeight)
@@ -106,7 +106,7 @@ public class ControlPlane3D : Object3D
         RenderPixelHeight = pixelHeight;
         _snapshotDirty = false;
         _snapshotVersion++;
-        RaiseChanged();
+        RaiseChanged(SceneChangeKind.Control, nameof(Snapshot));
     }
 
     public override Matrix4x4 GetModelMatrix() => base.GetModelMatrix();

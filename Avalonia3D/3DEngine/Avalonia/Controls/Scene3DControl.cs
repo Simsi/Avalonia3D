@@ -71,6 +71,7 @@ public sealed class Scene3DControl : Border
     private readonly HashSet<ControlPlane3D> _creatingControlAdapters;
     private Scene3D _scene;
     private IScenePresenter? _presenter;
+    private RendererInvalidationKind _pendingRendererInvalidation = RendererInvalidationKind.FullFrame;
     private ControlPlaneRuntimeAdapter? _activeControlAdapter;
     private ControlPlaneRuntimeAdapter? _focusedControlAdapter;
     private int _forwardedControlInputDepth;
@@ -301,9 +302,11 @@ public sealed class Scene3DControl : Border
             Adapters.SetScene(_scene);
             UpdateRuntimeOptionsFromControl();
 
+            _pendingRendererInvalidation = RendererInvalidationKind.FullFrame;
             if (_presenter is not null)
             {
                 _presenter.Scene = _scene;
+                _presenter.NotifySceneChanged(new SceneChangedEventArgs(SceneChangeKind.Structure), _pendingRendererInvalidation);
             }
 
             SyncControlAdapters();
@@ -765,6 +768,7 @@ public sealed class Scene3DControl : Border
         _presenter = Scene3DPlatform.GetFactory().CreatePresenter();
         _presenter.FrameRendered += OnPresenterFrameRendered;
         _presenter.Scene = Scene;
+        _presenter.NotifySceneChanged(new SceneChangedEventArgs(SceneChangeKind.Structure), _pendingRendererInvalidation);
         _presenter.View.IsHitTestVisible = false;
         _presenter.View.ZIndex = 0;
         _root.Children.Add(_presenter.View);
@@ -783,25 +787,29 @@ public sealed class Scene3DControl : Border
 
     private void OnSceneChanged(object? sender, SceneChangedEventArgs e)
     {
-        if (e.Kind == SceneChangeKind.Structure || e.Kind == SceneChangeKind.Control)
+        var invalidation = RendererInvalidationPolicy.FromSceneChange(e.Kind);
+        _pendingRendererInvalidation |= invalidation;
+        _presenter?.NotifySceneChanged(e, _pendingRendererInvalidation);
+        if ((invalidation & RendererInvalidationKind.BatchRebuild) != 0 || e.Kind == SceneChangeKind.Control)
         {
             SyncControlAdapters();
         }
 
-        if (e.Kind != SceneChangeKind.HighScaleState)
+        if ((invalidation & RendererInvalidationKind.HighScaleState) != 0)
         {
-            UpdateNavigationTimerState();
-            RequestRender();
+            // In continuous-render high-scale scenes telemetry state changes are consumed by
+            // the next scheduled frame. Calling RequestNextFrameRendering for every telemetry
+            // batch creates redundant UI render requests and makes frame pacing worse.
+            if (!ContinuousRendering)
+            {
+                RequestRender();
+            }
+
             return;
         }
 
-        // In continuous-render high-scale scenes telemetry state changes are consumed by
-        // the next scheduled frame. Calling RequestNextFrameRendering for every telemetry
-        // batch creates redundant UI render requests and makes frame pacing worse.
-        if (!ContinuousRendering)
-        {
-            RequestRender();
-        }
+        UpdateNavigationTimerState();
+        RequestRender();
     }
 
     private void OnObjectClicked(object? sender, ScenePointerEventArgs e)
@@ -843,6 +851,7 @@ public sealed class Scene3DControl : Border
     private void RequestPresenterRenderOnly()
     {
         _presenter?.RequestRender();
+        _pendingRendererInvalidation = RendererInvalidationKind.None;
     }
 
     private void RequestUnlockedFrameSoon()

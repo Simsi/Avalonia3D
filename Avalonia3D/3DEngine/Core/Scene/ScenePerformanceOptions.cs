@@ -46,6 +46,7 @@ public sealed class ScenePerformanceOptions
     public int TelemetryMaxBacklogMultiplier { get; set; } = 4;
     public bool EnableHighScaleDynamicFadeState { get; set; } = false;
     public bool EnableWebGlClientHighScaleRuntime { get; set; } = true;
+    public bool ForceWebGlJsOwnedHighScaleRuntime { get; set; } = false;
     public bool EnableWebGlClientGpuTransformAnimation { get; set; }
     public float WebGlClientGpuTransformAnimationAmplitude { get; set; } = 0.18f;
 
@@ -95,6 +96,7 @@ public sealed class ScenePerformanceOptions
         TelemetryMaxBacklogMultiplier = 4,
         EnableHighScaleDynamicFadeState = false,
         EnableWebGlClientHighScaleRuntime = true,
+        ForceWebGlJsOwnedHighScaleRuntime = true,
         EnableWebGlClientGpuTransformAnimation = false,
         WebGlClientGpuTransformAnimationAmplitude = 0.18f,
         EnableBakedHighScaleDetailedMeshes = true,
