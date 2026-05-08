@@ -16,7 +16,7 @@ namespace ThreeDEngine.Core.HighScale;
 /// telemetry changes update StateBuffer only and are surfaced through StateChanged.
 /// Renderers should update a small GPU state buffer rather than rebuilding transform batches.
 /// </summary>
-public sealed class HighScaleInstanceLayer3D : Object3D
+public class HighScaleInstanceLayer3D : Object3D
 {
     private int _materialResolverVersion;
     private bool _suppressStateChanged;
@@ -156,7 +156,7 @@ public sealed class HighScaleInstanceLayer3D : Object3D
             return;
         }
 
-        base.RaiseChanged(SceneChangeKind.HighScaleStructure);
+        base.RaiseChanged();
     }
 
     private void RaiseStateChanged()
@@ -179,7 +179,7 @@ public sealed class HighScaleInstanceLayer3D : Object3D
 
         if (structural)
         {
-            base.RaiseChanged(SceneChangeKind.HighScaleStructure);
+            base.RaiseChanged();
         }
 
         if (state)

@@ -15,6 +15,8 @@ public sealed class ScenePerformanceOptions
     public int MaxLiveControlSnapshotsPerFrame { get; set; } = 2;
     public int MaxOverlayLabels { get; set; } = 500;
     public bool PreferColliderPicking { get; set; } = true;
+    public bool AllowPickingFullScanFallback { get; set; } = true;
+    public int MaxPickingFullScanFallbackObjects { get; set; } = 5000;
     public bool EnableRegistryHotPath { get; set; } = true;
     public bool EnableSpatialBroadphase { get; set; } = true;
     public bool EnableHighScaleChunks { get; set; } = true;
@@ -46,7 +48,8 @@ public sealed class ScenePerformanceOptions
     public int TelemetryMaxBacklogMultiplier { get; set; } = 4;
     public bool EnableHighScaleDynamicFadeState { get; set; } = false;
     public bool EnableWebGlClientHighScaleRuntime { get; set; } = true;
-    public bool ForceWebGlJsOwnedHighScaleRuntime { get; set; } = false;
+    // Cross-backend shader-side high-scale transform motion. The historic property name is
+    // kept for compatibility; OpenGL desktop and WebGL both consume it now.
     public bool EnableWebGlClientGpuTransformAnimation { get; set; }
     public float WebGlClientGpuTransformAnimationAmplitude { get; set; } = 0.18f;
 
@@ -76,6 +79,8 @@ public sealed class ScenePerformanceOptions
         DistanceFadeBand = 80f,
         EnableDistanceFade = true,
         PreferColliderPicking = true,
+        AllowPickingFullScanFallback = false,
+        MaxPickingFullScanFallbackObjects = 5000,
         EnableRegistryHotPath = true,
         EnableSpatialBroadphase = true,
         EnableHighScaleChunks = true,
@@ -96,7 +101,6 @@ public sealed class ScenePerformanceOptions
         TelemetryMaxBacklogMultiplier = 4,
         EnableHighScaleDynamicFadeState = false,
         EnableWebGlClientHighScaleRuntime = true,
-        ForceWebGlJsOwnedHighScaleRuntime = true,
         EnableWebGlClientGpuTransformAnimation = false,
         WebGlClientGpuTransformAnimationAmplitude = 0.18f,
         EnableBakedHighScaleDetailedMeshes = true,

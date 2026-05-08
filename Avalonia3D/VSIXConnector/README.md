@@ -31,3 +31,7 @@ The connector detects the active C# class under the caret, builds the host proje
 ## v44 install note
 
 Ручная упаковка через `BuildVsix.ps1` отключена. Устанавливай `.vsix`, созданный VSSDK BuildTools, из `bin\Debug\net472`. Подробности: `INSTALL_VSIX_RU.md`.
+
+## Security note
+
+The VSIX connector invokes `dotnet build` and launches the PreviewerApp for the active project. This is intended for trusted local development workspaces only. Opening previews from unknown repositories can execute arbitrary project code.

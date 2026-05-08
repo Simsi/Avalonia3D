@@ -1,0 +1,5 @@
+<Project>
+  <ItemGroup>
+    <PackageReference Include="Jitter2" Version="2.8.5" />
+  </ItemGroup>
+</Project>

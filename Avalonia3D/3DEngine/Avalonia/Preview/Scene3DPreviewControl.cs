@@ -12,6 +12,7 @@ using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Layout;
 using Avalonia.Media;
+using Avalonia.Threading;
 using ThreeDEngine.Avalonia.Controls;
 using ThreeDEngine.Avalonia.Interaction;
 using ThreeDEngine.Core.Collision;
@@ -27,7 +28,7 @@ using ProjectionHelper3D = ThreeDEngine.Core.Math.ProjectionHelper;
 
 namespace ThreeDEngine.Avalonia.Preview;
 
-public sealed partial class Scene3DPreviewControl : UserControl
+public sealed class Scene3DPreviewControl : UserControl
 {
     private readonly Scene3DControl _viewport;
     private readonly ListBox _partList;
@@ -147,8 +148,11 @@ public sealed partial class Scene3DPreviewControl : UserControl
     private readonly ColumnDefinition _leftSplitterColumn;
     private readonly ColumnDefinition _rightSplitterColumn;
     private readonly ColumnDefinition _rightColumn;
-    private readonly DebuggerPhysicsService _debuggerPhysics;
-    private readonly DebuggerSelectionService _selectionService;
+    private readonly DispatcherTimer _debugPhysicsTimer;
+    private readonly ModelEditorHistoryService _history = new();
+    private readonly Button _undoButton;
+    private readonly Button _redoButton;
+    private readonly TextBlock _historyStatusText;
 
     private IReadOnlyList<PreviewScene3D> _previews = Array.Empty<PreviewScene3D>();
     private List<PreviewObjectEntry> _listedObjects = new();
@@ -165,10 +169,14 @@ public sealed partial class Scene3DPreviewControl : UserControl
     private Func<DebuggerSourceExportRequest, Task<DebuggerSourceExportResult>>? _sourceExportHandler;
     private readonly List<Object3D> _spaceGuideObjects = new();
     private readonly Dictionary<string, DebugEventBinding> _eventBindings = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, List<SourceEventBinding>> _sourceEventBindingsByObjectName = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, List<SourceEventBinding>> _sourceEventBindingsByObjectId = new(StringComparer.Ordinal);
     private readonly HashSet<string> _runtimeEventHandlersAttached = new(StringComparer.Ordinal);
-    private string _eventHintsText = "Hints are generated from engine sources when a preview is loaded.";
+    private string _eventHintsText = "Existing C# event handlers are loaded from source in read-only mode.";
     private bool _spaceGuidesUpdating;
     private bool _updatingSceneSettings;
+    private bool _applyingHistory;
+    private DateTime _lastDebugPhysicsTickUtc;
 
     public Scene3DPreviewControl()
     {
@@ -178,13 +186,8 @@ public sealed partial class Scene3DPreviewControl : UserControl
             ShowCenterCursor = false
         };
 
-        _debuggerPhysics = new DebuggerPhysicsService(
-            () => _viewport.Scene,
-            () => _enablePhysicsCheckBox.IsChecked == true,
-            () => TopLevel.GetTopLevel(this) is not null,
-            () => _selectedObject,
-            RefreshSelectionAfterPhysics);
-        _selectionService = new DebuggerSelectionService();
+        _debugPhysicsTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16d) };
+        _debugPhysicsTimer.Tick += OnDebugPhysicsTimerTick;
 
         _partList = new ListBox
         {
@@ -211,6 +214,19 @@ public sealed partial class Scene3DPreviewControl : UserControl
         _refreshButton.Click += (_, _) => RefreshRequested?.Invoke(this, EventArgs.Empty);
         var frameButton = new Button { Content = "Frame" };
         frameButton.Click += (_, _) => FocusSelectedObject();
+
+        _undoButton = new Button { Content = "Undo", IsEnabled = false };
+        _redoButton = new Button { Content = "Redo", IsEnabled = false };
+        _undoButton.Click += (_, _) => UndoModelEdit();
+        _redoButton.Click += (_, _) => RedoModelEdit();
+        _historyStatusText = new TextBlock
+        {
+            Text = "Clean",
+            TextWrapping = TextWrapping.Wrap,
+            FontSize = 11d,
+            Foreground = new SolidColorBrush(Color.FromRgb(190, 196, 210))
+        };
+        KeyDown += OnModelEditorShortcutKeyDown;
 
         _sceneSummaryText = new TextBlock
         {
@@ -351,7 +367,7 @@ public sealed partial class Scene3DPreviewControl : UserControl
         _copySceneSnippetButton.Click += async (_, _) => await CopySceneSnippetAsync();
         _copyDiagnosticsButton = new Button { Content = "Copy diagnostics" };
         _copyDiagnosticsButton.Click += async (_, _) => await CopyDiagnosticsAsync();
-        _exportSourceButton = new Button { Content = "Export code to source (experimental)" };
+        _exportSourceButton = new Button { Content = "Update Build in source" };
         _exportSourceButton.Click += async (_, _) => await ExportSourceExperimentalAsync();
         _showBasisCheckBox = new CheckBox { Content = "Show RGB basis axes", IsChecked = true };
         _showBasisCheckBox.Click += (_, _) => UpdateSpaceGuides();
@@ -442,10 +458,9 @@ public sealed partial class Scene3DPreviewControl : UserControl
             FontFamily = FontFamily.Parse("Consolas"),
             FontSize = 12d,
             MinHeight = 96d,
-            Watermark = "// C# event body. Export writes this into a generated handler.\n// Example: e.Target.Material.BaseColor = ColorRgba.Red;"
+            IsReadOnly = true,
+            Watermark = "Existing handler subscriptions are shown here. Code editing is intentionally outside the 3DModelEditor."
         };
-        _eventCodeBox.TextChanged += (_, _) => StoreEventEditorForSelection();
-        _eventCodeBox.LostFocus += (_, _) => StoreEventEditorForSelection();
         _eventHintsBox = new TextBox
         {
             AcceptsReturn = true,
@@ -456,7 +471,7 @@ public sealed partial class Scene3DPreviewControl : UserControl
             MinHeight = 132d,
             Text = _eventHintsText
         };
-        _copyEventSnippetButton = new Button { Content = "Copy event code" };
+        _copyEventSnippetButton = new Button { Content = "Copy handler summary" };
         _copyEventSnippetButton.Click += async (_, _) => await CopyEventSnippetAsync();
 
         _showLightGizmosCheckBox = new CheckBox { Content = "Show light gizmos", IsChecked = true };
@@ -529,7 +544,7 @@ public sealed partial class Scene3DPreviewControl : UserControl
             Margin = new Thickness(8d),
             Children =
             {
-                new TextBlock { Text = "3D Debugger", FontWeight = FontWeight.SemiBold, FontSize = 15d },
+                new TextBlock { Text = "3DModelEditor", FontWeight = FontWeight.SemiBold, FontSize = 15d },
                 _previewSelector,
                 new StackPanel
                 {
@@ -537,6 +552,13 @@ public sealed partial class Scene3DPreviewControl : UserControl
                     Spacing = 6d,
                     Children = { _refreshButton, frameButton }
                 },
+                new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    Spacing = 6d,
+                    Children = { _undoButton, _redoButton }
+                },
+                _historyStatusText,
                 BuildWorkbenchCreatePanel(),
                 BuildDebuggerToolsPanel(),
                 _sceneSummaryText,
@@ -585,11 +607,11 @@ public sealed partial class Scene3DPreviewControl : UserControl
                     new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8d, Children = { _rigidbodyKinematicCheckBox, _rigidbodyGravityCheckBox } },
                     LabeledEditor("Mass", _rigidbodyMassBox),
                     VectorRow("Friction / bounce", _rigidbodyFrictionBox, _rigidbodyRestitutionBox)),
-                CollapsibleSection("Events", false,
+                CollapsibleSection("Event handlers (read-only)", false,
                     LabeledEditor("Event", _eventTypeBox),
-                    new TextBlock { Text = "Stored as C# handler body and exported with Build(...). Runtime preview logs the event; arbitrary code is not executed in-process.", TextWrapping = TextWrapping.Wrap, FontSize = 11d, Foreground = new SolidColorBrush(Color.FromRgb(190, 196, 210)) },
+                    new TextBlock { Text = "The 3DModelEditor does not edit C# code. Existing handlers found in Build(...) are displayed and preserved when Build is updated.", TextWrapping = TextWrapping.Wrap, FontSize = 11d, Foreground = new SolidColorBrush(Color.FromRgb(190, 196, 210)) },
                     _eventCodeBox,
-                    new TextBlock { Text = "Engine API hints (auto-generated from engine sources)", FontWeight = FontWeight.SemiBold, FontSize = 11d },
+                    new TextBlock { Text = "Detected source handlers", FontWeight = FontWeight.SemiBold, FontSize = 11d },
                     _eventHintsBox,
                     _copyEventSnippetButton),
                 _primitivePanel,
@@ -699,6 +721,139 @@ public sealed partial class Scene3DPreviewControl : UserControl
 
     public Scene3DControl Viewport => _viewport;
 
+
+    private ModelEditorSceneSnapshot? CaptureModelEditStart()
+    {
+        return _applyingHistory ? null : _history.Capture(_viewport.Scene, _selectedObject?.Id);
+    }
+
+    private void CommitModelEdit(string label, ModelEditorSceneSnapshot? before, Object3D? preferredSelection = null)
+    {
+        if (before is null || _applyingHistory)
+        {
+            return;
+        }
+
+        var after = _history.Capture(_viewport.Scene, preferredSelection?.Id ?? _selectedObject?.Id);
+        if (_history.Commit(label, before, after))
+        {
+            UpdateHistoryUi();
+        }
+    }
+
+    private void UndoModelEdit()
+    {
+        if (!_history.CanUndo)
+        {
+            return;
+        }
+
+        _applyingHistory = true;
+        try
+        {
+            if (_history.Undo(_viewport.Scene, out var selectedObjectId))
+            {
+                RestoreModelEditorSelection(selectedObjectId);
+                SetStatus("Undo: " + (_history.RedoLabel ?? "model edit"), isError: false);
+            }
+        }
+        finally
+        {
+            _applyingHistory = false;
+            UpdateHistoryUi();
+        }
+    }
+
+    private void RedoModelEdit()
+    {
+        if (!_history.CanRedo)
+        {
+            return;
+        }
+
+        _applyingHistory = true;
+        try
+        {
+            if (_history.Redo(_viewport.Scene, out var selectedObjectId))
+            {
+                RestoreModelEditorSelection(selectedObjectId);
+                SetStatus("Redo: " + (_history.UndoLabel ?? "model edit"), isError: false);
+            }
+        }
+        finally
+        {
+            _applyingHistory = false;
+            UpdateHistoryUi();
+        }
+    }
+
+    private void RestoreModelEditorSelection(string? selectedObjectId)
+    {
+        RebuildObjectList(null);
+        var selected = string.IsNullOrWhiteSpace(selectedObjectId)
+            ? null
+            : EnumerateObjects(_viewport.Scene).FirstOrDefault(obj => string.Equals(obj.Id, selectedObjectId, StringComparison.Ordinal));
+        if (selected is not null)
+        {
+            SelectObject(selected);
+            RebuildObjectList(selected);
+        }
+        else
+        {
+            ClearInspectorSelection();
+        }
+
+        _viewport.Scene.Invalidate();
+    }
+
+    private void UpdateHistoryUi()
+    {
+        if (_undoButton is null || _redoButton is null || _historyStatusText is null)
+        {
+            return;
+        }
+
+        _undoButton.IsEnabled = _history.CanUndo;
+        _redoButton.IsEnabled = _history.CanRedo;
+        _undoButton.Content = _history.CanUndo ? "Undo: " + _history.UndoLabel : "Undo";
+        _redoButton.Content = _history.CanRedo ? "Redo: " + _history.RedoLabel : "Redo";
+        _historyStatusText.Text = _history.IsDirty ? "Unsaved visual edits" : "Clean";
+    }
+
+    private void OnModelEditorShortcutKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.Source is TextBox)
+        {
+            return;
+        }
+
+        var hasControl = e.KeyModifiers.HasFlag(KeyModifiers.Control);
+        if (!hasControl)
+        {
+            return;
+        }
+
+        if (e.Key == Key.Z && e.KeyModifiers.HasFlag(KeyModifiers.Shift))
+        {
+            RedoModelEdit();
+            e.Handled = true;
+            return;
+        }
+
+        if (e.Key == Key.Z)
+        {
+            UndoModelEdit();
+            e.Handled = true;
+            return;
+        }
+
+        if (e.Key == Key.Y)
+        {
+            RedoModelEdit();
+            e.Handled = true;
+        }
+    }
+
     private void ToggleLeftPanel()
     {
         var collapsed = _leftColumn.Width.Value <= 0.5d;
@@ -729,6 +884,7 @@ public sealed partial class Scene3DPreviewControl : UserControl
                 : $"Source target: {_sourceTargetInfo.FilePath}\nClass: {_sourceTargetInfo.ClassName} @ line {_sourceTargetInfo.Line}, method: {(_sourceTargetInfo.HasBuildMethod ? "Build(...)" : "none; Build(...) will be inserted")}";
         }
 
+        RefreshSourceEventBindings();
         RefreshEventHints();
     }
 
@@ -775,17 +931,20 @@ public sealed partial class Scene3DPreviewControl : UserControl
 
         RestoreDebugVisuals();
         _viewport.Scene = preview.Scene;
+        _history.Clear();
+        UpdateHistoryUi();
         UnlockEditableCompositeParts(preview.Scene);
         ApplyDebuggerSceneDefaults(preview.Scene);
         _debugVisualStates.Clear();
         var report = PreviewComplexityReport3D.Analyze(preview.Scene);
         UpdateSpaceGuides();
         LoadSceneSettingsFromScene();
+        RefreshSourceEventBindings();
         RefreshEventHints();
         UpdateDebuggerPhysicsPumpState();
         RebuildObjectList(null);
         _sceneSummaryText.Text = $"Preview: {preview.Name}\n" + report.Summary;
-        SetStatus("Select an object, create a workbench object, or edit values and copy snippet back into source code.", isError: false);
+        SetStatus("Select an object, create a workbench object, or edit values and update Build when needed.", isError: false);
         ClearInspectorSelection();
     }
 
@@ -798,10 +957,13 @@ public sealed partial class Scene3DPreviewControl : UserControl
 
         RestoreDebugVisuals();
         _viewport.Scene = PreviewScene3D.CreateDefaultScene();
+        _history.Clear();
+        UpdateHistoryUi();
         ApplyDebuggerSceneDefaults(_viewport.Scene);
         _debugVisualStates.Clear();
         UpdateSpaceGuides();
         LoadSceneSettingsFromScene();
+        RefreshSourceEventBindings();
         RefreshEventHints();
         UpdateDebuggerPhysicsPumpState();
         _listedObjects.Clear();
@@ -972,8 +1134,11 @@ public sealed partial class Scene3DPreviewControl : UserControl
 
     private void SelectObject(Object3D selected)
     {
-        _selectionService.Select(selected, _listedObjects.Select(entry => entry.Object));
-        _selectedObject = _selectionService.SelectedObject;
+        _selectedObject = selected;
+        foreach (var entry in _listedObjects)
+        {
+            entry.Object.IsSelected = ReferenceEquals(entry.Object, selected);
+        }
 
         LoadInspectorFromSelection();
         ApplyDebugVisualModes();
@@ -981,7 +1146,6 @@ public sealed partial class Scene3DPreviewControl : UserControl
 
     private void ClearInspectorSelection()
     {
-        _selectionService.Clear(_listedObjects.Select(entry => entry.Object));
         _selectedObject = null;
         _updatingInspector = true;
         try
@@ -1146,6 +1310,8 @@ public sealed partial class Scene3DPreviewControl : UserControl
             }
         }
 
+        var historyBefore = CaptureModelEditStart();
+
         using (_viewport.Scene.BeginUpdate())
         {
             if (applyIdentity)
@@ -1212,7 +1378,8 @@ public sealed partial class Scene3DPreviewControl : UserControl
         }
 
         ApplyDebugVisualModes();
-        SetStatus("Applied to preview scene. Copy snippet to port values into source code.", isError: false);
+        CommitModelEdit("Edit " + obj.Name, historyBefore, obj);
+        SetStatus("Applied to 3D model editor scene. Use Update Build when you want to write the visual model back to source.", isError: false);
         return true;
     }
 
@@ -1233,9 +1400,13 @@ public sealed partial class Scene3DPreviewControl : UserControl
         try
         {
             var eventName = ResolveSelectedEventName();
-            _eventCodeBox.Text = _eventBindings.TryGetValue(MakeEventBindingKey(obj, eventName), out var binding)
-                ? binding.Body
-                : DefaultEventBody(eventName);
+            var bindings = GetSourceEventBindingsForObject(obj)
+                .Where(binding => string.Equals(binding.EventName, eventName, StringComparison.Ordinal))
+                .ToArray();
+
+            _eventCodeBox.Text = bindings.Length == 0
+                ? $"No existing {eventName} handler was found in Build(...). Code editing is intentionally outside the 3DModelEditor."
+                : string.Join(global::System.Environment.NewLine, bindings.Select(binding => $"{binding.EventName} += {binding.HandlerName};"));
         }
         finally
         {
@@ -1245,25 +1416,7 @@ public sealed partial class Scene3DPreviewControl : UserControl
 
     private void StoreEventEditorForSelection()
     {
-        if (_updatingInspector || _selectedObject is null)
-        {
-            return;
-        }
-
-        var eventName = ResolveSelectedEventName();
-        var body = _eventCodeBox.Text ?? string.Empty;
-        var key = MakeEventBindingKey(_selectedObject, eventName);
-        if (string.IsNullOrWhiteSpace(body) || string.Equals(body.Trim(), DefaultEventBody(eventName).Trim(), StringComparison.Ordinal))
-        {
-            _eventBindings.Remove(key);
-        }
-        else
-        {
-            _eventBindings[key] = new DebugEventBinding(_selectedObject.Id, eventName, body);
-            AttachRuntimeEventLogger(_selectedObject);
-        }
-
-        UpdateSnippet(_selectedObject);
+        // The 3DModelEditor is visual-only. Event handler code is not edited here.
     }
 
     private async Task CopyEventSnippetAsync()
@@ -1271,17 +1424,16 @@ public sealed partial class Scene3DPreviewControl : UserControl
         var obj = _selectedObject;
         if (obj is null)
         {
-            SetStatus("Select an object before copying event code.", isError: true);
+            SetStatus("Select an object before copying handler information.", isError: true);
             return;
         }
 
-        StoreEventEditorForSelection();
-        var text = BuildEventHandlerSource(obj, ResolveSelectedEventName(), ResolveEventHandlerName("Selected", ResolveSelectedEventName()), _eventCodeBox.Text ?? string.Empty, "    ");
+        var summary = BuildSourceHandlerSummary(obj);
         var clipboard = TopLevel.GetTopLevel(this)?.Clipboard;
         if (clipboard is not null)
         {
-            await clipboard.SetTextAsync(text);
-            SetStatus("Event handler snippet copied.", isError: false);
+            await clipboard.SetTextAsync(summary);
+            SetStatus("Read-only handler summary copied.", isError: false);
         }
     }
 
@@ -1306,11 +1458,9 @@ public sealed partial class Scene3DPreviewControl : UserControl
             return;
         }
 
-        var eventNames = new[] { "Clicked", "PointerPressed", "PointerReleased", "PointerEntered", "PointerExited" };
-        var available = eventNames.Any(name => _eventBindings.ContainsKey(MakeEventBindingKey(obj, name)));
-        if (available)
+        if (GetSourceEventBindingsForObject(obj).Any())
         {
-            SetStatus($"Event draft exists for {obj.Name}. Export source to compile and execute custom code.", isError: false);
+            SetStatus($"Existing source handler mapping is preserved for {obj.Name}. Handler code is edited in the IDE, not in the 3DModelEditor.", isError: false);
         }
     }
 
@@ -1319,7 +1469,7 @@ public sealed partial class Scene3DPreviewControl : UserControl
     private static string MakeEventBindingKey(Object3D obj, string eventName) => obj.Id + ":" + eventName;
 
     private static string DefaultEventBody(string eventName)
-        => "// C# body for " + eventName + ".\n// Example:\n// e.Target.Material.BaseColor = ColorRgba.Red;";
+        => "Code editing is intentionally outside the 3DModelEditor.";
 
     private void LoadRigidbodyInspector(Object3D obj)
     {
@@ -1346,7 +1496,9 @@ public sealed partial class Scene3DPreviewControl : UserControl
             _enablePhysicsCheckBox.IsChecked = true;
         }
 
-        _debuggerPhysics.EnsureObjectReady(obj);
+        var scene = _viewport.Scene;
+        scene.PhysicsCore ??= PhysicsCoreFactory.CreateDefault();
+        EnsurePhysicsCollider(obj);
 
         var isNewBody = obj.Rigidbody is null;
         var body = obj.Rigidbody ?? new Rigidbody3D();
@@ -1361,7 +1513,7 @@ public sealed partial class Scene3DPreviewControl : UserControl
         }
 
         obj.Rigidbody = body;
-        _viewport.Scene.Invalidate();
+        scene.Invalidate();
         UpdateDebuggerPhysicsPumpState();
     }
 
@@ -1427,7 +1579,7 @@ public sealed partial class Scene3DPreviewControl : UserControl
         scene.Debug.ShowBounds = _showBoundsCheckBox.IsChecked == true;
         scene.Debug.ShowColliders = _showCollidersCheckBox.IsChecked == true;
         scene.Debug.ShowPickingRay = _showPickingRayCheckBox.IsChecked == true;
-        scene.PhysicsCore = _enablePhysicsCheckBox.IsChecked == true ? scene.PhysicsCore ?? new BasicPhysicsCore() : null;
+        scene.PhysicsCore = _enablePhysicsCheckBox.IsChecked == true ? scene.PhysicsCore ?? PhysicsCoreFactory.CreateDefault() : null;
         if (TryReadFloat(_cameraNearBox.Text, out var nearPlane)) scene.Camera.NearPlane = nearPlane;
         if (TryReadFloat(_cameraFarBox.Text, out var farPlane)) scene.Camera.FarPlane = farPlane;
         if (TryReadFloat(_drawDistanceBox.Text, out var drawDistance)) scene.Performance.DrawDistance = MathF.Max(1f, drawDistance);
@@ -1457,7 +1609,7 @@ public sealed partial class Scene3DPreviewControl : UserControl
         scene.Invalidate();
         if (setStatus)
         {
-            SetStatus("Scene/debug settings applied live.", isError: false);
+            SetStatus("Editor view settings applied live.", isError: false);
         }
     }
 
@@ -1523,7 +1675,81 @@ public sealed partial class Scene3DPreviewControl : UserControl
 
     private void ApplyPhysicsImmediately(Object3D? selectionToRefresh)
     {
-        _debuggerPhysics.StepImmediate(selectionToRefresh);
+        var scene = _viewport.Scene;
+        if (scene.PhysicsCore is null)
+        {
+            UpdateDebuggerPhysicsPumpState();
+            return;
+        }
+
+        scene.Registry.Invalidate();
+        scene.StepPhysics(1f / 60f);
+        scene.Invalidate();
+        RefreshSelectionAfterPhysics(selectionToRefresh);
+        UpdateDebuggerPhysicsPumpState();
+    }
+
+    private void UpdateDebuggerPhysicsPumpState()
+    {
+        var shouldRun =
+            _enablePhysicsCheckBox.IsChecked == true &&
+            _viewport.Scene.PhysicsCore is not null &&
+            TopLevel.GetTopLevel(this) is not null &&
+            HasDebuggerDynamicPhysicsBodies();
+
+        if (shouldRun)
+        {
+            if (!_debugPhysicsTimer.IsEnabled)
+            {
+                _lastDebugPhysicsTickUtc = default;
+                _debugPhysicsTimer.Start();
+            }
+        }
+        else if (_debugPhysicsTimer.IsEnabled)
+        {
+            _debugPhysicsTimer.Stop();
+            _lastDebugPhysicsTickUtc = default;
+        }
+    }
+
+    private bool HasDebuggerDynamicPhysicsBodies()
+    {
+        foreach (var obj in _viewport.Scene.Registry.SnapshotDynamicBodies())
+        {
+            var body = obj.Rigidbody;
+            if (body is null || body.IsKinematic)
+            {
+                continue;
+            }
+
+            if (body.UseGravity || body.Velocity.LengthSquared() > 0.000001f)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void OnDebugPhysicsTimerTick(object? sender, EventArgs e)
+    {
+        var scene = _viewport.Scene;
+        if (_enablePhysicsCheckBox.IsChecked != true || scene.PhysicsCore is null || TopLevel.GetTopLevel(this) is null)
+        {
+            UpdateDebuggerPhysicsPumpState();
+            return;
+        }
+
+        var now = DateTime.UtcNow;
+        var dt = _lastDebugPhysicsTickUtc == default ? 1f / 60f : (float)(now - _lastDebugPhysicsTickUtc).TotalSeconds;
+        _lastDebugPhysicsTickUtc = now;
+        dt = global::System.Math.Clamp(dt, 0.001f, 1f / 15f);
+
+        scene.Registry.Invalidate();
+        scene.StepPhysics(dt);
+        scene.Invalidate();
+        RefreshSelectionAfterPhysics(_selectedObject);
+        UpdateDebuggerPhysicsPumpState();
     }
 
     private void RefreshSelectionAfterPhysics(Object3D? obj)
@@ -1544,11 +1770,153 @@ public sealed partial class Scene3DPreviewControl : UserControl
         {
             _updatingInspector = false;
         }
+
+        _selectionDetailsText.Text = BuildSelectionDetails(obj);
+        UpdateSnippet(obj);
     }
 
-    private void UpdateDebuggerPhysicsPumpState()
+    private static void EnsurePhysicsCollider(Object3D obj)
     {
-        _debuggerPhysics.UpdatePumpState();
+        if (obj.Collider is not null)
+        {
+            return;
+        }
+
+        var bounds = obj.GetWorldBounds();
+        var size = bounds.IsValid ? bounds.Size : Vector3.One;
+        var scale = obj.Scale;
+        size = new Vector3(
+            MathF.Max(0.01f, size.X / MathF.Max(0.001f, MathF.Abs(scale.X))),
+            MathF.Max(0.01f, size.Y / MathF.Max(0.001f, MathF.Abs(scale.Y))),
+            MathF.Max(0.01f, size.Z / MathF.Max(0.001f, MathF.Abs(scale.Z))));
+        obj.Collider = new BoxCollider3D { Size = size };
+    }
+
+
+    private void RefreshSourceEventBindings()
+    {
+        _sourceEventBindingsByObjectName.Clear();
+        _sourceEventBindingsByObjectId.Clear();
+
+        var target = _sourceTargetInfo ?? ResolveSourceTarget(_sourcePatchDirectory, _sourceTypeFullName);
+        if (target is null || !target.HasBuildMethod || !File.Exists(target.FilePath))
+        {
+            return;
+        }
+
+        try
+        {
+            var source = File.ReadAllText(target.FilePath);
+            var methodEndExclusive = global::System.Math.Min(source.Length, target.BuildMethodEnd + 1);
+            if (target.BuildMethodStart < 0 || target.BuildMethodStart >= methodEndExclusive)
+            {
+                return;
+            }
+
+            var methodSource = source[target.BuildMethodStart..methodEndExclusive];
+            var variableToName = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (Match match in Regex.Matches(methodSource, @"\b(?:var|[\w<>,.?]+)\s+(?<var>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?<builder>[A-Za-z_][A-Za-z0-9_]*)\.Add\s*\(\s*""(?<name>(?:\\.|[^""\\])*)""", RegexOptions.Multiline))
+            {
+                var variable = match.Groups["var"].Value;
+                var name = UnescapeCSharpString(match.Groups["name"].Value);
+                if (!string.IsNullOrWhiteSpace(variable) && !string.IsNullOrWhiteSpace(name))
+                {
+                    variableToName[variable] = name;
+                }
+            }
+
+            foreach (Match match in Regex.Matches(methodSource, @"\b(?<var>[A-Za-z_][A-Za-z0-9_]*)(?:\.Object)?\.(?<event>Clicked|PointerPressed|PointerReleased|PointerEntered|PointerExited|PointerMoved)\s*\+=\s*(?<handler>[A-Za-z_][A-Za-z0-9_\.]*)\s*;", RegexOptions.Multiline))
+            {
+                var variable = match.Groups["var"].Value;
+                if (!variableToName.TryGetValue(variable, out var objectName))
+                {
+                    continue;
+                }
+
+                var binding = new SourceEventBinding(objectName, match.Groups["event"].Value, match.Groups["handler"].Value);
+                if (!_sourceEventBindingsByObjectName.TryGetValue(objectName, out var list))
+                {
+                    list = new List<SourceEventBinding>();
+                    _sourceEventBindingsByObjectName[objectName] = list;
+                }
+
+                if (!list.Any(existing => existing.EventName == binding.EventName && existing.HandlerName == binding.HandlerName))
+                {
+                    list.Add(binding);
+                }
+            }
+
+            BindSourceHandlersToCurrentObjects();
+        }
+        catch
+        {
+            _sourceEventBindingsByObjectName.Clear();
+            _sourceEventBindingsByObjectId.Clear();
+        }
+    }
+
+    private void BindSourceHandlersToCurrentObjects()
+    {
+        _sourceEventBindingsByObjectId.Clear();
+        if (_sourceEventBindingsByObjectName.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var obj in EnumerateObjects(_viewport.Scene))
+        {
+            if (_sourceEventBindingsByObjectName.TryGetValue(obj.Name, out var bindings))
+            {
+                _sourceEventBindingsByObjectId[obj.Id] = bindings.ToList();
+                AttachRuntimeEventLogger(obj);
+            }
+        }
+    }
+
+    private IEnumerable<SourceEventBinding> GetSourceEventBindingsForObject(Object3D obj)
+    {
+        if (_sourceEventBindingsByObjectId.TryGetValue(obj.Id, out var byId))
+        {
+            foreach (var binding in byId)
+            {
+                yield return binding;
+            }
+
+            yield break;
+        }
+
+        if (_sourceEventBindingsByObjectName.TryGetValue(obj.Name, out var byName))
+        {
+            foreach (var binding in byName)
+            {
+                yield return binding;
+            }
+        }
+    }
+
+    private string BuildSourceHandlerSummary(Object3D obj)
+    {
+        var bindings = GetSourceEventBindingsForObject(obj).ToArray();
+        if (bindings.Length == 0)
+        {
+            return $"{obj.Name}: no existing Build(...) event handler subscriptions were found.";
+        }
+
+        var sb = new StringBuilder();
+        sb.AppendLine(obj.Name + " existing handlers:");
+        foreach (var binding in bindings)
+        {
+            sb.AppendLine("- " + binding.EventName + " += " + binding.HandlerName);
+        }
+
+        return sb.ToString().TrimEnd();
+    }
+
+    private static string UnescapeCSharpString(string value)
+    {
+        return value
+            .Replace("\\\"", "\"", StringComparison.Ordinal)
+            .Replace("\\\\", "\\", StringComparison.Ordinal);
     }
 
     private void RefreshEventHints()
@@ -1563,33 +1931,27 @@ public sealed partial class Scene3DPreviewControl : UserControl
     private string BuildEventHints()
     {
         var sb = new StringBuilder();
-        sb.AppendLine("Generated event hints");
-        sb.AppendLine("---------------------");
-        sb.AppendLine("Available by default in handlers:");
-        sb.AppendLine("- sender: the event source object");
-        sb.AppendLine("- e: ScenePointerEventArgs");
-        sb.AppendLine("- e.Target: Object3D under the pointer");
+        sb.AppendLine("Read-only source handler map");
+        sb.AppendLine("----------------------------");
+        sb.AppendLine("The 3DModelEditor does not edit handler code.");
+        sb.AppendLine("It reads existing Build(...) subscriptions and preserves them when Build is updated.");
         sb.AppendLine();
 
-        var sourceRoot = _sourcePatchDirectory;
-        if (!string.IsNullOrWhiteSpace(sourceRoot) && Directory.Exists(sourceRoot))
+        if (_sourceEventBindingsByObjectName.Count == 0)
         {
-            AppendPublicMemberHints(sb, sourceRoot, "3DEngine/Core/Interaction/ScenePointerEventArgs.cs", "ScenePointerEventArgs e");
-            AppendPublicMemberHints(sb, sourceRoot, "3DEngine/Core/Scene/Object3D.cs", "Object3D");
-            AppendPublicMemberHints(sb, sourceRoot, "3DEngine/Core/Materials/Material3D.cs", "Material3D");
-            AppendPublicMemberHints(sb, sourceRoot, "3DEngine/Core/Physics/Rigidbody3D.cs", "Rigidbody3D");
-            AppendPublicMemberHints(sb, sourceRoot, "3DEngine/Core/Primitives/ColorRgba.cs", "ColorRgba");
-        }
-        else
-        {
-            sb.AppendLine("Source-based hints are not available yet. Load the preview from a project/source context to enable them.");
+            sb.AppendLine("No existing handler subscriptions were found in Build(...).");
+            return sb.ToString().TrimEnd();
         }
 
-        sb.AppendLine();
-        sb.AppendLine("Common examples:");
-        sb.AppendLine("e.Target.Material.BaseColor = new ColorRgba(1f, 0.2f, 0.2f, 1f);");
-        sb.AppendLine("e.Target.Position += new Vector3(0f, 0.5f, 0f);");
-        sb.AppendLine("if (e.Target.Rigidbody is not null) e.Target.Rigidbody.UseGravity = false;");
+        foreach (var pair in _sourceEventBindingsByObjectName.OrderBy(p => p.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            sb.AppendLine(pair.Key + ":");
+            foreach (var binding in pair.Value.OrderBy(b => b.EventName, StringComparer.Ordinal))
+            {
+                sb.AppendLine("  - " + binding.EventName + " += " + binding.HandlerName);
+            }
+        }
+
         return sb.ToString().TrimEnd();
     }
 
@@ -1646,7 +2008,7 @@ public sealed partial class Scene3DPreviewControl : UserControl
             CollapsibleSection("Focus", true,
                 new TextBlock
                 {
-                    Text = "Isolate, ghost, filter and export the current runtime state.",
+                    Text = "Isolate, ghost and filter the current visual model.",
                     TextWrapping = TextWrapping.Wrap,
                     FontSize = 11d,
                     Foreground = new SolidColorBrush(Color.FromRgb(190, 196, 210))
@@ -1694,10 +2056,10 @@ public sealed partial class Scene3DPreviewControl : UserControl
     private Control BuildSourceGenerationPanel()
     {
         return ToolPanel(
-            CollapsibleSection("Experimental source generation", false,
+            CollapsibleSection("Source Build update", false,
                 new TextBlock
                 {
-                    Text = "Experimental export. It replaces or inserts only Build(...). A .3ddebugger.bak backup is created before writing.",
+                    Text = "Updates only Build(CompositeBuilder3D builder). Existing handler methods and other class code are preserved; a .3dmodel.bak backup is created before writing.",
                     TextWrapping = TextWrapping.Wrap,
                     FontSize = 11d
                 },
@@ -1708,7 +2070,7 @@ public sealed partial class Scene3DPreviewControl : UserControl
     private Control BuildWorkbenchCreatePanel()
     {
         return ToolPanel(
-            CollapsibleSection("Create / debug", true,
+            CollapsibleSection("Create visual part", true,
                 LabeledEditor("Primitive", _createTypeBox),
                 LabeledEditor("Name", _createNameBox),
                 VectorRow("Size", _createSizeXBox, _createSizeYBox, _createSizeZBox),
@@ -1743,6 +2105,7 @@ public sealed partial class Scene3DPreviewControl : UserControl
             : Vector3.Zero;
         obj.DataContext = DebugWorkbenchTag.Instance;
 
+        var historyBefore = CaptureModelEditStart();
         using (_viewport.Scene.BeginUpdate())
         {
             _viewport.Scene.Add(obj);
@@ -1750,7 +2113,8 @@ public sealed partial class Scene3DPreviewControl : UserControl
 
         RebuildObjectList(obj);
         SelectObject(obj);
-        SetStatus($"Created {obj.GetType().Name}. Adjust values, then Copy code.", isError: false);
+        CommitModelEdit("Create " + obj.Name, historyBefore, obj);
+        SetStatus($"Created {obj.GetType().Name}. Adjust values, then Update Build.", isError: false);
     }
 
     private void DuplicateSelectedObject()
@@ -1783,6 +2147,7 @@ public sealed partial class Scene3DPreviewControl : UserControl
         clone.Material.CullMode = selected.Material.CullMode;
         clone.DataContext = DebugWorkbenchTag.Instance;
 
+        var historyBefore = CaptureModelEditStart();
         using (_viewport.Scene.BeginUpdate())
         {
             _viewport.Scene.Add(clone);
@@ -1790,7 +2155,8 @@ public sealed partial class Scene3DPreviewControl : UserControl
 
         RebuildObjectList(clone);
         SelectObject(clone);
-        SetStatus("Duplicated as standalone workbench object.", isError: false);
+        CommitModelEdit("Duplicate " + selected.Name, historyBefore, clone);
+        SetStatus("Duplicated as standalone model-editor object.", isError: false);
     }
 
     private void DeleteOrHideSelectedObject()
@@ -1802,11 +2168,14 @@ public sealed partial class Scene3DPreviewControl : UserControl
             return;
         }
 
+        var historyBefore = CaptureModelEditStart();
+
         if (selected.Parent is not null)
         {
             selected.IsVisible = false;
             LoadInspectorFromSelection();
-            SetStatus("Selected item is a generated part of a composite. It cannot be removed from source-built composite state here, so it was hidden instead.", isError: false);
+            CommitModelEdit("Hide " + selected.Name, historyBefore, selected);
+            SetStatus("Selected item is part of a source-built composite. It was hidden in the visual model instead of deleting source structure.", isError: false);
             return;
         }
 
@@ -1821,7 +2190,8 @@ public sealed partial class Scene3DPreviewControl : UserControl
         _selectedObject = null;
         RebuildObjectList(null);
         ClearInspectorSelection();
-        SetStatus("Removed root object from debug scene.", isError: false);
+        CommitModelEdit("Delete " + selected.Name, historyBefore, null);
+        SetStatus("Removed root object from 3D model editor scene.", isError: false);
     }
 
     private void ClearWorkbenchObjects()
@@ -1833,6 +2203,7 @@ public sealed partial class Scene3DPreviewControl : UserControl
             return;
         }
 
+        var historyBefore = CaptureModelEditStart();
         using (_viewport.Scene.BeginUpdate())
         {
             foreach (var obj in removable)
@@ -1844,7 +2215,8 @@ public sealed partial class Scene3DPreviewControl : UserControl
         _selectedObject = null;
         RebuildObjectList(null);
         ClearInspectorSelection();
-        SetStatus($"Removed {removable.Length} workbench-created object(s).", isError: false);
+        CommitModelEdit("Clear model-editor objects", historyBefore, null);
+        SetStatus($"Removed {removable.Length} model-editor object(s).", isError: false);
     }
 
     private Vector3 ReadWorkbenchSize()
@@ -2199,6 +2571,587 @@ public sealed partial class Scene3DPreviewControl : UserControl
         SetStatus("Diagnostics copied.", isError: false);
     }
 
+    private async Task ExportSourceExperimentalAsync()
+    {
+        var target = _sourceTargetInfo ?? ResolveSourceTarget(_sourcePatchDirectory, _sourceTypeFullName);
+        _sourceTargetInfo = target;
+        if (target is null)
+        {
+            SetStatus("Source class was not found. Use Copy scene code instead.", isError: true);
+            return;
+        }
+
+        var modeText = target.HasBuildMethod
+            ? "partial replacement of the Build(CompositeBuilder3D builder) method"
+            : "insertion of a new Build(CompositeBuilder3D builder) method into the selected class";
+        var confirmed = await ConfirmDestructiveSourceExportAsync(target, modeText);
+        if (!confirmed)
+        {
+            SetStatus("Source export cancelled.", isError: false);
+            return;
+        }
+
+        try
+        {
+            if (_sourceExportHandler is null)
+            {
+                SetStatus("Roslyn source exporter is not configured. Start the debugger through PreviewerApp/VSIX.", isError: true);
+                return;
+            }
+
+            var refreshed = ResolveSourceTarget(Path.GetDirectoryName(target.FilePath), _sourceTypeFullName) ?? target;
+            var request = new DebuggerSourceExportRequest(
+                refreshed.FilePath,
+                refreshed.ClassName,
+                _sourceTypeFullName,
+                refreshed.Line,
+                refreshed.ClassStart,
+                refreshed.HasBuildMethod,
+                BuildGeneratedBuildMethod(refreshed.BuildParameterName ?? "builder", refreshed.Indent),
+                BuildGeneratedClass(refreshed.ClassName, refreshed.Indent),
+                string.Empty);
+
+            var result = await _sourceExportHandler(request);
+            if (!result.Success)
+            {
+                SetStatus(result.Message, isError: true);
+                return;
+            }
+
+            _sourceTargetInfo = ResolveSourceTarget(Path.GetDirectoryName(result.FilePath), _sourceTypeFullName);
+            RefreshSourceEventBindings();
+            RefreshEventHints();
+            _history.MarkClean();
+            UpdateHistoryUi();
+            _sourceTargetBox.Text = $"Updated Build with Roslyn: {result.FilePath}\nBackup: {result.BackupPath}\nMode: {result.Mode}";
+            SetStatus(result.Message, isError: false);
+        }
+        catch (Exception ex)
+        {
+            SetStatus("Roslyn source export failed: " + ex.Message, isError: true);
+        }
+    }
+
+    private async Task<bool> ConfirmDestructiveSourceExportAsync(SourceTargetInfo target, string modeText)
+    {
+        var owner = TopLevel.GetTopLevel(this) as Window;
+        var dialog = new Window
+        {
+            Title = "Update Build from 3DModelEditor",
+            Width = 620d,
+            Height = 360d,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner
+        };
+
+        dialog.Content = new Border
+        {
+            Padding = new Thickness(18d),
+            Child = new StackPanel
+            {
+                Spacing = 12d,
+                Children =
+                {
+                    new TextBlock
+                    {
+                        Text = "3DModelEditor обновит только метод Build(CompositeBuilder3D builder). Остальной код класса, включая существующие обработчики событий, должен быть сохранён.",
+                        TextWrapping = TextWrapping.Wrap,
+                        FontWeight = FontWeight.SemiBold
+                    },
+                    new TextBlock
+                    {
+                        Text = $"Target: {target.FilePath}\nClass: {target.ClassName}\nMode: {modeText}\n\nA backup will be written next to the source file before updating Build(...).",
+                        TextWrapping = TextWrapping.Wrap,
+                        FontFamily = FontFamily.Parse("Consolas"),
+                        FontSize = 12d
+                    },
+                    new StackPanel
+                    {
+                        Orientation = Orientation.Horizontal,
+                        HorizontalAlignment = HorizontalAlignment.Right,
+                        Spacing = 8d,
+                        Children =
+                        {
+                            CreateDialogButton(dialog, "Cancel", false),
+                            CreateDialogButton(dialog, "Update Build only", true)
+                        }
+                    }
+                }
+            }
+        };
+
+        if (owner is not null)
+        {
+            return await dialog.ShowDialog<bool>(owner);
+        }
+
+        dialog.Show();
+        return false;
+
+        static Button CreateDialogButton(Window ownerDialog, string text, bool result)
+        {
+            var button = new Button { Content = text, MinWidth = result ? 190d : 90d };
+            button.Click += (_, _) => ownerDialog.Close(result);
+            return button;
+        }
+    }
+
+
+    private string BuildGeneratedClass(string className, string indent)
+    {
+        var sb = new StringBuilder();
+        sb.Append(indent).Append("public sealed class ").Append(className).Append(" : CompositeObject3D").AppendLine();
+        sb.Append(indent).AppendLine("{");
+        sb.Append(BuildGeneratedBuildMethod("builder", indent + "    "));
+        sb.Append(indent).AppendLine("}");
+        return sb.ToString();
+    }
+
+    private string BuildGeneratedBuildMethod(string builderName, string indent)
+    {
+        var sb = new StringBuilder();
+        sb.Append(indent).AppendLine("protected override void Build(CompositeBuilder3D " + builderName + ")");
+        sb.Append(indent).AppendLine("{");
+        foreach (var line in BuildCompositeBuildBody(builderName).Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+        {
+            sb.Append(indent).Append("    ").AppendLine(line);
+        }
+        sb.Append(indent).AppendLine("}");
+        return sb.ToString();
+    }
+
+    private string BuildCompositeBuildBody(string builderName)
+    {
+        var parts = GetExportObjectsForCompositeBuild().ToArray();
+        if (parts.Length == 0)
+        {
+            return "// No debugger objects were available for export.";
+        }
+
+        var sb = new StringBuilder();
+        for (var i = 0; i < parts.Length; i++)
+        {
+            var obj = parts[i];
+            var variable = "part" + (i + 1).ToString(CultureInfo.InvariantCulture);
+            var name = string.IsNullOrWhiteSpace(obj.Name) ? variable : obj.Name;
+            var construction = BuildPrimitiveConstructionExpression(obj);
+            if (construction.StartsWith("/*", StringComparison.Ordinal))
+            {
+                sb.AppendLine("// Unsupported debugger object: " + obj.GetType().FullName);
+                continue;
+            }
+
+            sb.Append("var ").Append(variable).Append(" = ").Append(builderName).Append(".Add(\"").Append(Escape(name)).Append("\", ").Append(construction).AppendLine(");");
+            AppendEventSubscriptionLines(sb, obj, variable);
+            sb.Append(variable).Append(".At(").Append(FormatFloatCode(obj.Position.X)).Append(", ").Append(FormatFloatCode(obj.Position.Y)).Append(", ").Append(FormatFloatCode(obj.Position.Z)).AppendLine(");");
+            sb.Append(variable).Append(".Rotate(").Append(FormatFloatCode(obj.RotationDegrees.X)).Append(", ").Append(FormatFloatCode(obj.RotationDegrees.Y)).Append(", ").Append(FormatFloatCode(obj.RotationDegrees.Z)).AppendLine(");");
+            sb.Append(variable).Append(".WithScale(new Vector3(").Append(FormatFloatCode(obj.Scale.X)).Append(", ").Append(FormatFloatCode(obj.Scale.Y)).Append(", ").Append(FormatFloatCode(obj.Scale.Z)).AppendLine("));");
+            sb.Append(variable).Append(".Color(new ColorRgba(")
+                .Append(FormatFloatCode(obj.Material.BaseColor.R)).Append(", ")
+                .Append(FormatFloatCode(obj.Material.BaseColor.G)).Append(", ")
+                .Append(FormatFloatCode(obj.Material.BaseColor.B)).Append(", ")
+                .Append(FormatFloatCode(obj.Material.BaseColor.A)).AppendLine("));");
+            sb.Append(variable).Append(".Pickable(").Append(FormatBool(obj.IsPickable)).AppendLine(");");
+            sb.Append(variable).Append(".Visible(").Append(FormatBool(obj.IsVisible)).AppendLine(");");
+            sb.Append(variable).Append(".Manipulation(").Append(FormatBool(obj.IsManipulationEnabled)).AppendLine(");");
+            sb.Append(variable).Append(".Object.Material.Opacity = ").Append(FormatFloatCode(obj.Material.Opacity)).AppendLine(";");
+            sb.Append(variable).Append(".Object.Material.Lighting = LightingMode.").Append(obj.Material.Lighting).AppendLine(";");
+            sb.Append(variable).Append(".Object.Material.Surface = SurfaceMode.").Append(obj.Material.Surface).AppendLine(";");
+            sb.Append(variable).Append(".Object.Material.CullMode = CullMode.").Append(obj.Material.CullMode).AppendLine(";");
+            AppendRigidbodyBuildLines(sb, variable + ".Object", obj.Rigidbody);
+            if (i + 1 < parts.Length)
+            {
+                sb.AppendLine();
+            }
+        }
+
+        return sb.ToString();
+    }
+
+    private void AppendEventSubscriptionLines(StringBuilder sb, Object3D obj, string variable)
+    {
+        foreach (var binding in GetSourceEventBindingsForObject(obj))
+        {
+            sb.Append(variable).Append(".Object.").Append(binding.EventName).Append(" += ").Append(binding.HandlerName).AppendLine(";");
+        }
+    }
+
+    private string BuildGeneratedEventMembers(string indent) => string.Empty;
+
+    private IEnumerable<DebugEventBinding> GetEventBindingsForObject(Object3D obj)
+    {
+        // Kept for binary/source compatibility with older preview code paths.
+        return Array.Empty<DebugEventBinding>();
+    }
+
+    private static string BuildEventHandlerSource(Object3D obj, string eventName, string handlerName, string body, string indent)
+    {
+        var sb = new StringBuilder();
+        sb.Append(indent).Append("private void ").Append(handlerName).AppendLine("(object? sender, ScenePointerEventArgs e)");
+        sb.Append(indent).AppendLine("{");
+        var normalized = string.IsNullOrWhiteSpace(body) ? DefaultEventBody(eventName) : body.Replace("\r\n", "\n").Replace('\r', '\n');
+        foreach (var line in normalized.Split('\n'))
+        {
+            sb.Append(indent).Append("    ").AppendLine(line);
+        }
+        sb.Append(indent).AppendLine("}");
+        return sb.ToString();
+    }
+
+    private static string ResolveEventHandlerName(string variable, string eventName)
+        => "On" + ToPascalIdentifier(variable) + ToPascalIdentifier(eventName);
+
+    private static string ToPascalIdentifier(string value)
+    {
+        var sb = new StringBuilder();
+        var capitalize = true;
+        foreach (var ch in value)
+        {
+            if (!char.IsLetterOrDigit(ch))
+            {
+                capitalize = true;
+                continue;
+            }
+
+            sb.Append(capitalize ? char.ToUpperInvariant(ch) : ch);
+            capitalize = false;
+        }
+
+        return sb.Length == 0 ? "Generated" : sb.ToString();
+    }
+
+    private IEnumerable<Object3D> GetExportObjectsForCompositeBuild()
+    {
+        var workbench = _viewport.Scene.Objects
+            .Where(o => ReferenceEquals(o.DataContext, DebugWorkbenchTag.Instance))
+            .ToArray();
+        if (workbench.Length > 0)
+        {
+            return workbench;
+        }
+
+        var targetRoot = FindTargetCompositeRoot();
+        if (targetRoot is not null)
+        {
+            return targetRoot.Children.Where(o => !ReferenceEquals(o.DataContext, DebugGuideTag.Instance));
+        }
+
+        if (_selectedObject is not null && !ReferenceEquals(_selectedObject.DataContext, DebugGuideTag.Instance))
+        {
+            return new[] { _selectedObject };
+        }
+
+        return _viewport.Scene.Objects.Where(o => !ReferenceEquals(o.DataContext, DebugGuideTag.Instance));
+    }
+
+    private CompositeObject3D? FindTargetCompositeRoot()
+    {
+        if (string.IsNullOrWhiteSpace(_sourceTypeFullName))
+        {
+            return _viewport.Scene.Objects.OfType<CompositeObject3D>().FirstOrDefault();
+        }
+
+        var fullName = _sourceTypeFullName.Replace('+', '.');
+        var shortName = fullName.Split('.').LastOrDefault() ?? fullName;
+        foreach (var obj in _viewport.Scene.Objects.OfType<CompositeObject3D>())
+        {
+            var type = obj.GetType();
+            var candidateFull = (type.FullName ?? type.Name).Replace('+', '.');
+            if (string.Equals(candidateFull, fullName, StringComparison.Ordinal) || string.Equals(type.Name, shortName, StringComparison.Ordinal))
+            {
+                return obj;
+            }
+        }
+
+        return _viewport.Scene.Objects.OfType<CompositeObject3D>().FirstOrDefault();
+    }
+
+    private string BuildSceneWorkbenchSnippet()
+    {
+        var roots = _viewport.Scene.Objects
+            .Where(o => ReferenceEquals(o.DataContext, DebugWorkbenchTag.Instance))
+            .ToArray();
+        if (roots.Length == 0 && _selectedObject is not null)
+        {
+            roots = new[] { _selectedObject };
+        }
+
+        if (roots.Length == 0)
+        {
+            return "// No workbench-created or selected object to export.";
+        }
+
+        var sb = new StringBuilder();
+        for (var i = 0; i < roots.Length; i++)
+        {
+            var variable = "obj" + (i + 1).ToString(CultureInfo.InvariantCulture);
+            sb.AppendLine(BuildObjectConstructionSnippet(roots[i], variable));
+        }
+
+        return sb.ToString();
+    }
+
+    private string BuildDiagnosticsText()
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("3DEngine Debugger diagnostics");
+        sb.AppendLine(_sceneSummaryText.Text ?? string.Empty);
+        sb.AppendLine();
+        sb.AppendLine("Selected:");
+        sb.AppendLine(_selectionDetailsText.Text ?? "none");
+        sb.AppendLine();
+        sb.AppendLine("Objects:");
+        foreach (var entry in _listedObjects)
+        {
+            sb.AppendLine(entry.Path + " | " + entry.Object.GetType().FullName + " | visible=" + entry.Object.IsVisible);
+        }
+
+        return sb.ToString();
+    }
+
+    private static IEnumerable<Object3D> EnumerateObjects(Scene3D scene)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var root in scene.Objects)
+        {
+            foreach (var obj in EnumerateObject(root, seen))
+            {
+                yield return obj;
+            }
+        }
+    }
+
+    private static IEnumerable<Object3D> EnumerateObject(Object3D root, HashSet<string> seen)
+    {
+        if (!seen.Add(root.Id))
+        {
+            yield break;
+        }
+
+        yield return root;
+        if (root is CompositeObject3D composite)
+        {
+            foreach (var child in composite.Children)
+            {
+                foreach (var nested in EnumerateObject(child, seen))
+                {
+                    yield return nested;
+                }
+            }
+        }
+    }
+
+    private static string? ResolveSourcePatchDirectory(string? assemblyPath, string? projectPath)
+    {
+        if (!string.IsNullOrWhiteSpace(projectPath))
+        {
+            var fullProjectPath = Path.GetFullPath(projectPath);
+            if (File.Exists(fullProjectPath))
+            {
+                return Path.GetDirectoryName(fullProjectPath);
+            }
+
+            if (Directory.Exists(fullProjectPath))
+            {
+                return fullProjectPath;
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(assemblyPath))
+        {
+            return null;
+        }
+
+        var dir = new DirectoryInfo(Path.GetDirectoryName(assemblyPath) ?? global::System.Environment.CurrentDirectory);
+        for (var current = dir; current is not null; current = current.Parent)
+        {
+            if (current.GetFiles("*.csproj").Length > 0)
+            {
+                return current.FullName;
+            }
+
+            if (current.Name.Equals("bin", StringComparison.OrdinalIgnoreCase) && current.Parent is not null)
+            {
+                return current.Parent.FullName;
+            }
+        }
+
+        return dir.FullName;
+    }
+
+    private static SourceTargetInfo? ResolveSourceTarget(string? searchRoot, string? typeFullName)
+    {
+        if (string.IsNullOrWhiteSpace(searchRoot) || string.IsNullOrWhiteSpace(typeFullName) || !Directory.Exists(searchRoot))
+        {
+            return null;
+        }
+
+        var normalized = typeFullName.Trim().Replace('+', '.');
+        var className = normalized.Split('.').LastOrDefault();
+        if (string.IsNullOrWhiteSpace(className))
+        {
+            return null;
+        }
+
+        var files = Directory.EnumerateFiles(searchRoot, "*.cs", SearchOption.AllDirectories)
+            .Where(path => !path.Contains(Path.DirectorySeparatorChar + "bin" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            .Where(path => !path.Contains(Path.DirectorySeparatorChar + "obj" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            .Where(path => !Path.GetFileName(path).EndsWith(".g.cs", StringComparison.OrdinalIgnoreCase))
+            .Where(path => !Path.GetFileName(path).EndsWith(".Designer.cs", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(path => Path.GetFileName(path).Equals(className + ".cs", StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+            .ThenBy(path => path, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var file in files)
+        {
+            SourceTargetInfo? info = null;
+            try
+            {
+                var text = File.ReadAllText(file);
+                info = TryResolveSourceTargetInFile(file, text, className);
+            }
+            catch
+            {
+                // Ignore unreadable source candidates.
+            }
+
+            if (info is not null)
+            {
+                return info;
+            }
+        }
+
+        return null;
+    }
+
+    private static SourceTargetInfo? TryResolveSourceTargetInFile(string filePath, string source, string className)
+    {
+        var classPattern = @"\b(?:public|internal|private|protected|sealed|abstract|partial|static|new|unsafe|record|\s)+class\s+" + Regex.Escape(className) + @"\b|\bclass\s+" + Regex.Escape(className) + @"\b";
+        foreach (Match match in Regex.Matches(source, classPattern, RegexOptions.Multiline))
+        {
+            var openBrace = source.IndexOf('{', match.Index + match.Length);
+            if (openBrace < 0)
+            {
+                continue;
+            }
+
+            var closeBrace = FindMatchingBrace(source, openBrace);
+            if (closeBrace < 0)
+            {
+                continue;
+            }
+
+            var method = TryFindBuildMethod(source, openBrace, closeBrace);
+            var indent = GetLineIndent(source, match.Index);
+            var line = CountLineNumber(source, match.Index);
+            return new SourceTargetInfo(filePath, className, match.Index, closeBrace, openBrace, closeBrace, indent, line, method.Start, method.End, method.ParameterName);
+        }
+
+        return null;
+    }
+
+    private static (int Start, int End, string? ParameterName) TryFindBuildMethod(string source, int classOpenBrace, int classCloseBrace)
+    {
+        var classBodyStart = classOpenBrace + 1;
+        var classBody = source.Substring(classBodyStart, global::System.Math.Max(0, classCloseBrace - classBodyStart));
+        var regex = new Regex(@"\bprotected\s+override\s+void\s+Build\s*\(\s*(?:global::ThreeDEngine\.Core\.Scene\.)?CompositeBuilder3D\s+(?<param>[A-Za-z_][A-Za-z0-9_]*)\s*\)", RegexOptions.Multiline);
+        var match = regex.Match(classBody);
+        if (!match.Success)
+        {
+            return (-1, -1, null);
+        }
+
+        var absoluteMethodStart = classBodyStart + match.Index;
+        var openBrace = source.IndexOf('{', absoluteMethodStart + match.Length);
+        if (openBrace < 0 || openBrace > classCloseBrace)
+        {
+            return (-1, -1, null);
+        }
+
+        var closeBrace = FindMatchingBrace(source, openBrace);
+        if (closeBrace < 0 || closeBrace > classCloseBrace)
+        {
+            return (-1, -1, null);
+        }
+
+        return (absoluteMethodStart, closeBrace, match.Groups["param"].Value);
+    }
+
+    private static int FindMatchingBrace(string source, int openBraceIndex)
+    {
+        var depth = 0;
+        var inString = false;
+        var inChar = false;
+        var inLineComment = false;
+        var inBlockComment = false;
+        for (var i = openBraceIndex; i < source.Length; i++)
+        {
+            var ch = source[i];
+            var next = i + 1 < source.Length ? source[i + 1] : '\0';
+            if (inLineComment)
+            {
+                if (ch is '\r' or '\n') inLineComment = false;
+                continue;
+            }
+
+            if (inBlockComment)
+            {
+                if (ch == '*' && next == '/') { inBlockComment = false; i++; }
+                continue;
+            }
+
+            if (inString)
+            {
+                if (ch == '\\') { i++; continue; }
+                if (ch == '"') inString = false;
+                continue;
+            }
+
+            if (inChar)
+            {
+                if (ch == '\\') { i++; continue; }
+                if (ch == '\'') inChar = false;
+                continue;
+            }
+
+            if (ch == '/' && next == '/') { inLineComment = true; i++; continue; }
+            if (ch == '/' && next == '*') { inBlockComment = true; i++; continue; }
+            if (ch == '"') { inString = true; continue; }
+            if (ch == '\'') { inChar = true; continue; }
+            if (ch == '{') depth++;
+            else if (ch == '}')
+            {
+                depth--;
+                if (depth == 0) return i;
+            }
+        }
+
+        return -1;
+    }
+
+    private static string GetLineIndent(string source, int index)
+    {
+        var lineStart = source.LastIndexOf('\n', global::System.Math.Max(0, index - 1));
+        lineStart = lineStart < 0 ? 0 : lineStart + 1;
+        var i = lineStart;
+        while (i < source.Length && char.IsWhiteSpace(source[i]) && source[i] is not '\r' and not '\n')
+        {
+            i++;
+        }
+
+        return source[lineStart..i];
+    }
+
+    private static int CountLineNumber(string source, int index)
+    {
+        var line = 1;
+        var limit = System.Math.Clamp(index, 0, source.Length);
+        for (var i = 0; i < limit; i++)
+        {
+            if (source[i] == '\n') line++;
+        }
+
+        return line;
+    }
+
     private void UpdateSpaceGuides()
     {
         if (_spaceGuidesUpdating)
@@ -2407,6 +3360,349 @@ public sealed partial class Scene3DPreviewControl : UserControl
         SetStatus("Camera framed selected object.", isError: false);
     }
 
+    private void UpdateSnippet(Object3D obj)
+    {
+        _snippetBox.Text = BuildSnippet(obj);
+    }
+
+    private string BuildSnippet(Object3D obj)
+    {
+        var variableName = obj.Parent is null ? "obj" : "part";
+        var body = BuildObjectConstructionSnippet(obj, variableName, declareAndAdd: obj.Parent is null);
+        if (obj.Parent is not null)
+        {
+            var path = _listedObjects.FirstOrDefault(e => ReferenceEquals(e.Object, obj))?.Path ?? obj.Name;
+            var partName = path.Split('/').LastOrDefault() ?? obj.Name;
+            return
+                $"var part = root.FindPart(\"{Escape(partName)}\");\n" +
+                "if (part is not null)\n{\n" +
+                body +
+                "}";
+        }
+
+        return body;
+    }
+
+    private string BuildObjectConstructionSnippet(Object3D obj, string variable, bool declareAndAdd = true)
+    {
+        var construction = BuildPrimitiveConstructionExpression(obj);
+        if (declareAndAdd && construction.StartsWith("/*", StringComparison.Ordinal))
+        {
+            return $"// Construction export is not supported for {obj.GetType().FullName}. Create this object in source manually, then copy the property block from the inspector.\n";
+        }
+
+        var prefix = declareAndAdd
+            ? $"var {variable} = {construction};\nscene.Add({variable});\n"
+            : string.Empty;
+
+        return
+            prefix +
+            $"{variable}.Name = \"{Escape(obj.Name)}\";\n" +
+            $"{variable}.IsVisible = {FormatBool(obj.IsVisible)};\n" +
+            $"{variable}.IsPickable = {FormatBool(obj.IsPickable)};\n" +
+            $"{variable}.IsManipulationEnabled = {FormatBool(obj.IsManipulationEnabled)};\n" +
+            $"{variable}.Position = new Vector3({FormatFloatCode(obj.Position.X)}, {FormatFloatCode(obj.Position.Y)}, {FormatFloatCode(obj.Position.Z)});\n" +
+            $"{variable}.RotationDegrees = new Vector3({FormatFloatCode(obj.RotationDegrees.X)}, {FormatFloatCode(obj.RotationDegrees.Y)}, {FormatFloatCode(obj.RotationDegrees.Z)});\n" +
+            $"{variable}.Scale = new Vector3({FormatFloatCode(obj.Scale.X)}, {FormatFloatCode(obj.Scale.Y)}, {FormatFloatCode(obj.Scale.Z)});\n" +
+            $"{variable}.Material.BaseColor = new ColorRgba({FormatFloatCode(obj.Material.BaseColor.R)}, {FormatFloatCode(obj.Material.BaseColor.G)}, {FormatFloatCode(obj.Material.BaseColor.B)}, {FormatFloatCode(obj.Material.BaseColor.A)});\n" +
+            $"{variable}.Material.Opacity = {FormatFloatCode(obj.Material.Opacity)};\n" +
+            $"{variable}.Material.Lighting = LightingMode.{obj.Material.Lighting};\n" +
+            $"{variable}.Material.Surface = SurfaceMode.{obj.Material.Surface};\n" +
+            $"{variable}.Material.CullMode = CullMode.{obj.Material.CullMode};\n" +
+            BuildRigidbodySnippet(variable, obj.Rigidbody);
+    }
+
+    private static void AppendRigidbodyBuildLines(StringBuilder sb, string targetExpression, Rigidbody3D? body)
+    {
+        if (body is null)
+        {
+            return;
+        }
+
+        sb.Append(targetExpression).Append(".Rigidbody = new Rigidbody3D { Mass = ").Append(FormatFloatCode(body.Mass))
+            .Append(", IsKinematic = ").Append(FormatBool(body.IsKinematic))
+            .Append(", UseGravity = ").Append(FormatBool(body.UseGravity))
+            .Append(", Friction = ").Append(FormatFloatCode(body.Friction))
+            .Append(", Restitution = ").Append(FormatFloatCode(body.Restitution))
+            .AppendLine(" };");
+    }
+
+    private static string BuildRigidbodySnippet(string variable, Rigidbody3D? body)
+    {
+        if (body is null)
+        {
+            return string.Empty;
+        }
+
+        return $"{variable}.Rigidbody = new Rigidbody3D {{ Mass = {FormatFloatCode(body.Mass)}, IsKinematic = {FormatBool(body.IsKinematic)}, UseGravity = {FormatBool(body.UseGravity)}, Friction = {FormatFloatCode(body.Friction)}, Restitution = {FormatFloatCode(body.Restitution)} }};\n";
+    }
+
+    private static string BuildPrimitiveConstructionExpression(Object3D obj)
+    {
+        return obj switch
+        {
+            Box3D box => $"new Box3D {{ Width = {FormatFloatCode(box.Width)}, Height = {FormatFloatCode(box.Height)}, Depth = {FormatFloatCode(box.Depth)} }}",
+            Rectangle3D rect => $"new Box3D {{ Width = {FormatFloatCode(rect.Width)}, Height = {FormatFloatCode(rect.Height)}, Depth = {FormatFloatCode(rect.Depth)} }}",
+            Sphere3D sphere => $"new Sphere3D {{ Radius = {FormatFloatCode(sphere.Radius)}, Segments = {sphere.Segments}, Rings = {sphere.Rings} }}",
+            Cylinder3D cylinder => $"new Cylinder3D {{ Radius = {FormatFloatCode(cylinder.Radius)}, Height = {FormatFloatCode(cylinder.Height)}, Segments = {cylinder.Segments} }}",
+            Cone3D cone => $"new Cone3D {{ Radius = {FormatFloatCode(cone.Radius)}, Height = {FormatFloatCode(cone.Height)}, Segments = {cone.Segments} }}",
+            Plane3D plane => $"new Plane3D {{ Width = {FormatFloatCode(plane.Width)}, Height = {FormatFloatCode(plane.Height)}, SegmentsX = {plane.SegmentsX}, SegmentsY = {plane.SegmentsY} }}",
+            Ellipse3D ellipse => $"new Ellipse3D {{ Width = {FormatFloatCode(ellipse.Width)}, Height = {FormatFloatCode(ellipse.Height)}, Depth = {FormatFloatCode(ellipse.Depth)}, Segments = {ellipse.Segments} }}",
+            _ => "/* Unsupported construction: create this type in source code, then apply the property block below. */"
+        };
+    }
+
+    private static Border ToolPanel(params Control[] children)
+    {
+        var stack = new StackPanel
+        {
+            Spacing = 4d,
+            HorizontalAlignment = HorizontalAlignment.Stretch
+        };
+        foreach (var child in children)
+        {
+            child.HorizontalAlignment = HorizontalAlignment.Stretch;
+            stack.Children.Add(child);
+        }
+
+        return new Border
+        {
+            Padding = new Thickness(6d),
+            CornerRadius = new CornerRadius(3d),
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            Background = new SolidColorBrush(Color.FromArgb(24, 255, 255, 255)),
+            Child = stack
+        };
+    }
+
+    private static Expander CollapsibleSection(string title, bool expanded, params Control[] children)
+    {
+        var stack = new StackPanel
+        {
+            Spacing = 5d,
+            Margin = new Thickness(0d, 4d, 0d, 2d),
+            HorizontalAlignment = HorizontalAlignment.Stretch
+        };
+        foreach (var child in children)
+        {
+            child.HorizontalAlignment = HorizontalAlignment.Stretch;
+            stack.Children.Add(child);
+        }
+
+        return new Expander
+        {
+            Header = new TextBlock { Text = title, FontWeight = FontWeight.SemiBold, FontSize = 12d },
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            HorizontalContentAlignment = HorizontalAlignment.Stretch,
+            IsExpanded = expanded,
+            Content = stack
+        };
+    }
+
+    private static TextBlock SectionTitle(string text) => new()
+    {
+        Text = text,
+        FontWeight = FontWeight.SemiBold,
+        Margin = new Thickness(0d, 6d, 0d, 0d),
+        FontSize = 12d
+    };
+
+    private static Control LabeledEditor(string label, Control editor)
+    {
+        editor.HorizontalAlignment = HorizontalAlignment.Stretch;
+        return new Grid
+        {
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            ColumnDefinitions = new ColumnDefinitions("92,*"),
+            Children =
+            {
+                new TextBlock { Text = label, VerticalAlignment = VerticalAlignment.Center, TextWrapping = TextWrapping.NoWrap },
+                PlaceInColumn(editor, 1)
+            }
+        };
+    }
+
+    private static Control VectorRow(string label, params TextBox[] boxes)
+    {
+        var grid = new Grid
+        {
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            ColumnDefinitions = new ColumnDefinitions("92,*")
+        };
+        grid.Children.Add(new TextBlock { Text = label, VerticalAlignment = VerticalAlignment.Center, TextWrapping = TextWrapping.NoWrap });
+        var row = new Grid
+        {
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            ColumnDefinitions = new ColumnDefinitions(string.Join(",", Enumerable.Repeat("*", global::System.Math.Max(1, boxes.Length))))
+        };
+        for (var i = 0; i < boxes.Length; i++)
+        {
+            var box = boxes[i];
+            box.Width = double.NaN;
+            box.MinWidth = 0d;
+            box.HorizontalAlignment = HorizontalAlignment.Stretch;
+            box.Margin = new Thickness(i == 0 ? 0d : 4d, 0d, 0d, 0d);
+            Grid.SetColumn(box, i);
+            row.Children.Add(box);
+        }
+
+        Grid.SetColumn(row, 1);
+        grid.Children.Add(row);
+        return grid;
+    }
+
+    private static Control PlaceInColumn(Control control, int column)
+    {
+        Grid.SetColumn(control, column);
+        return control;
+    }
+
+    private TextBox CreateSceneBox(string watermark)
+    {
+        var box = new TextBox
+        {
+            Watermark = watermark,
+            MinWidth = 0d,
+            Height = 24d,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            FontSize = 12d
+        };
+        box.KeyDown += (sender, e) =>
+        {
+            if (e.Key == Key.Enter)
+            {
+                ApplySceneSettingsFromControls();
+                e.Handled = true;
+            }
+        };
+        return box;
+    }
+
+    private static TextBox CreateWorkbenchBox(string watermark) => new()
+    {
+        Watermark = watermark,
+        MinWidth = 0d,
+        Height = 24d,
+        HorizontalAlignment = HorizontalAlignment.Stretch,
+        FontSize = 12d
+    };
+
+    private TextBox CreateEditorBox(string watermark)
+    {
+        var box = new TextBox
+        {
+            Watermark = watermark,
+            MinWidth = 0d,
+            Height = 24d,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            FontSize = 12d
+        };
+        box.TextChanged += OnEditorChanged;
+        box.LostFocus += OnEditorChanged;
+        box.KeyDown += OnEditorKeyDown;
+        return box;
+    }
+
+    private CheckBox CreateEditorCheckBox(string label)
+    {
+        var checkBox = new CheckBox { Content = label, FontSize = 12d };
+        checkBox.Click += OnEditorChanged;
+        return checkBox;
+    }
+
+    private ComboBox CreateEnumBox<TEnum>() where TEnum : struct, Enum
+    {
+        var combo = new ComboBox
+        {
+            ItemsSource = Enum.GetValues<TEnum>(),
+            Height = 24d,
+            HorizontalAlignment = HorizontalAlignment.Stretch
+        };
+        combo.SelectionChanged += OnEditorChanged;
+        return combo;
+    }
+
+    private static void SetVector(TextBox x, TextBox y, TextBox z, Vector3 value)
+    {
+        x.Text = FormatFloat(value.X);
+        y.Text = FormatFloat(value.Y);
+        z.Text = FormatFloat(value.Z);
+    }
+
+    private static bool TryReadVector(TextBox x, TextBox y, TextBox z, out Vector3 value)
+    {
+        value = default;
+        if (!TryReadFloat(x.Text, out var vx) || !TryReadFloat(y.Text, out var vy) || !TryReadFloat(z.Text, out var vz))
+        {
+            return false;
+        }
+
+        value = new Vector3(vx, vy, vz);
+        return true;
+    }
+
+    private bool TryReadColor(out ColorRgba color)
+    {
+        color = ColorRgba.White;
+        if (!TryReadFloat(_colorRBox.Text, out var r) ||
+            !TryReadFloat(_colorGBox.Text, out var g) ||
+            !TryReadFloat(_colorBBox.Text, out var b) ||
+            !TryReadFloat(_colorABox.Text, out var a))
+        {
+            return false;
+        }
+
+        color = new ColorRgba(Clamp01(r), Clamp01(g), Clamp01(b), Clamp01(a));
+        return true;
+    }
+
+    private static bool TryReadFloat(string? text, out float value)
+    {
+        value = 0f;
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        var normalized = text.Trim().Replace(',', '.');
+        return float.TryParse(normalized, NumberStyles.Float, CultureInfo.InvariantCulture, out value) && !float.IsNaN(value) && !float.IsInfinity(value);
+    }
+
+    private static bool TryReadInt(string? text, out int value)
+    {
+        value = 0;
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        var normalized = text.Trim();
+        return int.TryParse(normalized, NumberStyles.Integer, CultureInfo.InvariantCulture, out value);
+    }
+
+    private static float Clamp01(float value) => System.Math.Clamp(value, 0f, 1f);
+
+    private void SetStatus(string message, bool isError)
+    {
+        _statusText.Text = message;
+        _statusText.Foreground = isError
+            ? new SolidColorBrush(Color.FromRgb(255, 145, 145))
+            : new SolidColorBrush(Color.FromRgb(178, 204, 255));
+    }
+
+    private static string FormatVector(Vector3 value)
+        => $"({FormatFloat(value.X)}, {FormatFloat(value.Y)}, {FormatFloat(value.Z)})";
+
+    private static string FormatFloat(float value)
+        => value.ToString("0.###", CultureInfo.InvariantCulture);
+
+    private static string FormatFloatCode(float value)
+        => value.ToString("0.######", CultureInfo.InvariantCulture) + "f";
+
+    private static string FormatBool(bool value) => value ? "true" : "false";
+
+    private static string Escape(string value) => value.Replace("\\", "\\\\").Replace("\"", "\\\"");
+
     private readonly record struct DebugVisualState(bool IsVisible, ColorRgba BaseColor, float Opacity);
 
     private sealed class DebugWorkbenchTag
@@ -2451,6 +3747,8 @@ public sealed partial class Scene3DPreviewControl : UserControl
         public string? BuildParameterName { get; }
         public bool HasBuildMethod => BuildMethodStart >= 0 && BuildMethodEnd >= BuildMethodStart;
     }
+
+    private readonly record struct SourceEventBinding(string ObjectName, string EventName, string HandlerName);
 
     private sealed class PreviewObjectEntry
     {

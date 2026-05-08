@@ -12,7 +12,7 @@ public sealed class CollisionWorld3D
         var hasHit = false;
         var bestDistance = float.MaxValue;
         var candidates = scene.Registry.ColliderIndex.QueryRay(ray);
-        var objects = candidates.Count == 0 ? scene.Registry.Colliders : candidates;
+        var objects = candidates.Count == 0 ? scene.Registry.SnapshotColliders() : candidates;
 
         foreach (var obj in objects)
         {
@@ -33,7 +33,7 @@ public sealed class CollisionWorld3D
     {
         var hits = new List<RaycastHit3D>();
         var candidates = scene.Registry.ColliderIndex.QueryRay(ray);
-        var objects = candidates.Count == 0 ? scene.Registry.Colliders : candidates;
+        var objects = candidates.Count == 0 ? scene.Registry.SnapshotColliders() : candidates;
         foreach (var obj in objects)
         {
             if (obj.Collider is not null && obj.Collider.Raycast(obj, ray, out var hit))

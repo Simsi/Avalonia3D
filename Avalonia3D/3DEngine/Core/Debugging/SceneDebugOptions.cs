@@ -10,6 +10,9 @@ public sealed class SceneDebugOptions
     private bool _showAxes;
     private bool _showGrid;
     private bool _showPickingRay;
+    private bool _showWireframeOverlay;
+    private bool _showSilhouetteOverlay;
+    private bool _showSurfaceNormals;
 
     public event EventHandler? Changed;
 
@@ -19,6 +22,9 @@ public sealed class SceneDebugOptions
     public bool ShowAxes { get => _showAxes; set => Set(ref _showAxes, value); }
     public bool ShowGrid { get => _showGrid; set => Set(ref _showGrid, value); }
     public bool ShowPickingRay { get => _showPickingRay; set => Set(ref _showPickingRay, value); }
+    public bool ShowWireframeOverlay { get => _showWireframeOverlay; set => Set(ref _showWireframeOverlay, value); }
+    public bool ShowSilhouetteOverlay { get => _showSilhouetteOverlay; set => Set(ref _showSilhouetteOverlay, value); }
+    public bool ShowSurfaceNormals { get => _showSurfaceNormals; set => Set(ref _showSurfaceNormals, value); }
 
     private void Set(ref bool field, bool value)
     {

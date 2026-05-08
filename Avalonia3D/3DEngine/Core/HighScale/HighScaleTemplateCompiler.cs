@@ -81,7 +81,7 @@ public static class HighScaleTemplateCompiler
         for (var partIndex = 0; partIndex < parts.Count; partIndex++)
         {
             var part = parts[partIndex];
-            if (part.LightingMode == LightingMode.Lambert) lighting = LightingMode.Lambert;
+            if ((int)part.LightingMode > (int)lighting) lighting = part.LightingMode;
 
             var mesh = part.Mesh;
             var local = part.LocalTransform;

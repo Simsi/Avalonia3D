@@ -1,5 +1,6 @@
 using System;
 using System.Numerics;
+using ThreeDEngine.Core.Math;
 
 namespace ThreeDEngine.Core.Transforms;
 
@@ -68,6 +69,11 @@ public sealed class Transform3D
     {
         var radians = eulerDegrees * (MathF.PI / 180f);
         LocalRotation = Quaternion.CreateFromYawPitchRoll(radians.Y, radians.X, radians.Z);
+    }
+
+    public Vector3 ToEulerDegrees()
+    {
+        return LocalRotation.ToEulerDegrees();
     }
 
     private void Invalidate()

@@ -3,10 +3,16 @@ using System.Collections.Generic;
 using System.Numerics;
 using ThreeDEngine.Avalonia.Controls;
 using ThreeDEngine.Core.Culling;
+using ThreeDEngine.Core.Environment;
 using ThreeDEngine.Core.HighScale;
+using ThreeDEngine.Core.Instancing;
+using ThreeDEngine.Core.Particles;
 using ThreeDEngine.Core.Materials;
 using ThreeDEngine.Core.Primitives;
+using ThreeDEngine.Core.Lighting;
 using ThreeDEngine.Core.Rendering;
+using ThreeDEngine.Core.Rendering.Shadows;
+using ThreeDEngine.Core.Rendering.Pipeline;
 using ThreeDEngine.Core.Scene;
 
 namespace ThreeDEngine.Avalonia.WebGL.Rendering;
@@ -31,7 +37,27 @@ internal static class WebGlScenePacketBuilder
 
         foreach (var obj in scene.Registry.Renderables)
         {
+            if (stats is not null && obj is ParticleSystem3D particles)
+            {
+                stats.ParticleSystemCount++;
+                stats.ParticleCount += particles.AliveCount;
+            }
+            if (stats is not null && obj is InstancedMesh3D instancedMesh)
+            {
+                stats.InstancedMeshLayerCount++;
+                stats.InstancedMeshInstanceCount += instancedMesh.Instances.Count;
+            }
+            if (obj is ParticleSystem3D particleSystem)
+            {
+                particleSystem.SetBillboardBasis(scene.Camera.Right, scene.Camera.SafeUp, scene.Camera.Forward);
+            }
             var mesh = obj.GetMesh();
+            if (stats is not null && obj is ParticleSystem3D)
+            {
+                stats.ParticleVertexCount += mesh.Positions.Length;
+                stats.ParticleMeshUploadBytes += mesh.RenderGeometry.EstimatedUploadBytes;
+                stats.ThroughputFallbackDrawCount++;
+            }
             var model = obj.GetModelMatrix();
             if (!FrustumCuller3D.IntersectsLocalBounds(mesh.LocalBounds, model, viewProjection))
             {
@@ -47,12 +73,23 @@ internal static class WebGlScenePacketBuilder
             }
 
             var color = ApplyDistanceAlpha(ResolveColor(obj), distanceAlpha);
-            var lighting = obj.Material.Lighting == LightingMode.Lambert ? 1f : 0f;
-            var batch = GetBatch(batchMap, mesh.ResourceKey, lighting);
+            var material = obj.Material;
+            var lighting = ToLightingUniform(material.Lighting);
+            var normalMapStrength = material.HasNormalMap ? material.NormalMapStrength : 0f;
+            var baseColorTextureId = material.HasBaseColorTexture ? material.BaseColorTextureKey : null;
+            var normalTextureId = material.HasNormalMap ? material.NormalMapTextureKey : null;
+            var metallicRoughnessTextureId = material.HasMetallicRoughnessTexture ? material.MetallicRoughnessTextureKey : null;
+            var emissiveTextureId = material.HasEmissiveTexture ? material.EmissiveTextureKey : null;
+            AddLiveTexture(liveTextureIds, baseColorTextureId);
+            AddLiveTexture(liveTextureIds, normalTextureId);
+            AddLiveTexture(liveTextureIds, metallicRoughnessTextureId);
+            AddLiveTexture(liveTextureIds, emissiveTextureId);
+            var batch = GetBatch(batchMap, mesh.ResourceKey, lighting, normalMapStrength, baseColorTextureId, normalTextureId, metallicRoughnessTextureId, emissiveTextureId, material.Metallic, material.Roughness, material.Surface == SurfaceMode.Transparent ? 0f : material.AlphaCutoff, material.EmissiveColor);
             AddInstance(batch, model, color);
             if (stats is not null)
             {
                 stats.VisibleMeshCount++;
+                if (obj.Material.HasNormalMap) stats.NormalMappedMeshCount++;
                 stats.TriangleCount += mesh.Indices.Length / 3;
             }
         }
@@ -110,8 +147,8 @@ internal static class WebGlScenePacketBuilder
                     {
                         var part = parts[p];
                         var model = part.LocalTransform * record.Transform;
-                        var lighting = part.LightingMode == LightingMode.Lambert ? 1f : 0f;
-                        var batch = GetBatch(batchMap, part.Mesh.ResourceKey, lighting);
+                        var lighting = ToLightingUniform(part.LightingMode);
+                        var batch = GetBatch(batchMap, part.Mesh.ResourceKey, lighting, 0f, null, null, null, null, 0f, 1f, 0.5f, ColorRgba.Transparent);
                         var color = ApplyDistanceAlpha(layer.ResolveColor(part, record), layer.LodPolicy.ResolveFadeAlpha(scene.Camera.Position, record.Transform));
                         if (color.A <= 0.001f) continue;
                         AddInstance(batch, model, color);
@@ -138,6 +175,8 @@ internal static class WebGlScenePacketBuilder
 
             var corners = ControlPlaneGeometry.GetWorldCorners(plane, scene.Camera);
             var vertices = new float[20];
+            // Keep the same UV convention as OpenGL: ControlPlaneGeometry returns
+            // corners in top-left, top-right, bottom-right, bottom-left order.
             WriteControlVertex(vertices, 0, corners[0], 0f, 0f);
             WriteControlVertex(vertices, 5, corners[1], 1f, 0f);
             WriteControlVertex(vertices, 10, corners[2], 1f, 1f);
@@ -155,6 +194,13 @@ internal static class WebGlScenePacketBuilder
 
         controls.Sort((a, b) => b.AverageDepth.CompareTo(a.AverageDepth));
         var light = ResolveLight(scene);
+        var shadow = DirectionalShadowResolver3D.Resolve(scene);
+        var skybox = scene.Environment.Skybox;
+        var skyboxTextureId = skybox.HasEquirectangularTexture ? skybox.EquirectangularTextureKey : null;
+        var skyboxCubemapTextureIds = BuildCubemapTextureIds(skybox);
+        AddLiveTexture(liveTextureIds, skyboxTextureId);
+        for (var i = 0; i < skyboxCubemapTextureIds.Length; i++) AddLiveTexture(liveTextureIds, skyboxCubemapTextureIds[i]);
+        var pipeline = RenderPipelinePlanner3D.Plan(scene, BackendKind.WebGlBrowser);
         var batches = new List<WebGlMeshBatchPacket>(batchMap.Values);
         if (stats is not null)
         {
@@ -162,6 +208,15 @@ internal static class WebGlScenePacketBuilder
             stats.EstimatedDrawCallCount = stats.DrawCallCount;
             stats.InstancedBatchCount = batches.Count + (retainedHighScaleBatches?.Count ?? 0);
             stats.ControlPlaneCount = controls.Count;
+            stats.DirectionalLightCount = scene.Lights.Count;
+            stats.PointLightCount = scene.PointLights.Count;
+            stats.SpotLightCount = scene.SpotLights.Count;
+            stats.SkyboxEnabled = skybox.Mode != SkyboxMode3D.None;
+            stats.SkyboxMode = (int)skybox.Mode;
+            stats.DirectionalShadowEnabled = shadow.IsEnabled;
+            stats.ShadowMapResolution = shadow.Resolution;
+            stats.ShadowMapReason = shadow.Reason;
+            ApplyPipelineStats(stats, scene, pipeline);
         }
 
         return new WebGlScenePacket
@@ -170,17 +225,58 @@ internal static class WebGlScenePacketBuilder
             Height = height,
             ClearColor = new[] { scene.BackgroundColor.R, scene.BackgroundColor.G, scene.BackgroundColor.B, scene.BackgroundColor.A },
             ViewProjection = ToArray(viewProjection),
+            CameraPosition = new[] { scene.Camera.Position.X, scene.Camera.Position.Y, scene.Camera.Position.Z },
+            CameraRight = ToArray(scene.Camera.Right),
+            CameraUp = ToArray(scene.Camera.SafeUp),
+            CameraForward = ToArray(scene.Camera.Forward),
             AmbientLight = light.Ambient,
             DirectionalLightDirection = light.Direction,
             DirectionalLightColor = light.DirectionalColor,
             PointLightPosition = light.PointPosition,
             PointLightColor = light.PointColor,
+            SpotLightPosition = light.SpotPosition,
+            SpotLightDirection = light.SpotDirection,
+            SpotLightColor = light.SpotColor,
+            SpotLightCone = light.SpotCone,
+            SkyboxEnabled = skybox.Mode != SkyboxMode3D.None,
+            SkyboxMode = (int)skybox.Mode,
+            SkyboxTopColor = skybox.TopColor.ToArray(),
+            SkyboxHorizonColor = skybox.HorizonColor.ToArray(),
+            SkyboxBottomColor = skybox.BottomColor.ToArray(),
+            SkyboxIntensity = skybox.Intensity,
+            SkyboxTextureId = skyboxTextureId,
+            SkyboxCubemapTextureIds = skyboxCubemapTextureIds,
+            DirectionalShadowEnabled = shadow.IsEnabled,
+            DirectionalShadowResolution = shadow.Resolution,
+            DirectionalShadowStrength = shadow.Strength,
+            DirectionalShadowBias = shadow.Bias,
+            DirectionalShadowReason = shadow.Reason,
+            DirectionalShadowLightViewProjection = ToArray(shadow.LightViewProjection),
+            RenderPipelineMode = (int)pipeline.ActiveMode,
+            DeferredRequested = pipeline.DeferredRequested,
+            SsaoEnabled = pipeline.SsaoRequested,
+            SsaoParams = new[] { scene.RenderPipeline.Ssao.Strength, scene.RenderPipeline.Ssao.Radius, scene.RenderPipeline.Ssao.Bias, (float)scene.RenderPipeline.Ssao.SampleCount },
+            HdrEnabled = pipeline.HdrActive,
+            ToneMappingMode = (int)pipeline.ToneMappingMode,
+            ToneMappingParams = new[] { scene.RenderPipeline.ToneMapping.Exposure, scene.RenderPipeline.ToneMapping.Gamma, pipeline.ToneMappingActive ? 1f : 0f, 0f },
+            MotionVectorMetadataEnabled = pipeline.MotionVectorsRequested,
+            ShowWireframeOverlay = scene.Debug.ShowWireframeOverlay,
+            ShowSilhouetteOverlay = scene.Debug.ShowSilhouetteOverlay,
             Batches = batches,
             RetainedBatches = retainedHighScaleBatches ?? new List<WebGlRetainedBatchPacket>(),
             ControlPlanes = controls,
             LiveMeshIds = new List<string>(liveMeshIds),
             LiveTextureIds = new List<string>(liveTextureIds)
         };
+    }
+
+
+    private static string?[] BuildCubemapTextureIds(Skybox3D skybox)
+    {
+        var ids = new string?[6];
+        if (!skybox.HasCubemapTextures) return ids;
+        for (var i = 0; i < ids.Length && i < skybox.CubemapTextureKeys.Count; i++) ids[i] = skybox.CubemapTextureKeys[i];
+        return ids;
     }
 
     private static HashSet<string> CollectLiveMeshIds(Scene3D scene)
@@ -205,15 +301,44 @@ internal static class WebGlScenePacketBuilder
         return ids;
     }
 
-    private static WebGlMeshBatchPacket GetBatch(Dictionary<string, WebGlMeshBatchPacket> batches, string meshId, float lightingEnabled)
+    private static WebGlMeshBatchPacket GetBatch(
+        Dictionary<string, WebGlMeshBatchPacket> batches,
+        string meshId,
+        float lightingEnabled,
+        float normalMapStrength,
+        string? baseColorTextureId,
+        string? normalTextureId,
+        string? metallicRoughnessTextureId,
+        string? emissiveTextureId,
+        float metallic,
+        float roughness,
+        float alphaCutoff,
+        ColorRgba emissiveColor)
     {
-        var key = meshId + "|l:" + lightingEnabled.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        var key = meshId +
+                  "|l:" + lightingEnabled.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                  "|n:" + MathF.Round(normalMapStrength, 4).ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                  TextureKey("base", baseColorTextureId) +
+                  TextureKey("normal", normalTextureId) +
+                  TextureKey("mr", metallicRoughnessTextureId) +
+                  TextureKey("em", emissiveTextureId) +
+                  "|m:" + F(metallic) + "|r:" + F(roughness) + "|cut:" + F(alphaCutoff) +
+                  "|ec:" + F(emissiveColor.R) + "," + F(emissiveColor.G) + "," + F(emissiveColor.B) + "," + F(emissiveColor.A);
         if (!batches.TryGetValue(key, out var batch))
         {
             batch = new WebGlMeshBatchPacket
             {
                 Id = meshId,
                 LightingEnabled = lightingEnabled,
+                NormalMapStrength = normalMapStrength,
+                BaseColorTextureId = baseColorTextureId,
+                NormalTextureId = normalTextureId,
+                MetallicRoughnessTextureId = metallicRoughnessTextureId,
+                EmissiveTextureId = emissiveTextureId,
+                Metallic = metallic,
+                Roughness = roughness,
+                AlphaCutoff = alphaCutoff,
+                EmissiveColor = new[] { emissiveColor.R, emissiveColor.G, emissiveColor.B, emissiveColor.A },
                 InstanceData = new List<float>(InstanceFloatStride * 64)
             };
             batches[key] = batch;
@@ -221,6 +346,17 @@ internal static class WebGlScenePacketBuilder
 
         return batch;
     }
+
+    private static void AddLiveTexture(HashSet<string> liveTextureIds, string? textureId)
+    {
+        if (!string.IsNullOrWhiteSpace(textureId)) liveTextureIds.Add(textureId);
+    }
+
+    private static string TextureKey(string role, string? id)
+        => string.IsNullOrWhiteSpace(id) ? string.Empty : "|" + role + ":" + id;
+
+    private static string F(float value)
+        => MathF.Round(value, 4).ToString("0.####", System.Globalization.CultureInfo.InvariantCulture);
 
     private static IEnumerable<HighScaleInstanceLayer3D> EnumerateHighScaleLayers(Scene3D scene)
     {
@@ -257,32 +393,40 @@ internal static class WebGlScenePacketBuilder
         return color;
     }
 
-    private static (float[] Ambient, float[] Direction, float[] DirectionalColor, float[] PointPosition, float[] PointColor) ResolveLight(Scene3D scene)
+    private static void ApplyPipelineStats(RenderStats stats, Scene3D scene, RenderPipelinePlan3D pipeline)
     {
-        var ambient = new[] { 0.28f, 0.28f, 0.28f };
-        var dir = new[] { -0.35f, -0.75f, -0.55f };
-        var dirColor = new[] { 0f, 0f, 0f };
-        foreach (var light in scene.Lights)
-        {
-            if (!light.IsEnabled) continue;
-            var direction = light.Direction.LengthSquared() < 0.000001f ? new Vector3(-0.35f, -0.75f, -0.55f) : Vector3.Normalize(light.Direction);
-            dir = new[] { direction.X, direction.Y, direction.Z };
-            dirColor = new[] { light.Color.R * light.Intensity, light.Color.G * light.Intensity, light.Color.B * light.Intensity };
-            break;
-        }
-
-        var pointPos = new[] { 0f, 0f, 0f, 1f };
-        var pointColor = new[] { 0f, 0f, 0f, 0f };
-        foreach (var light in scene.PointLights)
-        {
-            if (!light.IsEnabled) continue;
-            pointPos = new[] { light.Position.X, light.Position.Y, light.Position.Z, light.Range };
-            pointColor = new[] { light.Color.R * light.Intensity, light.Color.G * light.Intensity, light.Color.B * light.Intensity, 1f };
-            break;
-        }
-
-        return (ambient, dir, dirColor, pointPos, pointColor);
+        stats.RenderPipelineMode = (int)pipeline.ActiveMode;
+        stats.DeferredRequested = pipeline.DeferredRequested;
+        stats.DeferredActive = pipeline.DeferredActive;
+        stats.GBufferActive = pipeline.GBufferActive;
+        stats.GBufferTargetCount = pipeline.GBufferActive ? 4 : 0;
+        stats.SsaoRequested = pipeline.SsaoRequested;
+        stats.SsaoActive = pipeline.SsaoActive;
+        stats.SsaoSampleCount = scene.RenderPipeline.Ssao.SampleCount;
+        stats.HdrRequested = pipeline.HdrRequested;
+        stats.HdrActive = pipeline.HdrActive;
+        stats.ToneMappingMode = (int)pipeline.ToneMappingMode;
+        stats.ToneMappingActive = pipeline.ToneMappingActive;
+        stats.ToneMappingExposure = scene.RenderPipeline.ToneMapping.Exposure;
+        stats.ToneMappingGamma = scene.RenderPipeline.ToneMapping.Gamma;
+        stats.RenderPassCount = pipeline.Passes.Count;
+        stats.MotionVectorsRequested = pipeline.MotionVectorsRequested;
+        stats.MotionVectorsActive = pipeline.MotionVectorsActive;
+        stats.RenderPipelineReason = pipeline.Reason;
     }
+
+    private static (float[] Ambient, float[] Direction, float[] DirectionalColor, float[] PointPosition, float[] PointColor, float[] SpotPosition, float[] SpotDirection, float[] SpotColor, float[] SpotCone) ResolveLight(Scene3D scene)
+    {
+        var light = SceneLightingResolver3D.Resolve(scene);
+        return (ToArray(light.Ambient), ToArray(light.DirectionalDirection), ToArray(light.DirectionalColor), ToArray(light.PointPosition), ToArray(light.PointColor), ToArray(light.SpotPosition), ToArray(light.SpotDirection), ToArray(light.SpotColor), ToArray(light.SpotCone));
+    }
+
+    private static float ToLightingUniform(LightingMode mode)
+        => mode == LightingMode.Unlit ? 0f : mode == LightingMode.Lambert ? 1f : mode == LightingMode.Phong ? 2f : 3f;
+
+    private static float[] ToArray(Vector3 value) => new[] { value.X, value.Y, value.Z };
+
+    private static float[] ToArray(Vector4 value) => new[] { value.X, value.Y, value.Z, value.W };
 
     private static void WriteControlVertex(float[] buffer, int baseIndex, Vector3 position, float u, float v)
     {
@@ -344,11 +488,43 @@ internal sealed class WebGlScenePacket
     public required float Height { get; init; }
     public required float[] ClearColor { get; init; }
     public required float[] ViewProjection { get; init; }
+    public required float[] CameraPosition { get; init; }
+    public required float[] CameraRight { get; init; }
+    public required float[] CameraUp { get; init; }
+    public required float[] CameraForward { get; init; }
     public required float[] AmbientLight { get; init; }
     public required float[] DirectionalLightDirection { get; init; }
     public required float[] DirectionalLightColor { get; init; }
     public required float[] PointLightPosition { get; init; }
     public required float[] PointLightColor { get; init; }
+    public required float[] SpotLightPosition { get; init; }
+    public required float[] SpotLightDirection { get; init; }
+    public required float[] SpotLightColor { get; init; }
+    public required float[] SpotLightCone { get; init; }
+    public bool SkyboxEnabled { get; init; }
+    public int SkyboxMode { get; init; }
+    public float[] SkyboxTopColor { get; init; } = Array.Empty<float>();
+    public float[] SkyboxHorizonColor { get; init; } = Array.Empty<float>();
+    public float[] SkyboxBottomColor { get; init; } = Array.Empty<float>();
+    public float SkyboxIntensity { get; init; }
+    public string? SkyboxTextureId { get; init; }
+    public string?[] SkyboxCubemapTextureIds { get; init; } = Array.Empty<string?>();
+    public bool DirectionalShadowEnabled { get; init; }
+    public int DirectionalShadowResolution { get; init; }
+    public float DirectionalShadowStrength { get; init; }
+    public float DirectionalShadowBias { get; init; }
+    public string DirectionalShadowReason { get; init; } = string.Empty;
+    public float[] DirectionalShadowLightViewProjection { get; init; } = Array.Empty<float>();
+    public int RenderPipelineMode { get; init; }
+    public bool DeferredRequested { get; init; }
+    public bool SsaoEnabled { get; init; }
+    public float[] SsaoParams { get; init; } = Array.Empty<float>();
+    public bool HdrEnabled { get; init; }
+    public int ToneMappingMode { get; init; }
+    public float[] ToneMappingParams { get; init; } = Array.Empty<float>();
+    public bool MotionVectorMetadataEnabled { get; init; }
+    public bool ShowWireframeOverlay { get; init; }
+    public bool ShowSilhouetteOverlay { get; init; }
     public required List<WebGlMeshBatchPacket> Batches { get; init; }
     public required List<WebGlRetainedBatchPacket> RetainedBatches { get; init; }
     public required List<WebGlControlPlanePacket> ControlPlanes { get; init; }
@@ -360,6 +536,15 @@ internal sealed class WebGlMeshBatchPacket
 {
     public required string Id { get; init; }
     public required float LightingEnabled { get; init; }
+    public float NormalMapStrength { get; init; }
+    public string? BaseColorTextureId { get; init; }
+    public string? NormalTextureId { get; init; }
+    public string? MetallicRoughnessTextureId { get; init; }
+    public string? EmissiveTextureId { get; init; }
+    public float Metallic { get; init; }
+    public float Roughness { get; init; } = 1f;
+    public float AlphaCutoff { get; init; } = 0.5f;
+    public float[] EmissiveColor { get; init; } = Array.Empty<float>();
     public required List<float> InstanceData { get; init; }
     public int InstanceCount { get; set; }
 }

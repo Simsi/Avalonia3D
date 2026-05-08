@@ -18,6 +18,7 @@ public sealed class SceneInteractionManager
     private Vector2 _lastPosition;
     private Vector2 _pressPosition;
     private PickingResult? _pressedPick;
+    private ModelHitResult3D? _hoveredModelHit;
 
     public SceneInteractionManager(Scene3D scene, Action requestRender, Func<Vector2>? getViewportSize = null)
     {
@@ -39,6 +40,7 @@ public sealed class SceneInteractionManager
         HoveredObject = null;
         SelectedObject = null;
         _pressedPick = null;
+        _hoveredModelHit = null;
         _objectDragStarted = false;
     }
 
@@ -46,11 +48,13 @@ public sealed class SceneInteractionManager
     {
         if (HoveredObject is null)
         {
+            _hoveredModelHit = null;
             return;
         }
 
         HoveredObject.IsHovered = false;
         HoveredObject = null;
+        _hoveredModelHit = null;
         _requestRender();
     }
 
@@ -86,6 +90,7 @@ public sealed class SceneInteractionManager
             {
                 var args = CreatePointerArgs(_pressedPick, _lastPosition, SceneMouseButton.Left);
                 _pressedPick.Object.RaisePointerPressed(args);
+                DispatchModelPointerEvent(_pressedPick, ModelPointerEventKind.PointerPressed, _lastPosition, SceneMouseButton.Left);
             }
         }
 
@@ -117,6 +122,7 @@ public sealed class SceneInteractionManager
 
             var pointerArgs = CreatePointerArgs(_pressedPick, position, SceneMouseButton.Left);
             _pressedPick.Object.RaisePointerReleased(pointerArgs);
+            DispatchModelPointerEvent(_pressedPick, ModelPointerEventKind.PointerReleased, position, SceneMouseButton.Left);
 
             var dragDistance = Vector2.Distance(position, _pressPosition);
             if (!_objectDragStarted &&
@@ -125,6 +131,7 @@ public sealed class SceneInteractionManager
             {
                 var clickArgs = CreatePointerArgs(releasePick, position, SceneMouseButton.Left);
                 releasePick.Object.RaiseClicked(clickArgs);
+                DispatchModelPointerEvent(releasePick, ModelPointerEventKind.Clicked, position, SceneMouseButton.Left);
                 ObjectClicked?.Invoke(this, clickArgs);
             }
         }
@@ -183,6 +190,7 @@ public sealed class SceneInteractionManager
             if (hoverPick is not null)
             {
                 HoveredObject.RaisePointerMoved(CreatePointerArgs(hoverPick, position, SceneMouseButton.Unknown));
+                DispatchModelPointerEvent(hoverPick, ModelPointerEventKind.PointerMoved, position, SceneMouseButton.Unknown);
             }
         }
 
@@ -199,6 +207,7 @@ public sealed class SceneInteractionManager
             if (hoverPick is not null)
             {
                 HoveredObject.RaisePointerMoved(CreatePointerArgs(hoverPick, position, SceneMouseButton.Unknown));
+                DispatchModelPointerEvent(hoverPick, ModelPointerEventKind.PointerMoved, position, SceneMouseButton.Unknown);
             }
         }
 
@@ -236,18 +245,23 @@ public sealed class SceneInteractionManager
         var oldHovered = HoveredObject;
         HoveredObject = pick?.Object;
 
-        if (oldHovered == HoveredObject)
+        var hoverTargetChanged = oldHovered != HoveredObject;
+        var modelElementChanged = !AreSameModelHover(_hoveredModelHit, pick?.ModelHit);
+        if (!hoverTargetChanged && !modelElementChanged)
         {
             return;
         }
 
-        if (oldHovered is not null)
+        if (oldHovered is not null && hoverTargetChanged)
         {
             oldHovered.IsHovered = false;
-            oldHovered.RaisePointerExited(new ScenePointerEventArgs(oldHovered, position, oldHovered.Position, button));
+            oldHovered.RaisePointerExited(new ScenePointerEventArgs(oldHovered, position, oldHovered.Position, button, _hoveredModelHit));
         }
 
-        if (HoveredObject is not null && pick is not null)
+        DispatchModelHoverTransition(_hoveredModelHit, pick?.ModelHit, position, button);
+        _hoveredModelHit = pick?.ModelHit;
+
+        if (HoveredObject is not null && pick is not null && hoverTargetChanged)
         {
             HoveredObject.IsHovered = true;
             HoveredObject.RaisePointerEntered(CreatePointerArgs(pick, position, button));
@@ -298,7 +312,7 @@ public sealed class SceneInteractionManager
         var target = ResolveInteractionTarget(pick.Object);
         return ReferenceEquals(target, pick.Object)
             ? pick
-            : new PickingResult(target, pick.WorldPosition, pick.Distance);
+            : new PickingResult(target, pick.WorldPosition, pick.Distance, pick.ModelHit);
     }
 
     private static Object3D ResolveInteractionTarget(Object3D obj)
@@ -319,5 +333,32 @@ public sealed class SceneInteractionManager
     }
 
     private static ScenePointerEventArgs CreatePointerArgs(PickingResult pick, Vector2 position, SceneMouseButton button)
-        => new(pick.Object, position, pick.WorldPosition, button);
+        => new(pick.Object, position, pick.WorldPosition, button, pick.ModelHit);
+
+    private static bool AreSameModelHover(ModelHitResult3D? oldHit, ModelHitResult3D? newHit)
+        => oldHit is null ? newHit is null : oldHit.IsSameInteractiveElement(newHit);
+
+    private static void DispatchModelPointerEvent(PickingResult pick, ModelPointerEventKind eventKind, Vector2 position, SceneMouseButton button)
+    {
+        var modelHit = pick.ModelHit;
+        if (modelHit is null)
+        {
+            return;
+        }
+
+        modelHit.Model.RaiseModelPointerEvent(eventKind, modelHit, position, button);
+    }
+
+    private static void DispatchModelHoverTransition(ModelHitResult3D? oldHit, ModelHitResult3D? newHit, Vector2 position, SceneMouseButton button)
+    {
+        if (oldHit is not null && !oldHit.IsSameInteractiveElement(newHit))
+        {
+            oldHit.Model.RaiseModelPointerEvent(ModelPointerEventKind.PointerExited, oldHit, position, button);
+        }
+
+        if (newHit is not null && !newHit.IsSameInteractiveElement(oldHit))
+        {
+            newHit.Model.RaiseModelPointerEvent(ModelPointerEventKind.PointerEntered, newHit, position, button);
+        }
+    }
 }

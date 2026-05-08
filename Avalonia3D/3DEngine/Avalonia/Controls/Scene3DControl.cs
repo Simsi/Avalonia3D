@@ -17,6 +17,7 @@ using ThreeDEngine.Core.Interaction;
 using ThreeDEngine.Core.Collision;
 using ThreeDEngine.Core.Navigation;
 using ThreeDEngine.Core.Physics;
+using ThreeDEngine.Core.Physics.Kinematic;
 using ThreeDEngine.Core.Rendering;
 using ThreeDEngine.Core.Math;
 using ThreeDEngine.Core.Scene;
@@ -66,12 +67,12 @@ public sealed class Scene3DControl : Border
     private float _pitchDegrees;
     private Vector3 _personVelocity;
     private bool _personGrounded;
+    private readonly KinematicCharacterController3D _personController = new();
     private DateTime _lastNavigationTickUtc;
     private readonly Dictionary<ControlPlane3D, ControlPlaneRuntimeAdapter> _controlAdapters;
     private readonly HashSet<ControlPlane3D> _creatingControlAdapters;
     private Scene3D _scene;
     private IScenePresenter? _presenter;
-    private RendererInvalidationKind _pendingRendererInvalidation = RendererInvalidationKind.FullFrame;
     private ControlPlaneRuntimeAdapter? _activeControlAdapter;
     private ControlPlaneRuntimeAdapter? _focusedControlAdapter;
     private int _forwardedControlInputDepth;
@@ -302,11 +303,9 @@ public sealed class Scene3DControl : Border
             Adapters.SetScene(_scene);
             UpdateRuntimeOptionsFromControl();
 
-            _pendingRendererInvalidation = RendererInvalidationKind.FullFrame;
             if (_presenter is not null)
             {
                 _presenter.Scene = _scene;
-                _presenter.NotifySceneChanged(new SceneChangedEventArgs(SceneChangeKind.Structure), _pendingRendererInvalidation);
             }
 
             SyncControlAdapters();
@@ -390,6 +389,7 @@ public sealed class Scene3DControl : Border
         EndMouseLook();
         _isPointerInsideScene = false;
         RestoreCenterLockedCursor();
+        ClearControlAdapters();
     }
 
     protected override void OnPointerEntered(PointerEventArgs e)
@@ -768,7 +768,6 @@ public sealed class Scene3DControl : Border
         _presenter = Scene3DPlatform.GetFactory().CreatePresenter();
         _presenter.FrameRendered += OnPresenterFrameRendered;
         _presenter.Scene = Scene;
-        _presenter.NotifySceneChanged(new SceneChangedEventArgs(SceneChangeKind.Structure), _pendingRendererInvalidation);
         _presenter.View.IsHitTestVisible = false;
         _presenter.View.ZIndex = 0;
         _root.Children.Add(_presenter.View);
@@ -787,29 +786,25 @@ public sealed class Scene3DControl : Border
 
     private void OnSceneChanged(object? sender, SceneChangedEventArgs e)
     {
-        var invalidation = RendererInvalidationPolicy.FromSceneChange(e.Kind);
-        _pendingRendererInvalidation |= invalidation;
-        _presenter?.NotifySceneChanged(e, _pendingRendererInvalidation);
-        if ((invalidation & RendererInvalidationKind.BatchRebuild) != 0 || e.Kind == SceneChangeKind.Control)
+        if (e.Kind == SceneChangeKind.Structure || e.Kind == SceneChangeKind.Control)
         {
             SyncControlAdapters();
         }
 
-        if ((invalidation & RendererInvalidationKind.HighScaleState) != 0)
+        if (e.Kind != SceneChangeKind.HighScaleState)
         {
-            // In continuous-render high-scale scenes telemetry state changes are consumed by
-            // the next scheduled frame. Calling RequestNextFrameRendering for every telemetry
-            // batch creates redundant UI render requests and makes frame pacing worse.
-            if (!ContinuousRendering)
-            {
-                RequestRender();
-            }
-
+            UpdateNavigationTimerState();
+            RequestRender();
             return;
         }
 
-        UpdateNavigationTimerState();
-        RequestRender();
+        // In continuous-render high-scale scenes telemetry state changes are consumed by
+        // the next scheduled frame. Calling RequestNextFrameRendering for every telemetry
+        // batch creates redundant UI render requests and makes frame pacing worse.
+        if (!ContinuousRendering)
+        {
+            RequestRender();
+        }
     }
 
     private void OnObjectClicked(object? sender, ScenePointerEventArgs e)
@@ -851,7 +846,6 @@ public sealed class Scene3DControl : Border
     private void RequestPresenterRenderOnly()
     {
         _presenter?.RequestRender();
-        _pendingRendererInvalidation = RendererInvalidationKind.None;
     }
 
     private void RequestUnlockedFrameSoon()
@@ -905,6 +899,8 @@ public sealed class Scene3DControl : Border
         Scene.AdaptivePerformance.Enabled = AdaptivePerformanceEnabled;
         Scene.Performance.AdaptivePerformanceEnabled = AdaptivePerformanceEnabled;
     }
+
+    private static string OnOff(bool value) => value ? "on" : "off";
 
     private void UpdateRuntimeStats(RenderStats stats)
     {
@@ -975,7 +971,7 @@ public sealed class Scene3DControl : Border
             return;
         }
 
-        var statsForRuntime = e.Stats ?? ThreeDEngine.Core.Rendering.RenderStats.Empty;
+        var statsForRuntime = e.Stats ?? new RenderStats();
         UpdateRuntimeStats(statsForRuntime);
         FrameRendered?.Invoke(this, e);
         if (ContinuousRendering && !FpsLockEnabled)
@@ -1019,7 +1015,14 @@ public sealed class Scene3DControl : Border
             $"HighScale: {stats.HighScaleInstanceCount} | Chunks: {stats.VisibleChunkCount}/{stats.TotalChunkCount} | Culled: {stats.CulledObjectCount}\n" +
             $"LOD D/S/P/B/C: {stats.LodDetailedCount}/{stats.LodSimplifiedCount}/{stats.LodProxyCount}/{stats.LodBillboardCount}/{stats.LodCulledCount} | PartInst: {stats.HighScaleVisiblePartInstanceCount}\n" +
             $"Draw: {stats.DrawCallCount} | Batches: {stats.InstancedBatchCount} | Tris: {stats.TriangleCount}\n" +
+            $"Pipeline: mode={stats.RenderPipelineMode} deferred {OnOff(stats.DeferredActive)}/{OnOff(stats.DeferredRequested)} | GBuffer={OnOff(stats.GBufferActive)} targets={stats.GBufferTargetCount} | HDR={OnOff(stats.HdrActive)} tone={stats.ToneMappingMode} exp={stats.ToneMappingExposure:0.00} gamma={stats.ToneMappingGamma:0.00}\n" +
+            $"SSAO: {OnOff(stats.SsaoActive)}/{OnOff(stats.SsaoRequested)} samples={stats.SsaoSampleCount} | Passes={stats.RenderPassCount} | MotionVec={OnOff(stats.MotionVectorsActive)}/{OnOff(stats.MotionVectorsRequested)} | Reason={stats.RenderPipelineReason}\n" +
+            $"Particles: {stats.ParticleCount} in {stats.ParticleSystemCount} systems | ParticleVB: {stats.ParticleMeshUploadBytes / 1024d:0.0} KB | InstancedMesh: {stats.InstancedMeshInstanceCount} in {stats.InstancedMeshLayerCount} layers | Throughput retained/fallback: {stats.RetainedThroughputDrawCount}/{stats.ThroughputFallbackDrawCount}\n" +
+            $"Models: imported={stats.ImportedModelCount} skinned={stats.SkinnedModelCount} animated={stats.AnimatedModelCount} | Skin matrices={stats.SkinMatrixCount} prim={stats.SkinnedPrimitiveCount} payload={stats.SkinningVertexPayloadBytes / 1024d:0.0} KB | GPUSkin={OnOff(stats.GpuSkinningActive)}/{OnOff(stats.GpuSkinningRequested)} {stats.SkinningFallbackReason}\n" +
+            $"Lights D/P/S: {stats.DirectionalLightCount}/{stats.PointLightCount}/{stats.SpotLightCount} | Skybox: {(stats.SkyboxEnabled ? "on" : "off")} mode={stats.SkyboxMode} | Shadows: {(stats.DirectionalShadowEnabled ? "on" : "off")} {stats.ShadowMapResolution}px casters={stats.ShadowCasterCount} maps={stats.ShadowMapCount} {stats.ShadowMapMilliseconds:0.00} ms\n" +
             $"TransformUpload: {stats.InstanceUploadBytes / (1024d * 1024d):0.00} MB | StateUpload: {stats.StateUploadBytes / 1024d:0.0} KB | TexUpload: {stats.TextureUploadBytes / (1024d * 1024d):0.00} MB\n" +
+            $"MeshUpload: {stats.MeshUploadBytes / 1024d:0.0} KB | V/I: {stats.VertexBufferUploadBytes / 1024d:0.0}/{stats.IndexBufferUploadBytes / 1024d:0.0} KB | Tangent: {stats.TangentUploadBytes / 1024d:0.0} KB | WireIdx: {stats.WireframeIndexUploadBytes / 1024d:0.0} KB\n" +
+            $"Surface: tangentMeshes={stats.TangentSpaceMeshCount} normalMapped={stats.NormalMappedMeshCount} wire/sil={stats.WireframeOverlayDrawCalls}/{stats.SilhouetteOverlayDrawCalls} | Geom: {stats.RenderGeometryCount} | VB/IB: {stats.VertexBufferUploadCount}/{stats.IndexBufferUploadCount} | PacketBytes: {stats.PacketBytes / 1024d:0.0} KB\n" +
             $"Packet: {stats.PacketBuildMilliseconds:0.00} ms | Ser: {stats.SerializationMilliseconds:0.00} ms | Upload: {stats.UploadMilliseconds:0.00} ms | Backend: {stats.BackendMilliseconds:0.00} ms\n" +
             $"WebGLv{stats.WebGlVersion} ClientHS: {(stats.WebGlClientHighScaleRuntime ? "on" : "off")} | GPUAnim: {(stats.WebGlClientGpuTransformAnimation ? "on" : "off")} | JS Cull: {stats.JsCullMilliseconds:0.00} ms | JS Draw: {stats.JsDrawMilliseconds:0.00} ms | JS Frame: {stats.JsFrameMilliseconds:0.00} ms | JS Batches: {stats.JsDrawBatchCount}\n" +
             $"JSPatch T/S: {stats.JsTransformPatchRanges}/{stats.JsStatePatchRanges} ranges | {stats.JsTransformPatchBytes / 1024d:0.0}/{stats.JsStatePatchBytes / 1024d:0.0} KB | JSAnim: {stats.JsAnimationUploadBatches} batches/{stats.JsAnimationUploadBytes / 1024d:0.0} KB | TexErr: {stats.JsTexturePayloadErrors}/{stats.JsPalettePayloadErrors} | Patch: {stats.JsPatchMilliseconds:0.00} ms\n" +
@@ -1409,7 +1412,7 @@ public sealed class Scene3DControl : Border
 
     private bool HasActiveDynamicPhysicsBodies()
     {
-        foreach (var obj in Scene.Registry.DynamicBodies)
+        foreach (var obj in Scene.Registry.SnapshotDynamicBodies())
         {
             var body = obj.Rigidbody;
             if (body is null || body.IsKinematic)
@@ -1457,9 +1460,17 @@ public sealed class Scene3DControl : Border
             return;
         }
 
-        _personVelocity.Y = System.MathF.Max(PersonSettings.JumpSpeed, 0f);
-        _personGrounded = false;
+        _personController.Jump(System.MathF.Max(PersonSettings.JumpSpeed, 0f));
+        _personVelocity = _personController.Velocity;
+        _personGrounded = _personController.IsGrounded;
         UpdateNavigationTimerState();
+    }
+
+    public void ResetPersonNavigationState(bool grounded = false)
+    {
+        _personVelocity = Vector3.Zero;
+        _personGrounded = grounded;
+        _personController.Reset(Vector3.Zero, grounded);
     }
 
     private void StepPersonNavigation(float dt)
@@ -1481,14 +1492,18 @@ public sealed class Scene3DControl : Border
         }
 
         var speed = PersonSettings.MoveSpeed * (IsPressed(Key.LeftShift) || IsPressed(Key.RightShift) ? PersonSettings.RunMultiplier : 1f);
-        _personVelocity.X = move.X * speed;
-        _personVelocity.Z = move.Z * speed;
-        _personVelocity.Y += PersonSettings.Gravity * dt;
+        _personController.Radius = System.MathF.Max(0.05f, PersonSettings.BodyRadius);
+        _personController.Height = System.MathF.Max(_personController.Radius * 2f, PersonSettings.BodyHeight);
+        _personController.StepHeight = System.MathF.Max(0f, PersonSettings.StepHeight);
+        _personController.Gravity = new Vector3(0f, PersonSettings.Gravity, 0f);
 
-        var oldPosition = Scene.Camera.Position;
-        var desired = oldPosition + _personVelocity * dt;
-        var resolved = ResolvePersonCollisions(oldPosition, desired, dt);
-        Scene.Camera.Position = resolved;
+        var eyeToFoot = new Vector3(0f, System.MathF.Max(0.05f, PersonSettings.EyeHeight), 0f);
+        var footPosition = Scene.Camera.Position - eyeToFoot;
+        var horizontalMotion = move * speed * dt;
+        var resolvedFootPosition = _personController.Move(Scene, footPosition, horizontalMotion, dt);
+        Scene.Camera.Position = resolvedFootPosition + eyeToFoot;
+        _personVelocity = _personController.Velocity;
+        _personGrounded = _personController.IsGrounded;
         ApplyCameraForwardFromAngles();
     }
 
@@ -1502,7 +1517,7 @@ public sealed class Scene3DControl : Border
         for (var i = 0; i < 3; i++)
         {
             var changed = false;
-            foreach (var obj in Scene.Registry.Colliders)
+            foreach (var obj in Scene.Registry.SnapshotColliders())
             {
                 if (obj.Collider is null)
                 {
@@ -1510,9 +1525,23 @@ public sealed class Scene3DControl : Border
                 }
 
                 var otherBounds = obj.Collider.GetWorldBounds(obj);
-                if (!BasicPhysicsCore.TryGetAabbPenetration(bodyBounds, otherBounds, out var correction, out var normal))
+                if (!TryGetAabbPenetration(bodyBounds, otherBounds, out var correction, out var normal))
                 {
                     continue;
+                }
+
+                if (System.MathF.Abs(normal.Y) < 0.25f && _personGrounded && PersonSettings.StepHeight > 0f)
+                {
+                    var stepUp = new Vector3(0f, PersonSettings.StepHeight, 0f);
+                    var steppedCenter = bodyCenter + stepUp;
+                    var steppedBounds = new Bounds3D(steppedCenter - half, steppedCenter + half);
+                    if (!steppedBounds.Intersects(otherBounds))
+                    {
+                        bodyCenter = steppedCenter;
+                        bodyBounds = steppedBounds;
+                        changed = true;
+                        continue;
+                    }
                 }
 
                 bodyCenter += correction;
@@ -1541,7 +1570,7 @@ public sealed class Scene3DControl : Border
                         var push = pushVelocity * PersonSettings.PushStrength;
                         if (push.LengthSquared() > 0.0001f)
                         {
-                            body.Velocity += push / System.Math.Max(body.Mass, 0.001f) * dt;
+                            body.AddImpulse(push * dt);
                         }
                     }
                 }
@@ -1554,6 +1583,46 @@ public sealed class Scene3DControl : Border
         }
 
         return bodyCenter - new Vector3(0f, PersonSettings.BodyHeight * 0.5f - PersonSettings.EyeHeight, 0f);
+    }
+
+    private static bool TryGetAabbPenetration(Bounds3D a, Bounds3D b, out Vector3 correction, out Vector3 normal)
+    {
+        correction = Vector3.Zero;
+        normal = Vector3.Zero;
+        if (!a.IsValid || !b.IsValid || !a.Intersects(b)) return false;
+
+        var dx1 = b.Max.X - a.Min.X;
+        var dx2 = a.Max.X - b.Min.X;
+        var dy1 = b.Max.Y - a.Min.Y;
+        var dy2 = a.Max.Y - b.Min.Y;
+        var dz1 = b.Max.Z - a.Min.Z;
+        var dz2 = a.Max.Z - b.Min.Z;
+
+        var px = dx1 < dx2 ? dx1 : -dx2;
+        var py = dy1 < dy2 ? dy1 : -dy2;
+        var pz = dz1 < dz2 ? dz1 : -dz2;
+
+        var ax = System.MathF.Abs(px);
+        var ay = System.MathF.Abs(py);
+        var az = System.MathF.Abs(pz);
+
+        if (ax <= ay && ax <= az)
+        {
+            correction = new Vector3(px, 0f, 0f);
+            normal = new Vector3(System.MathF.Sign(px), 0f, 0f);
+        }
+        else if (ay <= az)
+        {
+            correction = new Vector3(0f, py, 0f);
+            normal = new Vector3(0f, System.MathF.Sign(py), 0f);
+        }
+        else
+        {
+            correction = new Vector3(0f, 0f, pz);
+            normal = new Vector3(0f, 0f, System.MathF.Sign(pz));
+        }
+
+        return true;
     }
 
     private static bool IsFinite(Vector3 value)
@@ -1671,7 +1740,7 @@ public sealed class Scene3DControl : Border
 
     private void SyncControlAdapters()
     {
-        var planes = Scene.Registry.AllObjects.OfType<ControlPlane3D>().ToHashSet();
+        var planes = Scene.Registry.SnapshotAllObjects().OfType<ControlPlane3D>().ToHashSet();
         foreach (var plane in planes)
         {
             EnsureControlAdapter(plane);
@@ -1942,7 +2011,7 @@ public sealed class Scene3DControl : Border
         var meshHit = Raycaster.Pick(Scene, viewportPosition, viewportSize, obj => obj is not ControlPlane3D);
         PickingResult? best = meshHit;
 
-        foreach (var plane in Scene.Registry.AllObjects.OfType<ControlPlane3D>())
+        foreach (var plane in Scene.Registry.SnapshotAllObjects().OfType<ControlPlane3D>())
         {
             if (!plane.IsVisible)
             {

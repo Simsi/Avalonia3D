@@ -6,6 +6,30 @@ namespace ThreeDEngine.Core.Geometry;
 
 public static class MeshFactory
 {
+    public static Mesh3D CreateBillboardQuad(float width, float height)
+    {
+        width = System.MathF.Max(width, 0.001f);
+        height = System.MathF.Max(height, 0.001f);
+        var hw = width * 0.5f;
+        var hh = height * 0.5f;
+        var positions = new[]
+        {
+            new Vector3(-hw, -hh, 0f),
+            new Vector3(hw, -hh, 0f),
+            new Vector3(hw, hh, 0f),
+            new Vector3(-hw, hh, 0f)
+        };
+        var normals = new[] { Vector3.UnitZ, Vector3.UnitZ, Vector3.UnitZ, Vector3.UnitZ };
+        var texCoords = new[]
+        {
+            new Vector2(0f, 1f),
+            new Vector2(1f, 1f),
+            new Vector2(1f, 0f),
+            new Vector2(0f, 0f)
+        };
+        return new Mesh3D(positions, normals, new[] { 0, 1, 2, 0, 2, 3 }, texCoords0: texCoords);
+    }
+
     public static Mesh3D CreateRectangle(float width, float height)
         => CreateExtrudedRectangle(width, height, 0.001f);
 

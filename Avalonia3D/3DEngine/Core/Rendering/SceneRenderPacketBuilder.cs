@@ -1,5 +1,9 @@
 using System.Collections.Generic;
 using System.Numerics;
+using ThreeDEngine.Core.Environment;
+using ThreeDEngine.Core.Lighting;
+using ThreeDEngine.Core.Rendering.Shadows;
+using ThreeDEngine.Core.Rendering.Pipeline;
 using ThreeDEngine.Core.Scene;
 
 namespace ThreeDEngine.Core.Rendering;
@@ -22,29 +26,43 @@ public static class SceneRenderPacketBuilder
 
         foreach (var obj in scene.Registry.Renderables)
         {
+            if (obj is ThreeDEngine.Core.Particles.ParticleSystem3D particles)
+            {
+                particles.SetBillboardBasis(scene.Camera.Right, scene.Camera.SafeUp, scene.Camera.Forward);
+            }
             var mesh = obj.GetMesh();
             var model = obj.GetModelMatrix();
             var mvp = model * view * projection;
-            var geometryKey = mesh.ResourceKey;
+            var geometry = mesh.RenderGeometry;
+            var geometryKey = geometry.ResourceKey;
 
             RenderMeshPayload? payload = null;
             if (geometryVersionCache is null ||
                 !geometryVersionCache.TryGetValue(geometryKey, out var knownVersion) ||
-                knownVersion != obj.GeometryVersion)
+                knownVersion != mesh.GeometryVersion)
             {
                 payload = new RenderMeshPayload
                 {
-                    Positions = Flatten(mesh.Positions),
-                    Normals = Flatten(mesh.Normals),
-                    Indices = (int[])mesh.Indices.Clone()
+                    Positions = geometry.FlattenPositions(),
+                    Normals = geometry.FlattenNormals(),
+                    TexCoords0 = geometry.FlattenTexCoords0(),
+                    Tangents = geometry.FlattenTangents(),
+                    BoneIndices0 = geometry.FlattenBoneIndices0(),
+                    BoneWeights0 = geometry.FlattenBoneWeights0(),
+                    MaterialSlots = geometry.HasMaterialSlots ? (float[])geometry.MaterialSlots.Clone() : System.Array.Empty<float>(),
+                    Indices = (int[])geometry.Indices.Clone(),
+                    WireframeIndices = (int[])geometry.WireframeIndices.Clone(),
+                    VertexLayout = geometry.Layout.ToString(),
+                    EstimatedUploadBytes = geometry.EstimatedUploadBytes
                 };
 
                 if (geometryVersionCache is not null)
                 {
-                    geometryVersionCache[geometryKey] = obj.GeometryVersion;
+                    geometryVersionCache[geometryKey] = mesh.GeometryVersion;
                 }
             }
 
+            var material = MaterialBinding3D.FromMaterial(obj.Material);
             var color = obj.Material.EffectiveColor;
             if (obj.IsEffectivelyHovered)
             {
@@ -64,32 +82,61 @@ public static class SceneRenderPacketBuilder
                 Model = ToArray(model),
                 Mvp = ToArray(mvp),
                 Color = color.ToArray(),
+                LightingMode = (int)material.Lighting,
+                SpecularColor = new[] { material.SpecularColor.R, material.SpecularColor.G, material.SpecularColor.B },
+                SpecularParams = new[] { material.SpecularStrength, material.Shininess, material.Metallic, material.Roughness },
+                MaterialStrengths = new[] { material.AmbientStrength, material.DiffuseStrength, material.NormalMapStrength, material.HasNormalMap ? 1f : 0f },
                 Mesh = payload
             });
         }
 
+        var light = SceneLightingResolver3D.Resolve(scene);
+        var shadow = DirectionalShadowResolver3D.Resolve(scene);
+        var skybox = scene.Environment.Skybox;
+        var pipeline = RenderPipelinePlanner3D.Plan(scene, BackendKind.WebGlBrowser);
         return new SceneRenderPacket
         {
             Width = viewportSize.X,
             Height = viewportSize.Y,
             ClearColor = scene.BackgroundColor.ToArray(),
+            CameraPosition = new[] { scene.Camera.Position.X, scene.Camera.Position.Y, scene.Camera.Position.Z },
+            AmbientLight = ToArray(light.Ambient),
+            DirectionalLightDirection = ToArray(light.DirectionalDirection),
+            DirectionalLightColor = ToArray(light.DirectionalColor),
+            PointLightPosition = ToArray(light.PointPosition),
+            PointLightColor = ToArray(light.PointColor),
+            SpotLightPosition = ToArray(light.SpotPosition),
+            SpotLightDirection = ToArray(light.SpotDirection),
+            SpotLightColor = ToArray(light.SpotColor),
+            SpotLightCone = ToArray(light.SpotCone),
+            SkyboxEnabled = skybox.Mode != SkyboxMode3D.None,
+            SkyboxMode = (int)skybox.Mode,
+            SkyboxTopColor = skybox.TopColor.ToArray(),
+            SkyboxHorizonColor = skybox.HorizonColor.ToArray(),
+            SkyboxBottomColor = skybox.BottomColor.ToArray(),
+            SkyboxIntensity = skybox.Intensity,
+            DirectionalShadowEnabled = shadow.IsEnabled,
+            DirectionalShadowResolution = shadow.Resolution,
+            DirectionalShadowStrength = shadow.Strength,
+            DirectionalShadowBias = shadow.Bias,
+            DirectionalShadowNormalBias = shadow.NormalBias,
+            DirectionalShadowReason = shadow.Reason,
+            DirectionalShadowLightViewProjection = ToArray(shadow.LightViewProjection),
+            RenderPipelineMode = (int)pipeline.ActiveMode,
+            DeferredRequested = pipeline.DeferredRequested,
+            SsaoEnabled = pipeline.SsaoRequested,
+            SsaoParams = new[] { scene.RenderPipeline.Ssao.Strength, scene.RenderPipeline.Ssao.Radius, scene.RenderPipeline.Ssao.Bias, (float)scene.RenderPipeline.Ssao.SampleCount },
+            HdrEnabled = pipeline.HdrActive,
+            ToneMappingMode = (int)pipeline.ToneMappingMode,
+            ToneMappingParams = new[] { scene.RenderPipeline.ToneMapping.Exposure, scene.RenderPipeline.ToneMapping.Gamma, pipeline.ToneMappingActive ? 1f : 0f, 0f },
+            MotionVectorMetadataEnabled = pipeline.MotionVectorsRequested,
             Objects = objects
         };
     }
 
-    private static float[] Flatten(Vector3[] values)
-    {
-        var result = new float[values.Length * 3];
-        for (var i = 0; i < values.Length; i++)
-        {
-            var baseIndex = i * 3;
-            result[baseIndex] = values[i].X;
-            result[baseIndex + 1] = values[i].Y;
-            result[baseIndex + 2] = values[i].Z;
-        }
+    private static float[] ToArray(Vector3 value) => new[] { value.X, value.Y, value.Z };
 
-        return result;
-    }
+    private static float[] ToArray(Vector4 value) => new[] { value.X, value.Y, value.Z, value.W };
 
     private static float[] ToArray(Matrix4x4 matrix)
     {

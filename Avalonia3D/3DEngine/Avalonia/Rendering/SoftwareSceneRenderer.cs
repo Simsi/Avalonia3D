@@ -28,7 +28,7 @@ internal static class SoftwareSceneRenderer
         var commands = new List<DrawCommand>();
         var viewport = new Vector2((float)width, (float)height);
 
-        foreach (var obj in scene.Registry.AllObjects)
+        foreach (var obj in scene.Registry.SnapshotAllObjects())
         {
             if (!obj.IsVisible)
             {

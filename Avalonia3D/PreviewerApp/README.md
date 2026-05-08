@@ -23,3 +23,7 @@ Supported previews:
 - `[Preview3D] public static IEnumerable<PreviewScene3D> Previews()`.
 
 The Visual Studio connector builds and launches this app automatically.
+
+## Security note
+
+The previewer is a developer tool for trusted projects. It builds and loads the selected project assembly, creates preview types through reflection, and may execute user code from that project. Do not use it as a sandboxed viewer for untrusted source code or model pipelines.

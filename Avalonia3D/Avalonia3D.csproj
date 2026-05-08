@@ -1,5 +1,6 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 <Import Project="VSIXConnector\EngineDrop.Exclusions.targets" Condition="Exists('VSIXConnector\EngineDrop.Exclusions.targets')" />
+<Import Project="3DEngine\Core\Physics\Jitter2\Avalonia3D.Jitter2.Physics.props" Condition="Exists('3DEngine\Core\Physics\Jitter2\Avalonia3D.Jitter2.Physics.props')" />
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>

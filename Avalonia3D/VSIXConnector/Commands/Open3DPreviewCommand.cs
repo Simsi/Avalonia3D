@@ -8,6 +8,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using EnvDTE;
 using EnvDTE80;
@@ -19,6 +20,7 @@ namespace ThreeDEngine.PreviewerVsix.Commands;
 internal sealed class Open3DPreviewCommand
 {
     private const int MaxMessageLength = 3600;
+    private static readonly TimeSpan ProcessTimeout = TimeSpan.FromMinutes(3);
     private readonly AsyncPackage _package;
 
     private Open3DPreviewCommand(AsyncPackage package, OleMenuCommandService commandService)
@@ -306,7 +308,7 @@ internal sealed class Open3DPreviewCommand
             fullName = namespaceName + "." + fullName;
         }
 
-        var classText = source.Substring(innermost.MatchStart, Math.Max(0, innermost.CloseBrace - innermost.MatchStart + 1));
+        var classText = source.Substring(innermost.MatchStart, global::System.Math.Max(0, innermost.CloseBrace - innermost.MatchStart + 1));
         var isPreviewCandidate =
             innermost.Tail.IndexOf("CompositeObject3D", StringComparison.OrdinalIgnoreCase) >= 0 ||
             innermost.Attributes.IndexOf("Preview3D", StringComparison.OrdinalIgnoreCase) >= 0 ||
@@ -691,6 +693,23 @@ internal sealed class Open3DPreviewCommand
             EnableRaisingEvents = true
         };
 
+        var timeout = new CancellationTokenSource(ProcessTimeout);
+        timeout.Token.Register(() =>
+        {
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill();
+                }
+            }
+            catch
+            {
+            }
+
+            tcs.TrySetResult(new ProcessResult(-2, stdout.ToString(), stderr.ToString() + global::System.Environment.NewLine + "Process timed out after " + ProcessTimeout.TotalSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture) + " seconds."));
+        });
+
         process.OutputDataReceived += (_, e) =>
         {
             if (e.Data is not null)
@@ -707,9 +726,16 @@ internal sealed class Open3DPreviewCommand
         };
         process.Exited += (_, _) =>
         {
-            var exitCode = process.ExitCode;
-            process.Dispose();
-            tcs.TrySetResult(new ProcessResult(exitCode, stdout.ToString(), stderr.ToString()));
+            try
+            {
+                var exitCode = process.ExitCode;
+                tcs.TrySetResult(new ProcessResult(exitCode, stdout.ToString(), stderr.ToString()));
+            }
+            finally
+            {
+                timeout.Dispose();
+                process.Dispose();
+            }
         };
 
         try
@@ -720,6 +746,7 @@ internal sealed class Open3DPreviewCommand
         }
         catch (Exception ex)
         {
+            timeout.Dispose();
             process.Dispose();
             tcs.TrySetResult(new ProcessResult(-1, stdout.ToString(), stderr.ToString() + ex.ToString()));
         }

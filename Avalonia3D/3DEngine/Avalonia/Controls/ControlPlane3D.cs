@@ -69,7 +69,7 @@ public class ControlPlane3D : Object3D
     public bool AlwaysFaceCamera
     {
         get => _alwaysFaceCamera;
-        set => SetField(ref _alwaysFaceCamera, value, SceneChangeKind.Control);
+        set => SetField(ref _alwaysFaceCamera, value);
     }
 
     public int RenderPixelWidth
@@ -91,7 +91,7 @@ public class ControlPlane3D : Object3D
     internal void MarkSnapshotDirty()
     {
         _snapshotDirty = true;
-        RaiseChanged(SceneChangeKind.Control, nameof(Snapshot));
+        RaiseChanged(SceneChangeKind.Control);
     }
 
     internal void UpdateSnapshot(RenderTargetBitmap? bitmap, int pixelWidth, int pixelHeight)
@@ -106,10 +106,34 @@ public class ControlPlane3D : Object3D
         RenderPixelHeight = pixelHeight;
         _snapshotDirty = false;
         _snapshotVersion++;
-        RaiseChanged(SceneChangeKind.Control, nameof(Snapshot));
+        RaiseChanged(SceneChangeKind.Control);
     }
 
     public override Matrix4x4 GetModelMatrix() => base.GetModelMatrix();
+
+    /// <summary>
+    /// Rotates the plane so that its front side (+Z local normal) faces the current camera position.
+    /// This is useful for fixed-position UI panels that should be readable without using billboard mode.
+    /// </summary>
+    public void FaceCamera(Camera3D camera)
+    {
+        if (camera is null)
+        {
+            throw new ArgumentNullException(nameof(camera));
+        }
+
+        var direction = camera.Position - Position;
+        RotationDegrees = DirectionToEulerDegrees(direction);
+    }
+
+    private static Vector3 DirectionToEulerDegrees(Vector3 direction)
+    {
+        direction = direction.LengthSquared() > 0.000001f ? Vector3.Normalize(direction) : Vector3.UnitZ;
+        var yaw = MathF.Atan2(direction.X, direction.Z) * 180f / MathF.PI;
+        var horizontal = MathF.Sqrt(direction.X * direction.X + direction.Z * direction.Z);
+        var pitch = -MathF.Atan2(direction.Y, horizontal) * 180f / MathF.PI;
+        return new Vector3(pitch, yaw, 0f);
+    }
 
     private void UpdateColliderSize()
     {

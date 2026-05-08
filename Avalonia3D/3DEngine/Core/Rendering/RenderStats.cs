@@ -2,8 +2,6 @@ namespace ThreeDEngine.Core.Rendering;
 
 public sealed class RenderStats
 {
-    public RendererInvalidationKind RendererInvalidation { get; set; }
-    public string FullRebuildReason { get; set; } = string.Empty;
     public int ObjectCount { get; set; }
     public int RenderableCount { get; set; }
     public int PickableCount { get; set; }
@@ -17,10 +15,78 @@ public sealed class RenderStats
     public int EstimatedDrawCallCount { get; set; }
     public int InstancedBatchCount { get; set; }
     public int HighScaleInstanceCount { get; set; }
+public int ParticleSystemCount { get; set; }
+public int ParticleCount { get; set; }
+public int ParticleVertexCount { get; set; }
+public long ParticleMeshUploadBytes { get; set; }
+public int InstancedMeshLayerCount { get; set; }
+public int InstancedMeshInstanceCount { get; set; }
+public int ThroughputFallbackDrawCount { get; set; }
+public int RetainedThroughputDrawCount { get; set; }
+public bool IndirectDrawRequested { get; set; }
+public bool IndirectDrawActive { get; set; }
+public bool BindlessTextureRequested { get; set; }
+public bool BindlessTextureActive { get; set; }
+public int ImportedModelCount { get; set; }
+public int SkinnedModelCount { get; set; }
+public int AnimatedModelCount { get; set; }
+public int SkinMatrixCount { get; set; }
+public int SkinnedPrimitiveCount { get; set; }
+public long SkinningVertexPayloadBytes { get; set; }
+public bool GpuSkinningRequested { get; set; }
+public bool GpuSkinningActive { get; set; }
+public string SkinningFallbackReason { get; set; } = string.Empty;
+    public int RenderPipelineMode { get; set; }
+    public bool DeferredRequested { get; set; }
+    public bool DeferredActive { get; set; }
+    public bool GBufferActive { get; set; }
+    public int GBufferTargetCount { get; set; }
+    public bool SsaoRequested { get; set; }
+    public bool SsaoActive { get; set; }
+    public int SsaoSampleCount { get; set; }
+    public double SsaoMilliseconds { get; set; }
+    public bool HdrRequested { get; set; }
+    public bool HdrActive { get; set; }
+    public int ToneMappingMode { get; set; }
+    public bool ToneMappingActive { get; set; }
+    public float ToneMappingExposure { get; set; }
+    public float ToneMappingGamma { get; set; }
+    public int RenderPassCount { get; set; }
+    public bool MotionVectorsRequested { get; set; }
+    public bool MotionVectorsActive { get; set; }
+    public string RenderPipelineReason { get; set; } = string.Empty;
     public int CulledObjectCount { get; set; }
     public int DirtyMeshUploads { get; set; }
     public int DirtyTextureUploads { get; set; }
+    public int DirectionalLightCount { get; set; }
+    public int PointLightCount { get; set; }
+    public int SpotLightCount { get; set; }
+    public int RenderGeometryCount { get; set; }
+    public int VertexBufferUploadCount { get; set; }
+    public int IndexBufferUploadCount { get; set; }
+    public long VertexBufferUploadBytes { get; set; }
+    public long IndexBufferUploadBytes { get; set; }
+    public long MeshUploadBytes { get; set; }
+    public int ShaderProgramSwitches { get; set; }
+    public int TangentSpaceMeshCount { get; set; }
+    public int GeneratedNormalMeshCount { get; set; }
+    public int GeneratedTangentMeshCount { get; set; }
+    public int NormalMappedMeshCount { get; set; }
+    public int WireframeOverlayDrawCalls { get; set; }
+    public int SilhouetteOverlayDrawCalls { get; set; }
+    public long TangentUploadBytes { get; set; }
+    public long WireframeIndexUploadBytes { get; set; }
+    public long PacketBytes { get; set; }
     public long TextureUploadBytes { get; set; }
+    public bool SkyboxEnabled { get; set; }
+    public int SkyboxMode { get; set; }
+    public int SkyboxDrawCalls { get; set; }
+    public bool DirectionalShadowEnabled { get; set; }
+    public int ShadowMapCount { get; set; }
+    public int ShadowCasterCount { get; set; }
+    public int ShadowMapResolution { get; set; }
+    public string ShadowMapReason { get; set; } = string.Empty;
+    public double ShadowMapMilliseconds { get; set; }
     public int RegistryVersion { get; set; }
     public int MeshCacheCount { get; set; }
     public int SceneTraversalCount { get; set; }
@@ -71,8 +137,6 @@ public sealed class RenderStats
     public int RenderTargetHeight { get; set; }
     public int BakedHighScalePartDraws { get; set; }
     public bool WebGlClientHighScaleRuntime { get; set; }
-    public bool WebGlJsOwnedRuntimeRequested { get; set; }
-    public string WebGlFallbackReason { get; set; } = string.Empty;
     public bool WebGlClientGpuTransformAnimation { get; set; }
     public int WebGlVersion { get; set; }
     public double JsCullMilliseconds { get; set; }
@@ -89,5 +153,5 @@ public sealed class RenderStats
     public int JsTexturePayloadErrors { get; set; }
     public int JsPalettePayloadErrors { get; set; }
 
-    public static RenderStats Empty { get; } = new RenderStats();
+    public static RenderStats Empty => new RenderStats();
 }

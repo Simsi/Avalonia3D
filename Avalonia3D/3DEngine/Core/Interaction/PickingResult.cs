@@ -3,4 +3,4 @@ using ThreeDEngine.Core.Scene;
 
 namespace ThreeDEngine.Core.Interaction;
 
-public sealed record PickingResult(Object3D Object, Vector3 WorldPosition, float Distance);
+public sealed record PickingResult(Object3D Object, Vector3 WorldPosition, float Distance, ModelHitResult3D? ModelHit = null);

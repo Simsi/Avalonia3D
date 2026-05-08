@@ -1,6 +1,7 @@
 using System;
 using System.Numerics;
 using ThreeDEngine.Core.Primitives;
+using ThreeDEngine.Core.Scene;
 
 namespace ThreeDEngine.Core.Lighting;
 
@@ -10,6 +11,8 @@ public sealed class DirectionalLight3D
     private ColorRgba _color = ColorRgba.White;
     private float _intensity = 1f;
     private bool _isEnabled = true;
+
+    internal Scene3D? OwnerScene { get; set; }
 
     public event EventHandler? Changed;
 

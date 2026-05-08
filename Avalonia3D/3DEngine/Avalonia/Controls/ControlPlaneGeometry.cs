@@ -165,29 +165,30 @@ internal static class ControlPlaneGeometry
         var model = plane.GetModelMatrix();
         center = Vector3.Transform(Vector3.Zero, model);
 
-        right = camera.Right;
-        if (right.LengthSquared() < 0.000001f)
+        var frontToCamera = camera.Position - center;
+        if (frontToCamera.LengthSquared() < 0.000001f)
         {
-            right = Vector3.UnitX;
+            frontToCamera = -camera.Forward;
         }
-        else
-        {
-            right = Vector3.Normalize(right);
-        }
+        frontToCamera = SafeNormalize(frontToCamera, Vector3.UnitZ);
 
-        up = Vector3.Cross(camera.Forward, right);
-        if (up.LengthSquared() < 0.000001f)
-        {
-            up = camera.SafeUp;
-        }
+        up = camera.SafeUp;
         if (up.LengthSquared() < 0.000001f)
         {
             up = Vector3.UnitY;
         }
-        else
+        up = SafeNormalize(up, Vector3.UnitY);
+
+        // Billboard UI uses a front-facing basis: +X maps to screen-right and +Y maps
+        // to screen-up. The previous variants fixed one axis while flipping the other,
+        // which made Avalonia snapshots either mirrored or vertically inverted.
+        right = Vector3.Cross(up, frontToCamera);
+        if (right.LengthSquared() < 0.000001f)
         {
-            up = Vector3.Normalize(up);
+            right = camera.Right;
         }
+        right = SafeNormalize(right, Vector3.UnitX);
+        up = SafeNormalize(Vector3.Cross(frontToCamera, right), Vector3.UnitY);
 
         var radiansZ = plane.RotationDegrees.Z * (System.MathF.PI / 180f);
         if (System.MathF.Abs(radiansZ) > 0.0001f)

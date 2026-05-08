@@ -1,4 +1,3 @@
-#if THREE_DENGINE_PREVIEWER_APP
 using System;
 using Avalonia;
 using Avalonia.Controls.ApplicationLifetimes;
@@ -61,4 +60,3 @@ internal sealed class PreviewerArguments
         return parsed;
     }
 }
-#endif

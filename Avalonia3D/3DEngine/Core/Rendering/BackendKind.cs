@@ -4,6 +4,5 @@ public enum BackendKind
 {
     Unknown = 0,
     OpenGlDesktop = 1,
-    WebGlBrowser = 2,
-    Cpu = 3
+    WebGlBrowser = 2
 }

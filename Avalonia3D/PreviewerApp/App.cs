@@ -1,4 +1,3 @@
-#if THREE_DENGINE_PREVIEWER_APP
 using Avalonia;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Themes.Fluent;
@@ -37,4 +36,3 @@ public sealed class App : Application
         base.OnFrameworkInitializationCompleted();
     }
 }
-#endif

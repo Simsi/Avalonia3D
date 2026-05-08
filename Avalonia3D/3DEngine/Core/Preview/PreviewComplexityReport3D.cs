@@ -31,7 +31,7 @@ public sealed class PreviewComplexityReport3D
         var estimatedDrawCalls = 0;
         var warningCount = 0;
 
-        foreach (var obj in scene.Registry.AllObjects)
+        foreach (var obj in scene.Registry.SnapshotAllObjects())
         {
             objectCount++;
             if (obj is CompositeObject3D) compositeCount++;

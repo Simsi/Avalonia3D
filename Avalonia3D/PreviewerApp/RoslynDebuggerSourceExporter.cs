@@ -1,4 +1,3 @@
-#if THREE_DENGINE_PREVIEWER_APP || THREE_DENGINE_SMOKE_TESTS
 using System;
 using System.IO;
 using System.Linq;
@@ -78,132 +77,58 @@ internal static class RoslynDebuggerSourceExporter
 
             rewrittenRoot = ApplyGeneratedEventMembers(rewrittenRoot, classNode, request);
             rewrittenRoot = EnsureDebuggerUsings(rewrittenRoot);
-            var rewritten = rewrittenRoot.NormalizeWhitespace(elasticTrivia: true).ToFullString();
+            var rewritten = rewrittenRoot.ToFullString();
+            var validationRoot = CSharpSyntaxTree.ParseText(rewritten, path: request.FilePath).GetCompilationUnitRoot();
+            var validationErrors = validationRoot.GetDiagnostics()
+                .Where(d => d.Severity == DiagnosticSeverity.Error)
+                .Take(5)
+                .Select(d => d.ToString())
+                .ToArray();
+            if (validationErrors.Length > 0)
+            {
+                return Task.FromResult(DebuggerSourceExportResult.Failed(
+                    "Generated Build update is not valid C# syntax. Source was not written:\n" + string.Join("\n", validationErrors),
+                    request.FilePath));
+            }
+
             if (string.Equals(original, rewritten, StringComparison.Ordinal))
             {
                 return Task.FromResult(DebuggerSourceExportResult.Failed("Roslyn produced no source changes.", request.FilePath));
             }
 
-            var diffPreview = BuildUnifiedDiff(request.FilePath, original, rewritten);
-            if (IsPreviewOnly(request))
+            var directory = Path.GetDirectoryName(request.FilePath) ?? global::System.Environment.CurrentDirectory;
+            var fileName = Path.GetFileName(request.FilePath);
+            var stamp = DateTime.UtcNow.ToString("yyyyMMddHHmmssfff", System.Globalization.CultureInfo.InvariantCulture);
+            var backupPath = Path.Combine(directory, fileName + "." + stamp + ".3dmodel.bak");
+            var tempPath = Path.Combine(directory, fileName + "." + Guid.NewGuid().ToString("N") + ".3dmodel.tmp");
+            File.WriteAllText(tempPath, rewritten, Encoding.UTF8);
+            try
             {
-                return Task.FromResult(CreatePreviewResult(
-                    "Roslyn source export preview generated. Review the diff before applying.",
-                    request.FilePath,
-                    mode,
-                    diffPreview));
+                if (File.Exists(request.FilePath))
+                {
+                    File.Replace(tempPath, request.FilePath, backupPath, ignoreMetadataErrors: true);
+                }
+                else
+                {
+                    File.Move(tempPath, request.FilePath);
+                    File.WriteAllText(backupPath, original, Encoding.UTF8);
+                }
+            }
+            finally
+            {
+                try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
             }
 
-            var backupPath = request.FilePath + ".3ddebugger.bak";
-            File.WriteAllText(backupPath, original, Encoding.UTF8);
-            File.WriteAllText(request.FilePath, rewritten, Encoding.UTF8);
-            return Task.FromResult(CreateCompletedResult(
-                "Experimental Roslyn source export completed. Rebuild the project to reload the debugger view.",
+            return Task.FromResult(DebuggerSourceExportResult.Completed(
+                "3DModelEditor updated Build(...). Rebuild the project to reload the visual model.",
                 request.FilePath,
                 backupPath,
-                mode,
-                diffPreview));
+                mode));
         }
         catch (Exception ex)
         {
             return Task.FromResult(DebuggerSourceExportResult.Failed("Roslyn source export failed: " + ex.Message, request.FilePath));
         }
-    }
-
-
-    private static bool IsPreviewOnly(DebuggerSourceExportRequest request)
-    {
-        // Keep PreviewerApp build-compatible with older source drops while still
-        // using the v89+/v90 preview-first contract when it is present.
-        var property = typeof(DebuggerSourceExportRequest).GetProperty("PreviewOnly");
-        return property?.GetValue(request) is bool previewOnly && previewOnly;
-    }
-
-    private static DebuggerSourceExportResult CreatePreviewResult(string message, string filePath, string mode, string diffPreview)
-    {
-        var resultType = typeof(DebuggerSourceExportResult);
-        var previewMethod = resultType.GetMethods()
-            .FirstOrDefault(m =>
-                string.Equals(m.Name, "Preview", StringComparison.Ordinal) &&
-                m.IsStatic &&
-                m.GetParameters().Length == 4);
-        if (previewMethod is not null)
-        {
-            return (DebuggerSourceExportResult)previewMethod.Invoke(null, new object[] { message, filePath, mode, diffPreview })!;
-        }
-
-        var constructor = resultType.GetConstructors()
-            .FirstOrDefault(c => c.GetParameters().Length == 6);
-        if (constructor is not null)
-        {
-            return (DebuggerSourceExportResult)constructor.Invoke(new object?[] { true, message, filePath, null, mode, diffPreview });
-        }
-
-        return DebuggerSourceExportResult.Failed(
-            "Roslyn source export preview was generated, but the loaded debugger contract does not expose preview-result support. " +
-            "Apply the current 3DEngine/Avalonia/Preview/DebuggerSourceExportRequest.cs source drop and rebuild.\n\n" + diffPreview,
-            filePath);
-    }
-
-    private static DebuggerSourceExportResult CreateCompletedResult(string message, string filePath, string backupPath, string mode, string diffPreview)
-    {
-        var resultType = typeof(DebuggerSourceExportResult);
-        var completedMethods = resultType.GetMethods()
-            .Where(m => string.Equals(m.Name, "Completed", StringComparison.Ordinal) && m.IsStatic)
-            .ToArray();
-
-        var completedWithDiff = completedMethods.FirstOrDefault(m => m.GetParameters().Length == 5);
-        if (completedWithDiff is not null)
-        {
-            return (DebuggerSourceExportResult)completedWithDiff.Invoke(null, new object[] { message, filePath, backupPath, mode, diffPreview })!;
-        }
-
-        var completedLegacy = completedMethods.FirstOrDefault(m => m.GetParameters().Length == 4);
-        if (completedLegacy is not null)
-        {
-            return (DebuggerSourceExportResult)completedLegacy.Invoke(null, new object[] { message, filePath, backupPath, mode })!;
-        }
-
-        var constructorWithDiff = resultType.GetConstructors()
-            .FirstOrDefault(c => c.GetParameters().Length == 6);
-        if (constructorWithDiff is not null)
-        {
-            return (DebuggerSourceExportResult)constructorWithDiff.Invoke(new object?[] { true, message, filePath, backupPath, mode, diffPreview });
-        }
-
-        var legacyConstructor = resultType.GetConstructors()
-            .FirstOrDefault(c => c.GetParameters().Length == 5);
-        if (legacyConstructor is not null)
-        {
-            return (DebuggerSourceExportResult)legacyConstructor.Invoke(new object?[] { true, message, filePath, backupPath, mode });
-        }
-
-        return DebuggerSourceExportResult.Failed("Roslyn source export completed, but the debugger result contract could not be constructed.", filePath);
-    }
-
-    private static string BuildUnifiedDiff(string path, string original, string rewritten)
-    {
-        var originalLines = original.Replace("\r\n", "\n").Split('\n');
-        var rewrittenLines = rewritten.Replace("\r\n", "\n").Split('\n');
-        var sb = new StringBuilder();
-        sb.Append("--- ").Append(path).AppendLine(" (current)");
-        sb.Append("+++ ").Append(path).AppendLine(" (debugger export)");
-        var max = Math.Max(originalLines.Length, rewrittenLines.Length);
-        for (var i = 0; i < max; i++)
-        {
-            var oldLine = i < originalLines.Length ? originalLines[i] : null;
-            var newLine = i < rewrittenLines.Length ? rewrittenLines[i] : null;
-            if (string.Equals(oldLine, newLine, StringComparison.Ordinal))
-            {
-                continue;
-            }
-
-            sb.Append("@@ line ").Append(i + 1).AppendLine(" @@");
-            if (oldLine is not null) sb.Append('-').AppendLine(oldLine);
-            if (newLine is not null) sb.Append('+').AppendLine(newLine);
-        }
-
-        return sb.ToString();
     }
 
     private static CompilationUnitSyntax ApplyGeneratedEventMembers(CompilationUnitSyntax root, ClassDeclarationSyntax originalClassNode, DebuggerSourceExportRequest request)
@@ -285,19 +210,19 @@ internal static class RoslynDebuggerSourceExporter
         var indentation = ResolveClassMemberIndentation(classNode);
         if (classNode.Members.Count == 0)
         {
-            return SyntaxFactory.TriviaList(SyntaxFactory.EndOfLine(Environment.NewLine), SyntaxFactory.Whitespace(indentation));
+            return SyntaxFactory.TriviaList(SyntaxFactory.EndOfLine(global::System.Environment.NewLine), SyntaxFactory.Whitespace(indentation));
         }
 
         return SyntaxFactory.TriviaList(
-            SyntaxFactory.EndOfLine(Environment.NewLine),
-            SyntaxFactory.EndOfLine(Environment.NewLine),
+            SyntaxFactory.EndOfLine(global::System.Environment.NewLine),
+            SyntaxFactory.EndOfLine(global::System.Environment.NewLine),
             SyntaxFactory.Whitespace(indentation));
     }
 
     private static SyntaxTriviaList CreateInsertedMethodTrailingTrivia(ClassDeclarationSyntax classNode)
     {
         var indentation = ResolveClassMemberIndentation(classNode);
-        return SyntaxFactory.TriviaList(SyntaxFactory.EndOfLine(Environment.NewLine), SyntaxFactory.Whitespace(indentation));
+        return SyntaxFactory.TriviaList(SyntaxFactory.EndOfLine(global::System.Environment.NewLine), SyntaxFactory.Whitespace(indentation));
     }
 
     private static string ResolveClassMemberIndentation(ClassDeclarationSyntax classNode)
@@ -305,7 +230,7 @@ internal static class RoslynDebuggerSourceExporter
         foreach (var member in classNode.Members)
         {
             var text = member.GetLeadingTrivia().ToFullString();
-            var lastLineBreak = Math.Max(text.LastIndexOf('\n'), text.LastIndexOf('\r'));
+            var lastLineBreak = global::System.Math.Max(text.LastIndexOf('\n'), text.LastIndexOf('\r'));
             var suffix = lastLineBreak >= 0 ? text[(lastLineBreak + 1)..] : text;
             if (!string.IsNullOrWhiteSpace(suffix) && suffix.All(char.IsWhiteSpace))
             {
@@ -314,7 +239,7 @@ internal static class RoslynDebuggerSourceExporter
         }
 
         var classText = classNode.GetLeadingTrivia().ToFullString();
-        var classLineBreak = Math.Max(classText.LastIndexOf('\n'), classText.LastIndexOf('\r'));
+        var classLineBreak = global::System.Math.Max(classText.LastIndexOf('\n'), classText.LastIndexOf('\r'));
         var classIndent = classLineBreak >= 0 ? classText[(classLineBreak + 1)..] : classText;
         if (!string.IsNullOrWhiteSpace(classIndent) && classIndent.All(char.IsWhiteSpace))
         {
@@ -347,7 +272,7 @@ internal static class RoslynDebuggerSourceExporter
         }
 
         var byPosition = candidates
-            .OrderBy(c => Math.Abs(c.SpanStart - request.ClassStart))
+            .OrderBy(c => global::System.Math.Abs(c.SpanStart - request.ClassStart))
             .FirstOrDefault();
         return byPosition ?? candidates[0];
     }
@@ -394,4 +319,3 @@ internal static class RoslynDebuggerSourceExporter
         return name.Trim().Replace('+', '.');
     }
 }
-#endif

@@ -4,10 +4,13 @@ using System.Diagnostics;
 using System.Numerics;
 using System.Text.Json;
 using ThreeDEngine.Avalonia.WebGL.Interop;
+using ThreeDEngine.Core.Environment;
 using ThreeDEngine.Core.HighScale;
+using ThreeDEngine.Core.Lighting;
 using ThreeDEngine.Core.Materials;
 using ThreeDEngine.Core.Primitives;
 using ThreeDEngine.Core.Rendering;
+using ThreeDEngine.Core.Rendering.Shadows;
 using ThreeDEngine.Core.Scene;
 
 namespace ThreeDEngine.Avalonia.WebGL.Rendering;
@@ -33,16 +36,8 @@ internal sealed class WebGlClientHighScaleRenderer
     private readonly List<int> _dirtyTransformIndices = new(1024);
     private int[] _dirtyTransformScratch = Array.Empty<int>();
     private readonly Stopwatch _animationClock = Stopwatch.StartNew();
-    private bool _forceStructuralRebuild;
 
     public bool HasRuntimeState => _layers.Count != 0;
-
-    public bool ForceJsOwnedRuntime { get; set; } = true;
-
-    public void InvalidateStructure()
-    {
-        _forceStructuralRebuild = true;
-    }
 
     public void Reset(int hostId)
     {
@@ -63,10 +58,18 @@ internal sealed class WebGlClientHighScaleRenderer
     {
         stats.WebGlClientHighScaleRuntime = true;
         stats.WebGlClientGpuTransformAnimation = scene.Performance.EnableWebGlClientGpuTransformAnimation;
+        stats.SkyboxEnabled = scene.Environment.Skybox.Mode != SkyboxMode3D.None;
+        stats.SkyboxMode = (int)scene.Environment.Skybox.Mode;
+        var initialShadow = DirectionalShadowResolver3D.Resolve(scene);
+        stats.DirectionalShadowEnabled = initialShadow.IsEnabled;
+        stats.ShadowMapResolution = initialShadow.Resolution;
+        stats.ShadowMapReason = initialShadow.Reason;
         EnsureSnapshots(hostId, scene, stats);
         ApplyPatches(hostId, scene, stats);
 
         var light = ResolveLight(scene);
+        var shadow = DirectionalShadowResolver3D.Resolve(scene);
+        var skybox = scene.Environment.Skybox;
         var frameJson = JsonSerializer.Serialize(new
         {
             width,
@@ -79,6 +82,17 @@ internal sealed class WebGlClientHighScaleRenderer
             directionalLightColor = light.DirectionalColor,
             pointLightPosition = light.PointPosition,
             pointLightColor = light.PointColor,
+            skyboxEnabled = skybox.Mode != SkyboxMode3D.None,
+            skyboxMode = (int)skybox.Mode,
+            skyboxTopColor = skybox.TopColor.ToArray(),
+            skyboxHorizonColor = skybox.HorizonColor.ToArray(),
+            skyboxBottomColor = skybox.BottomColor.ToArray(),
+            skyboxIntensity = skybox.Intensity,
+            directionalShadowEnabled = shadow.IsEnabled,
+            directionalShadowResolution = shadow.Resolution,
+            directionalShadowStrength = shadow.Strength,
+            directionalShadowBias = shadow.Bias,
+            directionalShadowReason = shadow.Reason,
             clientAnimationEnabled = scene.Performance.EnableWebGlClientGpuTransformAnimation,
             clientAnimationTime = scene.Performance.EnableWebGlClientGpuTransformAnimation ? (float)_animationClock.Elapsed.TotalSeconds : 0f,
             clientAnimationAmplitude = scene.Performance.WebGlClientGpuTransformAnimationAmplitude
@@ -127,18 +141,17 @@ internal sealed class WebGlClientHighScaleRenderer
             var structuralVersion = BuildStructuralVersion(layer, scene);
             if (hasRuntime)
             {
-                if (!_forceStructuralRebuild && runtime!.StructuralVersion == structuralVersion)
+                if (runtime!.StructuralVersion == structuralVersion)
                 {
                     continue;
                 }
 
-                DestroyLayer(hostId, runtime!);
+                DestroyLayer(hostId, runtime);
             }
 
             runtime = BuildAndUploadLayer(hostId, layer, scene, structuralVersion, stats);
             _layers[layer.Id] = runtime;
             WebGlInterop.UploadHighScaleLayerSnapshot(hostId, layer.Id, runtime.SnapshotJson);
-            _forceStructuralRebuild = false;
             layer.StateBuffer.ClearDirty();
         }
 
@@ -286,7 +299,7 @@ internal sealed class WebGlClientHighScaleRenderer
     {
         var alpha = ResolveChunkFadeAlpha(scene, layer, chunkCenter);
         var usePalette = scene.Performance.EnableHighScalePaletteTexture && part.UsesVertexMaterialSlots && layer.ColorResolver is null;
-        var lighting = part.LightingMode == LightingMode.Lambert ? 1f : 0f;
+        var lighting = ToLightingUniform(part.LightingMode);
         var batch = new BatchRuntime(batchId, part, usePalette, lighting, indices.Count)
         {
             StateVersion = layer.StateBuffer.Version,
@@ -793,30 +806,16 @@ internal sealed class WebGlClientHighScaleRenderer
 
     private static (float[] Ambient, float[] Direction, float[] DirectionalColor, float[] PointPosition, float[] PointColor) ResolveLight(Scene3D scene)
     {
-        var ambient = new[] { 0.28f, 0.28f, 0.28f };
-        var dir = new[] { -0.35f, -0.75f, -0.55f };
-        var dirColor = new[] { 0f, 0f, 0f };
-        foreach (var light in scene.Lights)
-        {
-            if (!light.IsEnabled) continue;
-            var direction = light.Direction.LengthSquared() < 0.000001f ? new Vector3(-0.35f, -0.75f, -0.55f) : Vector3.Normalize(light.Direction);
-            dir = new[] { direction.X, direction.Y, direction.Z };
-            dirColor = new[] { light.Color.R * light.Intensity, light.Color.G * light.Intensity, light.Color.B * light.Intensity };
-            break;
-        }
-
-        var pointPos = new[] { 0f, 0f, 0f, 1f };
-        var pointColor = new[] { 0f, 0f, 0f, 0f };
-        foreach (var light in scene.PointLights)
-        {
-            if (!light.IsEnabled) continue;
-            pointPos = new[] { light.Position.X, light.Position.Y, light.Position.Z, light.Range };
-            pointColor = new[] { light.Color.R * light.Intensity, light.Color.G * light.Intensity, light.Color.B * light.Intensity, 1f };
-            break;
-        }
-
-        return (ambient, dir, dirColor, pointPos, pointColor);
+        var light = SceneLightingResolver3D.Resolve(scene);
+        return (ToArray(light.Ambient), ToArray(light.DirectionalDirection), ToArray(light.DirectionalColor), ToArray(light.PointPosition), ToArray(light.PointColor));
     }
+
+    private static float ToLightingUniform(LightingMode mode)
+        => mode == LightingMode.Unlit ? 0f : mode == LightingMode.Lambert ? 1f : mode == LightingMode.Phong ? 2f : 3f;
+
+    private static float[] ToArray(Vector3 value) => new[] { value.X, value.Y, value.Z };
+
+    private static float[] ToArray(Vector4 value) => new[] { value.X, value.Y, value.Z, value.W };
 
     private static float[] ToArray(Matrix4x4 matrix)
     {
@@ -838,7 +837,7 @@ internal sealed class WebGlClientHighScaleRenderer
             TemplateId = templateId;
             InstanceCount = instanceCount;
             PaletteTextureEnabled = paletteTextureEnabled;
-            _transformVersionsByInstance = new int[Math.Max(1, instanceCount)];
+            _transformVersionsByInstance = new int[global::System.Math.Max(1, instanceCount)];
         }
 
         public string LayerId { get; }
@@ -912,7 +911,7 @@ internal sealed class WebGlClientHighScaleRenderer
         {
             if (_stateDirtyOffsets.Length <= _stateDirtyOffsetCount)
             {
-                Array.Resize(ref _stateDirtyOffsets, Math.Max(16, _stateDirtyOffsets.Length * 2));
+                Array.Resize(ref _stateDirtyOffsets, global::System.Math.Max(16, _stateDirtyOffsets.Length * 2));
             }
 
             _stateDirtyOffsets[_stateDirtyOffsetCount++] = offset;
@@ -922,7 +921,7 @@ internal sealed class WebGlClientHighScaleRenderer
         {
             if (_transformDirtyOffsets.Length <= _transformDirtyOffsetCount)
             {
-                Array.Resize(ref _transformDirtyOffsets, Math.Max(16, _transformDirtyOffsets.Length * 2));
+                Array.Resize(ref _transformDirtyOffsets, global::System.Math.Max(16, _transformDirtyOffsets.Length * 2));
             }
 
             _transformDirtyOffsets[_transformDirtyOffsetCount++] = offset;

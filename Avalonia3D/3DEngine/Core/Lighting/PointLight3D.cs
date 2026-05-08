@@ -1,6 +1,7 @@
 using System;
 using System.Numerics;
 using ThreeDEngine.Core.Primitives;
+using ThreeDEngine.Core.Scene;
 
 namespace ThreeDEngine.Core.Lighting;
 
@@ -11,6 +12,8 @@ public sealed class PointLight3D
     private float _intensity = 2.5f;
     private float _range = 12f;
     private bool _isEnabled = true;
+
+    internal Scene3D? OwnerScene { get; set; }
 
     public event EventHandler? Changed;
 

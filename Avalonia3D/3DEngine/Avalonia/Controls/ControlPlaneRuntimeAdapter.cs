@@ -14,6 +14,9 @@ namespace ThreeDEngine.Avalonia.Controls;
 
 internal sealed class ControlPlaneRuntimeAdapter : IDisposable
 {
+    private const double MaxSnapshotEdge = 4096d;
+    private const double MaxSnapshotPixels = 4096d * 4096d;
+
     private readonly ControlPlane3D _plane;
     private readonly Control _sourceControl;
     private readonly Canvas _host;
@@ -746,6 +749,16 @@ internal sealed class ControlPlaneRuntimeAdapter : IDisposable
         if (height <= 0d)
         {
             height = 180d;
+        }
+
+        width = System.Math.Clamp(width, 1d, MaxSnapshotEdge);
+        height = System.Math.Clamp(height, 1d, MaxSnapshotEdge);
+        var pixels = width * height;
+        if (pixels > MaxSnapshotPixels)
+        {
+            var scale = System.Math.Sqrt(MaxSnapshotPixels / pixels);
+            width = System.Math.Max(1d, System.Math.Floor(width * scale));
+            height = System.Math.Max(1d, System.Math.Floor(height * scale));
         }
 
         return new Size(width, height);

@@ -153,9 +153,15 @@ public abstract class CompositeObject3D : Object3D
             throw new InvalidOperationException($"A part named '{name}' already exists in '{Name}'.");
         }
 
+        if (part.OwnerScene is not null && !ReferenceEquals(part.OwnerScene, OwnerScene))
+        {
+            throw new InvalidOperationException($"Part '{name}' is already attached to another scene.");
+        }
+
         part.Name = name;
+        part.OwnerScene = OwnerScene;
         part.Parent = this;
-        part.ChangedDetailed += OnChildChangedDetailed;
+        part.Changed += OnChildChanged;
         _children.Add(part);
         _parts.Add(name, part);
     }
@@ -186,7 +192,8 @@ public abstract class CompositeObject3D : Object3D
 
         foreach (var child in oldChildren)
         {
-            child.ChangedDetailed -= OnChildChangedDetailed;
+            child.Changed -= OnChildChanged;
+            child.OwnerScene = null;
             child.Parent = null;
         }
 
@@ -203,7 +210,8 @@ public abstract class CompositeObject3D : Object3D
 
             foreach (var child in newChildren)
             {
-                child.ChangedDetailed -= OnChildChangedDetailed;
+                child.Changed -= OnChildChanged;
+                child.OwnerScene = null;
                 child.Parent = null;
             }
         }
@@ -211,7 +219,8 @@ public abstract class CompositeObject3D : Object3D
         {
             foreach (var child in _children)
             {
-                child.ChangedDetailed -= OnChildChangedDetailed;
+                child.Changed -= OnChildChanged;
+                child.OwnerScene = null;
                 child.Parent = null;
             }
 
@@ -219,8 +228,9 @@ public abstract class CompositeObject3D : Object3D
             _parts.Clear();
             foreach (var child in oldChildren)
             {
+                child.OwnerScene = OwnerScene;
                 child.Parent = this;
-                child.ChangedDetailed += OnChildChangedDetailed;
+                child.Changed += OnChildChanged;
                 _children.Add(child);
             }
 
@@ -246,8 +256,9 @@ public abstract class CompositeObject3D : Object3D
 
         foreach (var child in newChildren)
         {
+            child.OwnerScene = OwnerScene;
             child.Parent = this;
-            child.ChangedDetailed += OnChildChangedDetailed;
+            child.Changed += OnChildChanged;
             _children.Add(child);
         }
 
@@ -264,7 +275,8 @@ public abstract class CompositeObject3D : Object3D
     {
         foreach (var child in _children)
         {
-            child.ChangedDetailed -= OnChildChangedDetailed;
+            child.Changed -= OnChildChanged;
+            child.OwnerScene = null;
             child.Parent = null;
         }
 
@@ -276,13 +288,7 @@ public abstract class CompositeObject3D : Object3D
     {
         _worldBoundsDirty = true;
         MarkWorldBoundsDirtyRecursive();
-        RaiseChanged(SceneChangeKind.Unknown);
-    }
-
-    private void OnChildChangedDetailed(object? sender, Object3DChangedEventArgs e)
-    {
-        _worldBoundsDirty = true;
-        MarkWorldBoundsDirtyRecursive();
-        RaiseChanged(e.Kind, e.PropertyName);
+        var kind = e is Object3DChangedEventArgs changed ? changed.Kind : SceneChangeKind.Unknown;
+        RaiseChanged(kind);
     }
 }

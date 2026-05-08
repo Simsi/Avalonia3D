@@ -1,4 +1,3 @@
-#if THREE_DENGINE_PREVIEWER_APP
 using System;
 using System.IO;
 using System.Linq;
@@ -249,4 +248,3 @@ public sealed class PreviewerWindow : Window
         }
     }
 }
-#endif

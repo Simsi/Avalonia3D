@@ -20,12 +20,19 @@ public sealed class SphereCollider3D : Collider3D
 
     public override bool Raycast(Object3D owner, Ray ray, out RaycastHit3D hit)
     {
+        if (ray.Direction.LengthSquared() < 0.000001f)
+        {
+            hit = default;
+            return false;
+        }
+
+        var direction = Vector3.Normalize(ray.Direction);
         var model = owner.GetModelMatrix();
         var center = Vector3.Transform(Center, model);
         var radius = MathF.Max(0f, Radius * GetMaxAbsScale(model));
         var oc = ray.Origin - center;
-        var a = Vector3.Dot(ray.Direction, ray.Direction);
-        var b = 2f * Vector3.Dot(oc, ray.Direction);
+        var a = 1f;
+        var b = 2f * Vector3.Dot(oc, direction);
         var c = Vector3.Dot(oc, oc) - radius * radius;
         var discriminant = b * b - 4f * a * c;
         if (discriminant < 0f)
@@ -46,7 +53,7 @@ public sealed class SphereCollider3D : Collider3D
             return false;
         }
 
-        var point = ray.Origin + ray.Direction * t;
+        var point = ray.Origin + direction * t;
         var normalVector = point - center;
         var normal = normalVector.LengthSquared() < 0.000001f ? Vector3.UnitY : Vector3.Normalize(normalVector);
         hit = new RaycastHit3D(owner, point, normal, t);

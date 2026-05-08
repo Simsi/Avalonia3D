@@ -40,6 +40,21 @@ public sealed class SceneObjectRegistry
     public IReadOnlyList<Object3D> DynamicBodies { get { EnsureCurrent(); return _dynamicBodies; } }
     public IReadOnlyList<Object3D> StaticColliders { get { EnsureCurrent(); return _staticColliders; } }
 
+
+    public Object3D[] SnapshotAllObjects() => CopyToArray(AllObjects);
+    public Object3D[] SnapshotRenderables() => CopyToArray(Renderables);
+    public Object3D[] SnapshotPickables() => CopyToArray(Pickables);
+    public Object3D[] SnapshotColliders() => CopyToArray(Colliders);
+    public Object3D[] SnapshotDynamicBodies() => CopyToArray(DynamicBodies);
+    public Object3D[] SnapshotStaticColliders() => CopyToArray(StaticColliders);
+
+    private static Object3D[] CopyToArray(IReadOnlyList<Object3D> source)
+    {
+        var snapshot = new Object3D[source.Count];
+        for (var i = 0; i < snapshot.Length; i++) snapshot[i] = source[i];
+        return snapshot;
+    }
+
     internal void Invalidate() => _dirty = true;
 
     private void EnsureCurrent()

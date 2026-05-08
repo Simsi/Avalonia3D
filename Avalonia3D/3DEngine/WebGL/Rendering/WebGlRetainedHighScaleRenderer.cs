@@ -89,7 +89,7 @@ internal sealed class WebGlRetainedHighScaleRenderer
                     var batchId = BuildBatchId(layer, chunk.Key, renderLod, p);
                     _liveBatchIds.Add(batchId);
                     var usePalette = scene.Performance.EnableHighScalePaletteTexture && part.UsesVertexMaterialSlots && layer.ColorResolver is null;
-                    var lighting = part.LightingMode == LightingMode.Lambert ? 1f : 0f;
+                    var lighting = ToLightingUniform(part.LightingMode);
                     var batchState = GetOrCreateBatch(batchId);
                     batchState.LastLiveFrame = _frameId;
                     var instanceCount = chunk.InstanceIndices.Count;
@@ -573,6 +573,9 @@ internal sealed class WebGlRetainedHighScaleRenderer
 
     private static bool NearlyEqual(float a, float b) => MathF.Abs(a - b) <= 0.0001f;
 
+    private static float ToLightingUniform(LightingMode mode)
+        => mode == LightingMode.Unlit ? 0f : mode == LightingMode.Lambert ? 1f : mode == LightingMode.Phong ? 2f : 3f;
+
     private static byte[] ConvertFloatsToBytes(float[] values)
         => ConvertFloatsToBytes(values, 0, values.Length);
 
@@ -674,7 +677,7 @@ internal sealed class WebGlRetainedHighScaleRenderer
         {
             if (TransformVersions.Length <= offset)
             {
-                Array.Resize(ref TransformVersions, Math.Max(offset + 1, Math.Max(16, TransformVersions.Length * 2)));
+                Array.Resize(ref TransformVersions, global::System.Math.Max(offset + 1, global::System.Math.Max(16, TransformVersions.Length * 2)));
             }
 
             TransformVersions[offset] = transformVersion;
@@ -689,7 +692,7 @@ internal sealed class WebGlRetainedHighScaleRenderer
         {
             if (_stateDirtyOffsets.Length <= _stateDirtyOffsetCount)
             {
-                Array.Resize(ref _stateDirtyOffsets, Math.Max(16, _stateDirtyOffsets.Length * 2));
+                Array.Resize(ref _stateDirtyOffsets, global::System.Math.Max(16, _stateDirtyOffsets.Length * 2));
             }
 
             _stateDirtyOffsets[_stateDirtyOffsetCount++] = offset;
@@ -699,7 +702,7 @@ internal sealed class WebGlRetainedHighScaleRenderer
         {
             if (_transformDirtyOffsets.Length <= _transformDirtyOffsetCount)
             {
-                Array.Resize(ref _transformDirtyOffsets, Math.Max(16, _transformDirtyOffsets.Length * 2));
+                Array.Resize(ref _transformDirtyOffsets, global::System.Math.Max(16, _transformDirtyOffsets.Length * 2));
             }
 
             _transformDirtyOffsets[_transformDirtyOffsetCount++] = offset;
