@@ -30,39 +30,88 @@ public sealed class Jitter2PhysicsCore : IPhysicsCore, IDisposable
     private readonly Dictionary<Object3D, BodyEntry> _entries = new();
     private readonly HashSet<Object3D> _seen = new();
     private readonly List<RaycastHit3D> _raycastBuffer = new();
+    private readonly List<Object3D> _removeScratch = new();
 
     private float _accumulator;
+    private float _fixedTimeStep = 1f / 120f;
+    private int _maxStepsPerFrame = 8;
+    private float _maxFrameDeltaSeconds = 0.25f;
     private int _lastRegistryVersion = -1;
     private bool _disposed;
 
     public Jitter2PhysicsCore()
     {
         _world.AllowDeactivation = true;
-        _world.SubstepCount = 4;
-        _world.SolverIterations = (solver: 12, relaxation: 4);
+        if (OperatingSystem.IsBrowser())
+        {
+            // WASM/browser must use a lower-cost default physics profile. This is an engine-level
+            // backend profile, not demo content trimming: the same rigid bodies remain active, but
+            // Jitter2 avoids the desktop-only 120Hz/4-substep contact budget and the post-step
+            // ground probe pass unless callers explicitly re-enable them.
+            _world.SubstepCount = 1;
+            _world.SolverIterations = (solver: 7, relaxation: 2);
+            FixedTimeStep = 1f / 60f;
+            MaxStepsPerFrame = 2;
+            MaxFrameDeltaSeconds = 1f / 20f;
+            EnableGroundProbe = false;
+        }
+        else
+        {
+            _world.SubstepCount = 4;
+            _world.SolverIterations = (solver: 12, relaxation: 4);
+        }
     }
 
     public Vector3 Gravity { get; set; } = new(0f, -9.81f, 0f);
 
     /// <summary>Fixed physics integration step. 1/120 gives stable contact stacks without excessive latency.</summary>
-    public float FixedTimeStep { get; set; } = 1f / 120f;
+    public float FixedTimeStep
+    {
+        get => _fixedTimeStep;
+        set => _fixedTimeStep = OperatingSystem.IsBrowser()
+            ? global::System.Math.Clamp(value, 1f / 60f, 1f / 30f)
+            : global::System.Math.Clamp(value, 1f / 500f, 1f / 30f);
+    }
 
-    public int MaxStepsPerFrame { get; set; } = 8;
+    public int MaxStepsPerFrame
+    {
+        get => _maxStepsPerFrame;
+        set => _maxStepsPerFrame = OperatingSystem.IsBrowser()
+            ? global::System.Math.Clamp(value, 1, 2)
+            : global::System.Math.Max(1, value);
+    }
 
-    public float MaxFrameDeltaSeconds { get; set; } = 0.25f;
+    public float MaxFrameDeltaSeconds
+    {
+        get => _maxFrameDeltaSeconds;
+        set => _maxFrameDeltaSeconds = OperatingSystem.IsBrowser()
+            ? global::System.Math.Clamp(value, 1f / 60f, 1f / 20f)
+            : global::System.Math.Clamp(value, 1f / 240f, 0.25f);
+    }
 
     public bool UseMultithreading { get; set; }
+
+    /// <summary>
+    /// Ground probing is useful for person navigation, but it is an O(dynamic * collider)
+    /// raycast pass after every physics frame. Browser defaults disable it for substantially
+    /// lower WASM CPU cost; person-navigation scenes can opt back in.
+    /// </summary>
+    public bool EnableGroundProbe { get; set; } = true;
 
     public int SubstepCount
     {
         get => _world.SubstepCount;
-        set => _world.SubstepCount = global::System.Math.Max(1, value);
+        set => _world.SubstepCount = OperatingSystem.IsBrowser()
+            ? global::System.Math.Clamp(value, 1, 2)
+            : global::System.Math.Max(1, value);
     }
 
     public (int solver, int relaxation) SolverIterations
     {
         get => _world.SolverIterations;
-        set => _world.SolverIterations = (global::System.Math.Max(1, value.solver), global::System.Math.Max(0, value.relaxation));
+        set => _world.SolverIterations = OperatingSystem.IsBrowser()
+            ? (global::System.Math.Clamp(value.solver, 1, 8), global::System.Math.Clamp(value.relaxation, 0, 2))
+            : (global::System.Math.Max(1, value.solver), global::System.Math.Max(0, value.relaxation));
     }
 
     public void Step(Scene3D scene, float deltaSeconds)
@@ -146,7 +195,7 @@ public sealed class Jitter2PhysicsCore : IPhysicsCore, IDisposable
     private void EnsureBodies(Scene3D scene)
     {
         var registryVersion = scene.Registry.Version;
-        var colliders = scene.Registry.SnapshotColliders();
+        var colliders = scene.Registry.Colliders;
         _seen.Clear();
 
         foreach (var obj in colliders)
@@ -179,17 +228,18 @@ public sealed class Jitter2PhysicsCore : IPhysicsCore, IDisposable
 
         if (_lastRegistryVersion != registryVersion || _entries.Count != _seen.Count)
         {
-            var remove = new List<Object3D>();
+            _removeScratch.Clear();
             foreach (var pair in _entries)
             {
-                if (!_seen.Contains(pair.Key)) remove.Add(pair.Key);
+                if (!_seen.Contains(pair.Key)) _removeScratch.Add(pair.Key);
             }
 
-            foreach (var obj in remove)
+            foreach (var obj in _removeScratch)
             {
                 RemoveEntry(_entries[obj]);
                 _entries.Remove(obj);
             }
+            _removeScratch.Clear();
 
             _lastRegistryVersion = registryVersion;
         }
@@ -446,7 +496,7 @@ public sealed class Jitter2PhysicsCore : IPhysicsCore, IDisposable
             var angular = rb.FreezeRotation ? Vector3.Zero : ClampLength(ToSystem(body.AngularVelocity), rb.MaxAngularSpeed);
             rb.SetSimulationVelocity(linear, angular);
             rb.IsSleeping = !body.IsActive;
-            if (TryProbeGround(entry, out var groundNormal))
+            if (EnableGroundProbe && TryProbeGround(entry, out var groundNormal))
             {
                 rb.IsGrounded = true;
                 rb.GroundNormal = groundNormal;

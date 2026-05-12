@@ -30,6 +30,18 @@ internal static class ControlPlaneGeometry
 {
     public static Vector3[] GetWorldCorners(ControlPlane3D plane, Camera3D camera)
     {
+        var corners = new Vector3[4];
+        GetWorldCorners(plane, camera, corners);
+        return corners;
+    }
+
+    public static void GetWorldCorners(ControlPlane3D plane, Camera3D camera, Span<Vector3> corners)
+    {
+        if (corners.Length < 4)
+        {
+            throw new ArgumentException("At least four corners are required.", nameof(corners));
+        }
+
         var hw = plane.Width * 0.5f;
         var hh = plane.Height * 0.5f;
 
@@ -39,23 +51,18 @@ internal static class ControlPlaneGeometry
             right *= extentX;
             up *= extentY;
 
-            return new[]
-            {
-                center - right + up,
-                center + right + up,
-                center + right - up,
-                center - right - up
-            };
+            corners[0] = center - right + up;
+            corners[1] = center + right + up;
+            corners[2] = center + right - up;
+            corners[3] = center - right - up;
+            return;
         }
 
         var model = plane.GetModelMatrix();
-        return new[]
-        {
-            Vector3.Transform(new Vector3(-hw, hh, 0f), model),
-            Vector3.Transform(new Vector3(hw, hh, 0f), model),
-            Vector3.Transform(new Vector3(hw, -hh, 0f), model),
-            Vector3.Transform(new Vector3(-hw, -hh, 0f), model)
-        };
+        corners[0] = Vector3.Transform(new Vector3(-hw, hh, 0f), model);
+        corners[1] = Vector3.Transform(new Vector3(hw, hh, 0f), model);
+        corners[2] = Vector3.Transform(new Vector3(hw, -hh, 0f), model);
+        corners[3] = Vector3.Transform(new Vector3(-hw, -hh, 0f), model);
     }
 
     public static bool TryProject(ControlPlane3D plane, Camera3D camera, Vector2 viewportSize, out ProjectedControlPlane projected)
@@ -87,8 +94,8 @@ internal static class ControlPlaneGeometry
             return false;
         }
 
-        return pixelPoint.X >= 0d && pixelPoint.X <= System.Math.Max(plane.RenderPixelWidth, 1) &&
-               pixelPoint.Y >= 0d && pixelPoint.Y <= System.Math.Max(plane.RenderPixelHeight, 1);
+        return pixelPoint.X >= 0d && pixelPoint.X <= System.Math.Max(plane.RenderLogicalWidth, 1d) &&
+               pixelPoint.Y >= 0d && pixelPoint.Y <= System.Math.Max(plane.RenderLogicalHeight, 1d);
     }
 
     public static bool TryMapWorldHitToControlUnclamped(ControlPlane3D plane, Camera3D camera, Vector3 worldHit, out Point pixelPoint)
@@ -119,8 +126,8 @@ internal static class ControlPlaneGeometry
         }
 
         pixelPoint = new Point(
-            u * System.Math.Max(plane.RenderPixelWidth, 1),
-            v * System.Math.Max(plane.RenderPixelHeight, 1));
+            u * System.Math.Max(plane.RenderLogicalWidth, 1d),
+            v * System.Math.Max(plane.RenderLogicalHeight, 1d));
         return true;
     }
 

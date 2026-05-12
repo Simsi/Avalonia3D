@@ -15,6 +15,9 @@ public class ControlPlane3D : Object3D
     private bool _alwaysFaceCamera;
     private int _renderPixelWidth;
     private int _renderPixelHeight;
+    private double _renderLogicalWidth;
+    private double _renderLogicalHeight;
+    private double _renderScale = 2.0d;
     private RenderTargetBitmap? _snapshot;
     private bool _snapshotDirty = true;
     private int _snapshotVersion;
@@ -84,6 +87,25 @@ public class ControlPlane3D : Object3D
         internal set => _renderPixelHeight = System.Math.Max(value, 1);
     }
 
+    /// <summary>
+    /// Supersampling factor for Avalonia controls rendered into a 3D texture.
+    /// 1.0 is native control size; 2.0-4.0 keeps text readable on perspective planes.
+    /// </summary>
+    public double RenderScale
+    {
+        get => _renderScale;
+        set
+        {
+            value = global::System.Math.Clamp(value, 1.0d, 4.0d);
+            if (global::System.Math.Abs(_renderScale - value) < 0.001d) return;
+            _renderScale = value;
+            MarkSnapshotDirty();
+        }
+    }
+
+    internal double RenderLogicalWidth => _renderLogicalWidth > 0d ? _renderLogicalWidth : global::System.Math.Max(_renderPixelWidth / global::System.Math.Max(_renderScale, 1d), 1d);
+    internal double RenderLogicalHeight => _renderLogicalHeight > 0d ? _renderLogicalHeight : global::System.Math.Max(_renderPixelHeight / global::System.Math.Max(_renderScale, 1d), 1d);
+
     internal RenderTargetBitmap? Snapshot => _snapshot;
     internal bool SnapshotDirty => _snapshotDirty;
     internal int SnapshotVersion => _snapshotVersion;
@@ -94,7 +116,7 @@ public class ControlPlane3D : Object3D
         RaiseChanged(SceneChangeKind.Control);
     }
 
-    internal void UpdateSnapshot(RenderTargetBitmap? bitmap, int pixelWidth, int pixelHeight)
+    internal void UpdateSnapshot(RenderTargetBitmap? bitmap, int pixelWidth, int pixelHeight, double logicalWidth, double logicalHeight)
     {
         if (!ReferenceEquals(_snapshot, bitmap) && _snapshot is IDisposable disposable)
         {
@@ -104,6 +126,8 @@ public class ControlPlane3D : Object3D
         _snapshot = bitmap;
         RenderPixelWidth = pixelWidth;
         RenderPixelHeight = pixelHeight;
+        _renderLogicalWidth = global::System.Math.Max(logicalWidth, 1d);
+        _renderLogicalHeight = global::System.Math.Max(logicalHeight, 1d);
         _snapshotDirty = false;
         _snapshotVersion++;
         RaiseChanged(SceneChangeKind.Control);

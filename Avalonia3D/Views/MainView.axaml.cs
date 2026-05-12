@@ -125,6 +125,8 @@ public partial class MainView : UserControl
     private Sphere3D? _planet;
     private Sphere3D? _planetMarker;
     private ControlPlane3D? _planetLabel;
+    private ControlPlane3D? _bridgeSensorPanel;
+    private Object3D? _grabbedPhysicsObject;
     private Vector3 _planetFocusPoint = Vector3.UnitZ;
     private DirectionalLight3D? _shaderSun;
     private PointLight3D? _shaderAccent;
@@ -137,26 +139,28 @@ public partial class MainView : UserControl
     private int _telemetryCursor;
     private int _embeddedCounter;
     private long _lastStatusTicks;
+    private long _lastBackendTextTicks;
 
     public MainView()
     {
         InitializeComponent();
 
+        var isBrowser = OperatingSystem.IsBrowser();
         _sceneControl = new Scene3DControl
         {
             HorizontalAlignment = HorizontalAlignment.Stretch,
             VerticalAlignment = VerticalAlignment.Stretch,
-            ShowPerformanceMetrics = true,
+            ShowPerformanceMetrics = !isBrowser,
             ContinuousRendering = true,
-            ContinuousRenderingFps = 60d,
+            ContinuousRenderingFps = isBrowser ? 30d : 60d,
             FpsLockEnabled = true,
-            TargetFps = 60d,
-            UnlockedMaxFps = 180d,
-            FrameInterpolationEnabled = true,
-            FrameInterpolationTickFps = 30d,
-            AdaptivePerformanceEnabled = false,
+            TargetFps = isBrowser ? 30d : 60d,
+            UnlockedMaxFps = isBrowser ? 60d : 180d,
+            FrameInterpolationEnabled = !isBrowser,
+            FrameInterpolationTickFps = isBrowser ? 15d : 30d,
+            AdaptivePerformanceEnabled = isBrowser,
             EnableSceneNavigation = true,
-            ShowCenterCursor = true,
+            ShowCenterCursor = !isBrowser,
             Width = double.NaN,
             Height = double.NaN
         };
@@ -164,7 +168,7 @@ public partial class MainView : UserControl
         _sceneControl.SelectionChanged += (_, e) => SetSelection(e.NewSelection);
         _sceneControl.FrameRendered += OnFrameRendered;
 
-        _animationTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
+        _animationTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(isBrowser ? 33 : 16) };
         _animationTimer.Tick += OnAnimationTick;
 
         BuildUi();
@@ -233,7 +237,7 @@ public partial class MainView : UserControl
         };
 
         _animateCheck = Check("Анимация", true);
-        _metricsCheck = Check("Performance overlay", true);
+        _metricsCheck = Check("Performance overlay", !OperatingSystem.IsBrowser());
         _wireframeCheck = Check("Wireframe overlay", false);
         _shadowsCheck = Check("Directional shadows", true);
 
@@ -399,13 +403,14 @@ public partial class MainView : UserControl
         {
             _sceneControl.NavigationMode = SceneNavigationMode.Person;
             _sceneControl.MouseLookMode = SceneMouseLookMode.ButtonDrag;
-            _sceneControl.PersonSettings.MoveSpeed = 3.2f;
-            _sceneControl.PersonSettings.RunMultiplier = 1.7f;
-            _sceneControl.PersonSettings.BodyRadius = 0.28f;
+            _sceneControl.PersonSettings.MoveSpeed = 2.75f;
+            _sceneControl.PersonSettings.RunMultiplier = 1.45f;
+            _sceneControl.PersonSettings.BodyRadius = 0.22f;
             _sceneControl.PersonSettings.BodyHeight = 1.72f;
             _sceneControl.PersonSettings.EyeHeight = 1.56f;
-            _sceneControl.PersonSettings.StepHeight = 0.34f;
-            _sceneControl.PersonSettings.JumpSpeed = 4.4f;
+            _sceneControl.PersonSettings.StepHeight = 0.24f;
+            _sceneControl.PersonSettings.JumpSpeed = 3.0f;
+            _sceneControl.PersonSettings.Gravity = -9.81f;
             _sceneControl.ShowCenterCursor = true;
         }
         else
@@ -444,6 +449,8 @@ public partial class MainView : UserControl
         _planet = null;
         _planetMarker = null;
         _planetLabel = null;
+        _bridgeSensorPanel = null;
+        _grabbedPhysicsObject = null;
         _shaderSun = null;
         _shaderAccent = null;
         _characterSequenceTime = 0f;
@@ -678,9 +685,10 @@ public partial class MainView : UserControl
 
     private void BuildEmbeddedAvaloniaControlsScene(Scene3D scene)
     {
-        scene.Camera.Position = new Vector3(4.4f, 2.8f, -5.8f);
-        scene.Camera.Target = new Vector3(0f, 1.3f, 0f);
-        AddGround(scene, 8f, 5f);
+        scene.FrameInterpolator.Enabled = false;
+        scene.Camera.Position = new Vector3(5.8f, 3.1f, -6.6f);
+        scene.Camera.Target = new Vector3(-0.55f, 1.15f, 0.1f);
+        AddGround(scene, 9f, 6f);
 
         var model = AddSelectable(scene, new Box3D
         {
@@ -688,7 +696,7 @@ public partial class MainView : UserControl
             Width = 1.25f,
             Height = 1.25f,
             Depth = 1.25f,
-            Position = new Vector3(-1.9f, 0.75f, 0.45f),
+            Position = new Vector3(-2.45f, 0.75f, 0.35f),
             RotationDegrees = new Vector3(0f, 28f, 0f),
             Material = Material3D.CreatePhong(new ColorRgba(0.26f, 0.66f, 1f, 1f), 0.55f, 72f)
         });
@@ -751,43 +759,132 @@ public partial class MainView : UserControl
             }
         };
 
+        scene.Add(new Sphere3D
+        {
+            Name = "UI demo reference sphere",
+            Radius = 0.42f,
+            Segments = 32,
+            Rings = 16,
+            Position = new Vector3(-0.85f, 0.48f, 0.75f),
+            Material = Material3D.CreatePhong(new ColorRgba(1.0f, 0.72f, 0.18f, 1f), 0.48f, 64f),
+            IsPickable = true
+        });
+        scene.Add(new Cylinder3D
+        {
+            Name = "UI demo reference cylinder",
+            Radius = 0.28f,
+            Height = 1.25f,
+            Segments = 32,
+            Position = new Vector3(0.30f, 0.63f, 1.05f),
+            Material = Material3D.CreateLambert(new ColorRgba(0.22f, 0.82f, 0.48f, 1f)),
+            IsPickable = true
+        });
+
         _controlPlane = scene.Add(new ControlPlane3D(statusBadge)
         {
             Name = "Embedded Avalonia control plane / front-facing",
-            Width = 4.4f,
-            Height = 2.2f,
-            Position = new Vector3(1.15f, 1.75f, 0.1f),
-            AlwaysFaceCamera = true
+            Width = 2.70f,
+            Height = 1.35f,
+            Position = new Vector3(1.95f, 1.75f, 0.20f),
+            AlwaysFaceCamera = true,
+            RenderScale = global::System.OperatingSystem.IsBrowser() ? 1.25d : 4.0d
         });
     }
 
     private void BuildHighScaleDigitalTwinScene(Scene3D scene)
     {
-        scene.Camera.Position = new Vector3(8.8f, 5.5f, -10.4f);
-        scene.Camera.Target = new Vector3(0.6f, 1.0f, 0.7f);
-        AddGround(scene, 13f, 10f);
-        scene.Performance.EnableWebGlClientGpuTransformAnimation = true;
-        scene.Performance.WebGlClientGpuTransformAnimationAmplitude = 0.11f;
+        scene.FrameInterpolator.Enabled = false;
+        scene.Camera.Position = new Vector3(13.8f, 7.0f, -14.8f);
+        scene.Camera.Target = new Vector3(0.6f, 1.35f, 0.4f);
+        scene.Camera.FarPlane = 500f;
+        scene.Performance.DrawDistance = 1000f;
+        var browserFastPath = OperatingSystem.IsBrowser();
+        if (!browserFastPath)
+        {
+            AddGround(scene, 24f, 16f);
+        }
+        scene.AmbientLightIntensity = 0.38f;
+        scene.Environment.Skybox.TopColor = new ColorRgba(0.05f, 0.09f, 0.15f, 1f);
+        scene.Environment.Skybox.HorizonColor = new ColorRgba(0.13f, 0.19f, 0.25f, 1f);
+        scene.AddLight(new DirectionalLight3D { Direction = Vector3.Normalize(new Vector3(-0.38f, -0.82f, -0.24f)), Intensity = 1.08f, Color = new ColorRgba(1f, 0.95f, 0.86f, 1f) });
+        scene.AddLight(new PointLight3D { Position = new Vector3(-5f, 5.2f, -5f), Range = 28f, Intensity = 2.4f, Color = new ColorRgba(0.55f, 0.76f, 1f, 1f) });
 
-        var template = HighScaleTemplateCompiler.Compile(3001, new DemoRack3D(), true);
+        // Keep this showcase deterministic. Shader-side high-scale motion is useful for
+        // stress tests, but in a demo it can make retained batches appear to blink while
+        // camera/LOD state is still warming up.
+        scene.Performance.EnableWebGlClientGpuTransformAnimation = false;
+        scene.Performance.WebGlClientGpuTransformAnimationAmplitude = 0f;
+        scene.Performance.MaxVisibleHighScaleChunks = 0;
+        scene.Performance.MaxHighScaleVisibleInstances = 0;
+        scene.Performance.EnableDistanceFade = false;
+        // This demo is intentionally small (~160 retained racks). Force the stable aggregate
+        // high-scale path on Desktop so it does not depend on per-chunk frustum classification
+        // while the generic chunk culler is still kept conservative. This removes the
+        // angle-dependent "only some racks load" behavior reported for the digital-twin scene.
+        scene.Performance.EnableHighScaleAggregateLayerBatches = true;
+        scene.Performance.HighScaleAggregateLayerInstanceThreshold = 1024;
+
+        // Keep detailed rack rendering unbaked in this demo. The generic baked-detailed path is
+        // still useful for large scenes, but for the current rack template it can collapse the
+        // composite into invalid geometry on Desktop. Unbaked detailed parts still render via
+        // instancing (one draw per part across all racks), so the scene remains lightweight while
+        // the cabinets stay visually correct.
+        var template = HighScaleTemplateCompiler.Compile(3001, new DemoRack3D(), false);
+        scene.Performance.EnableBakedHighScaleDetailedMeshes = false;
         template.AddMaterialVariant(1, "Warning").DefaultColor = new ColorRgba(1.0f, 0.72f, 0.18f, 1f);
         template.AddMaterialVariant(2, "Critical").DefaultColor = new ColorRgba(1.0f, 0.19f, 0.14f, 1f);
         template.AddMaterialVariant(3, "Offline").DefaultColor = new ColorRgba(0.22f, 0.24f, 0.29f, 0.52f);
 
-        var layer = new HighScaleInstanceLayer3D(template, 128, 6f)
-        {
-            Name = "Digital twin rack layer"
-        };
-        layer.LodPolicy.DetailedDistance = 38f;
-        layer.LodPolicy.SimplifiedDistance = 72f;
-        layer.LodPolicy.ProxyDistance = 140f;
-        layer.LodPolicy.DrawDistance = 220f;
-        layer.LodPolicy.FadeDistance = 24f;
-        layer.AddInstances(CreateRackTransforms(12, 8, 1.08f, 1.05f));
+        var layer = new HighScaleInstanceLayer3D(template, 256, 7f) { Name = "Digital twin retained rack layer" };
+        layer.LodPolicy.DetailedDistance = 44f;
+        layer.LodPolicy.SimplifiedDistance = 86f;
+        layer.LodPolicy.ProxyDistance = 160f;
+        layer.LodPolicy.DrawDistance = 420f;
+        layer.LodPolicy.FadeDistance = 0f;
+        layer.LodPolicy.EnableBillboardFallback = false;
+        layer.AddInstances(CreateRackTransforms(16, 10, 1.05f, 1.02f));
         scene.Add(layer);
         _rackLayer = layer;
+
+        if (!browserFastPath)
+        {
+            var floor = Material3D.CreateLambert(new ColorRgba(0.12f, 0.14f, 0.16f, 1f));
+            var aisle = Material3D.CreateLambert(new ColorRgba(0.20f, 0.23f, 0.26f, 1f));
+            var cable = Material3D.CreatePhong(new ColorRgba(0.08f, 0.12f, 0.18f, 1f), 0.28f, 44f);
+
+            // Do not duplicate rack cabinet geometry here. The retained layer above is the
+            // single source of rack rendering; overlapping StaticBox cabinets caused depth
+            // fighting and angle-dependent disappearing/flickering in the digital twin demo.
+            for (var z = -5; z <= 5; z += 2)
+            {
+                StaticBox(scene, "Service aisle " + z.ToString(CultureInfo.InvariantCulture), 20.5f, 0.035f, 0.10f, new Vector3(0f, 0.055f, z * 1.02f), aisle, pickable: false);
+            }
+            for (var x = -8; x <= 8; x += 2)
+            {
+                StaticBox(scene, "Overhead cable tray " + x.ToString(CultureInfo.InvariantCulture), 0.08f, 0.10f, 12.4f, new Vector3(x * 0.65f, 2.65f, 0f), cable, pickable: false);
+            }
+            for (var i = 0; i < 18; i++)
+            {
+                var x = -8.0f + (i % 9) * 2.0f;
+                var z = -4.8f + (i / 9) * 9.6f;
+                var beacon = scene.Add(new Sphere3D
+                {
+                    Name = "Telemetry beacon " + (i + 1).ToString(CultureInfo.InvariantCulture),
+                    Radius = 0.08f,
+                    Segments = 16,
+                    Rings = 8,
+                    Position = new Vector3(x, 1.38f + (i % 3) * 0.18f, z),
+                    Material = new Material3D { BaseColor = i % 5 == 0 ? new ColorRgba(1f, 0.22f, 0.12f, 1f) : new ColorRgba(0.18f, 1f, 0.44f, 1f), Lighting = LightingMode.Unlit },
+                    IsPickable = true,
+                    DataContext = "rack telemetry: temp " + (32 + i % 7).ToString(CultureInfo.InvariantCulture) + "°C, load " + (58 + i * 2 % 35).ToString(CultureInfo.InvariantCulture) + "%"
+                });
+                _selectableObjects.Add(beacon);
+            }
+            StaticBox(scene, "Operations floor mat", 21.5f, 0.02f, 12.2f, new Vector3(0f, 0.07f, 0f), floor, pickable: false);
+        }
         RandomizeRackTelemetry();
     }
+
 
     private void BuildParticlesScene(Scene3D scene)
     {
@@ -1081,6 +1178,38 @@ public partial class MainView : UserControl
             });
             _physicsObjects.Add(body);
         }
+
+        foreach (var obj in _physicsObjects)
+        {
+            EnablePhysicsGrab(obj);
+        }
+    }
+
+    private void EnablePhysicsGrab(Object3D obj)
+    {
+        obj.IsManipulationEnabled = true;
+        obj.PointerPressed += (_, _) => BeginPhysicsGrab(obj);
+        obj.PointerReleased += (_, _) => EndPhysicsGrab(obj);
+    }
+
+    private void BeginPhysicsGrab(Object3D obj)
+    {
+        if (_activeDemo != DemoSceneKind.Physics || obj.Rigidbody is null) return;
+        _grabbedPhysicsObject = obj;
+        obj.Rigidbody.Velocity = Vector3.Zero;
+        obj.Rigidbody.AngularVelocity = Vector3.Zero;
+        obj.Rigidbody.IsKinematic = true;
+        obj.Rigidbody.WakeUp();
+    }
+
+    private void EndPhysicsGrab(Object3D obj)
+    {
+        if (_activeDemo != DemoSceneKind.Physics || obj.Rigidbody is null) return;
+        obj.Rigidbody.IsKinematic = false;
+        obj.Rigidbody.Velocity = Vector3.Zero;
+        obj.Rigidbody.AngularVelocity = Vector3.Zero;
+        obj.Rigidbody.WakeUp();
+        if (ReferenceEquals(_grabbedPhysicsObject, obj)) _grabbedPhysicsObject = null;
     }
 
     private void BuildImportedGlbModelScene(Scene3D scene)
@@ -1276,7 +1405,7 @@ public partial class MainView : UserControl
             return _earthAsset;
         }
 
-        var uri = new Uri("avares://Avalonia3D/Assets/Models/Earth.glb");
+        var uri = new Uri("avares://Avalonia3D/Assets/Models/EarthDetailed.glb");
         try
         {
             using var stream = AssetLoader.Open(uri);
@@ -1311,71 +1440,102 @@ public partial class MainView : UserControl
         }
     }
 
-    private static void ApplySidecarBaseColorTexture(ImportedModel3D model, string textureKey, byte[] textureData, string mimeType)
+    private static bool LooksLikeEquirectangularTexture(byte[] textureData)
     {
-        if (textureData.Length == 0) return;
+        if (textureData.Length == 0) return false;
+        try
+        {
+            using var stream = new MemoryStream(textureData, writable: false);
+            using var bitmap = new Avalonia.Media.Imaging.Bitmap(stream);
+            var width = bitmap.PixelSize.Width;
+            var height = bitmap.PixelSize.Height;
+            if (width < 512 || height < 256) return false;
+            var ratio = width / (float)height;
+            return MathF.Abs(ratio - 2f) <= 0.06f;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void ApplySidecarBaseColorTextureIfCompatible(ImportedModel3D model, string textureKey, byte[] textureData, string mimeType)
+    {
+        if (!LooksLikeEquirectangularTexture(textureData)) return;
+
         _ = model.Children;
         foreach (var part in model.ModelParts)
         {
+            if (part.Material.HasBaseColorTexture) continue;
             part.Material.SetBaseColorTexture(textureKey, textureData, mimeType);
         }
     }
 
+    private static void ApplyFallbackEarthTextureIfCompatible(Material3D material, byte[]? textureData, string textureKey, string mimeType)
+    {
+        if (textureData is not { Length: > 0 } || !LooksLikeEquirectangularTexture(textureData)) return;
+        material.SetBaseColorTexture(textureKey, textureData, mimeType);
+    }
+
     private void BuildCameraArcPlanetScene(Scene3D scene)
     {
-        scene.Camera.Position = new Vector3(0.0f, 3.05f, -6.7f);
-        scene.Camera.Target = new Vector3(0f, 1.35f, 0f);
-        scene.AmbientLightIntensity = 0.14f;
+        scene.FrameInterpolator.Enabled = false;
+        scene.Camera.Position = new Vector3(0.0f, 3.10f, -6.8f);
+        scene.Camera.Target = new Vector3(0f, 1.38f, 0f);
+        scene.Camera.FarPlane = 420f;
+        scene.AmbientLightIntensity = 0.82f;
         scene.Environment.Skybox.Mode = SkyboxMode3D.StarField;
-        scene.Environment.Skybox.TopColor = new ColorRgba(0.002f, 0.006f, 0.022f, 1f);
-        scene.Environment.Skybox.HorizonColor = new ColorRgba(0.010f, 0.016f, 0.040f, 1f);
-        scene.Environment.Skybox.BottomColor = new ColorRgba(0.000f, 0.002f, 0.010f, 1f);
-        scene.Environment.Skybox.Intensity = 1.15f;
+        scene.Environment.Skybox.TopColor = new ColorRgba(0.001f, 0.003f, 0.014f, 1f);
+        scene.Environment.Skybox.HorizonColor = new ColorRgba(0.006f, 0.010f, 0.026f, 1f);
+        scene.Environment.Skybox.BottomColor = new ColorRgba(0.000f, 0.001f, 0.007f, 1f);
+        scene.Environment.Skybox.Intensity = 1.55f;
+        AddSpaceBackground(scene);
 
-        var earthAsset = LoadEarthAsset();
         var planetCenter = new Vector3(0f, 1.45f, 0f);
-        if (earthAsset is not null && !earthAsset.Diagnostics.HasErrors)
+        const float targetRadius = 1.25f;
+
+        // Invisible mathematical proxy used by camera flight, labels and markers.
+        // The visible planet is the authored GLB below. Keeping this proxy separate
+        // avoids reverting to the broken procedural UV sphere while preserving the
+        // existing geospatial helper code.
+        _planet = scene.Add(new Sphere3D
         {
-            _earthModel = scene.ImportModel(earthAsset, options =>
-            {
-                options.Name = "Earth GLB / textured planet";
-                options.Position = planetCenter;
-                options.RotationDegrees = new Vector3(0f, 0f, 0f);
-                options.Scale = Vector3.One;
-            });
-            var earthTexture = TryReadAvaloniaResourceBytes("avares://Avalonia3D/Assets/Models/Earth.jpg");
-            if (earthTexture is { Length: > 0 })
-            {
-                ApplySidecarBaseColorTexture(_earthModel, "sidecar-texture:Earth.jpg", earthTexture, "image/jpeg");
-            }
-            foreach (var part in _earthModel.ModelParts)
-            {
-                part.Material.Surface = SurfaceMode.Opaque;
-                part.Material.Opacity = 1f;
-                part.Material.Lighting = LightingMode.BlinnPhong;
-                part.Material.DoubleSided = true;
-            }
+            Name = "Earth coordinate proxy / not rendered",
+            Radius = targetRadius,
+            Segments = 32,
+            Rings = 16,
+            Position = planetCenter,
+            IsVisible = false,
+            IsPickable = false,
+            IsManipulationEnabled = false
+        });
 
-            _planet = scene.Add(new Sphere3D
-            {
-                Name = "Earth interaction proxy / hidden",
-                Radius = 1.25f,
-                Segments = 24,
-                Rings = 12,
-                Position = planetCenter,
-                IsVisible = false,
-                IsPickable = false,
-                IsManipulationEnabled = false
-            });
+        var asset = LoadEarthAsset();
+        if (asset is not null && asset.Meshes.Count > 0 && !asset.Diagnostics.HasErrors)
+        {
+            var size = asset.Bounds.IsValid ? asset.Bounds.Size : new Vector3(2f);
+            var maxSpan = MathF.Max(MathF.Max(MathF.Abs(size.X), MathF.Abs(size.Y)), MathF.Abs(size.Z));
+            var scale = maxSpan > 0.0001f ? (targetRadius * 2f) / maxSpan : 1f;
+            var centerOffset = asset.Bounds.IsValid ? asset.Bounds.Center * scale : Vector3.Zero;
 
+            _earthModel = scene.ImportModel(asset, options =>
+            {
+                options.Name = "Earth / authored GLB model";
+                options.Position = planetCenter - centerOffset;
+                options.RotationDegrees = new Vector3(0f, -90f, 0f);
+                options.Scale = new Vector3(scale);
+            });
             _earthModel.IsPickable = true;
+            _earthModel.IsManipulationEnabled = false;
             _earthModel.ModelClicked += (_, e) =>
             {
-                _clickCount++;
-                var normal = Vector3.Normalize(e.WorldPosition - planetCenter);
-                SetPlanetMarkerFromNormal(normal, showLabel: true);
-                SetSelection(_planetMarker);
+                SetSelection(e.Part);
+                var local = e.WorldPosition - planetCenter;
+                if (local.LengthSquared() > 0.0001f) SetPlanetMarkerFromNormal(Vector3.Normalize(local), showLabel: true);
             };
+            // Preserve the authored GLB material and embedded texture. EarthDetailed.jpg is a
+            // rendered sphere image, not an equirectangular 2:1 texture, so forcing it over
+            // the GLB material corrupts the model's authored UV mapping.
             _selectableObjects.Add(_earthModel);
             foreach (var part in _earthModel.ModelParts)
             {
@@ -1385,25 +1545,36 @@ public partial class MainView : UserControl
         }
         else
         {
-            _planet = AddSelectable(scene, new Sphere3D
+            var earthMaterial = new Material3D
             {
-                Name = "Fallback procedural planet sphere",
-                Radius = 1.25f,
-                Segments = 96,
-                Rings = 48,
+                BaseColor = new ColorRgba(1f, 1f, 1f, 1f),
+                Lighting = LightingMode.BlinnPhong,
+                SpecularStrength = 0.14f,
+                Shininess = 34f,
+                Roughness = 0.72f,
+                Surface = SurfaceMode.Opaque,
+                Opacity = 1f
+            };
+            var earthTexture = TryReadAvaloniaResourceBytes("avares://Avalonia3D/Assets/Models/EarthEquirectangularFallback.png");
+            ApplyFallbackEarthTextureIfCompatible(earthMaterial, earthTexture, "fallback-earth-equirectangular-texture", "image/png");
+            var fallback = AddSelectable(scene, new Sphere3D
+            {
+                Name = "Earth / fallback UV sphere",
+                Radius = targetRadius,
+                Segments = 128,
+                Rings = 64,
                 Position = planetCenter,
-                Material = new Material3D
-                {
-                    BaseColor = new ColorRgba(0.08f, 0.30f, 0.80f, 1f),
-                    Lighting = LightingMode.BlinnPhong,
-                    SpecularStrength = 0.36f,
-                    Shininess = 72f,
-                    Roughness = 0.50f
-                }
+                RotationDegrees = new Vector3(0f, -90f, 0f),
+                Material = earthMaterial
             });
-            AddPlanetDetails(scene);
+            fallback.Clicked += (_, e) =>
+            {
+                var local = e.WorldPosition - planetCenter;
+                if (local.LengthSquared() <= 0.0001f) return;
+                SetPlanetMarkerFromNormal(Vector3.Normalize(local), showLabel: true);
+                SetSelection(_planetMarker);
+            };
         }
-
 
         _planetMarker = AddSelectable(scene, new Sphere3D
         {
@@ -1411,31 +1582,47 @@ public partial class MainView : UserControl
             Radius = 0.060f,
             Segments = 20,
             Rings = 10,
-            Material = new Material3D
-            {
-                BaseColor = new ColorRgba(1f, 0.86f, 0.18f, 1f),
-                Lighting = LightingMode.Unlit
-            }
+            Material = new Material3D { BaseColor = new ColorRgba(1f, 0.86f, 0.18f, 1f), Lighting = LightingMode.Unlit }
         });
 
-        scene.AddLight(new PointLight3D
-        {
-            Position = new Vector3(-3.3f, 2.8f, -3.4f),
-            Range = 10f,
-            Intensity = 2.8f,
-            Color = new ColorRgba(0.86f, 0.91f, 1f, 1f)
-        });
-
-        scene.AddLight(new DirectionalLight3D
-        {
-            Direction = Vector3.Normalize(new Vector3(-0.45f, -0.75f, 0.18f)),
-            Intensity = 0.86f,
-            Color = new ColorRgba(1f, 0.92f, 0.78f, 1f)
-        });
+        // No transparent blue/cloud shell here: it was the source of the visible blue
+        // overlay and, depending on draw order, could also hide the planet. Use actual
+        // lights and the authored material instead.
+        scene.AddLight(new DirectionalLight3D { Direction = Vector3.Normalize(new Vector3(-0.46f, -0.62f, 0.18f)), Intensity = 1.08f, Color = new ColorRgba(1f, 0.95f, 0.86f, 1f) });
+        scene.AddLight(new DirectionalLight3D { Direction = Vector3.Normalize(new Vector3(0.36f, -0.35f, -0.62f)), Intensity = 0.44f, Color = new ColorRgba(0.55f, 0.70f, 1f, 1f) });
+        scene.AddLight(new PointLight3D { Position = new Vector3(-3.6f, 2.9f, -3.8f), Range = 12f, Intensity = 2.7f, Color = new ColorRgba(0.86f, 0.92f, 1f, 1f) });
+        scene.AddLight(new PointLight3D { Position = new Vector3(3.8f, 1.9f, 3.0f), Range = 10f, Intensity = 1.25f, Color = new ColorRgba(0.34f, 0.56f, 1f, 1f) });
 
         _planetFocusPoint = PlanetPointFromLatLon(24.5f, 38.0f);
         UpdatePlanetFocusMarker(0f);
         ShowPlanetLocationLabel(24.5f, 38.0f, _planetFocusPoint);
+    }
+
+
+    private void AddSpaceBackground(Scene3D scene)
+    {
+        var starMat = new Material3D { BaseColor = new ColorRgba(0.86f, 0.92f, 1f, 1f), Lighting = LightingMode.Unlit };
+        var warmStar = new Material3D { BaseColor = new ColorRgba(1f, 0.84f, 0.62f, 1f), Lighting = LightingMode.Unlit };
+        for (var i = 0; i < 120; i++)
+        {
+            var a = i * 12.9898f;
+            var b = i * 78.233f;
+            var x = (MathF.Sin(a) * 0.5f + 0.5f) * 2f - 1f;
+            var y = (MathF.Sin(b) * 0.5f + 0.5f) * 1.4f - 0.15f;
+            var z = -0.35f - (MathF.Cos(a * 0.73f) * 0.5f + 0.5f) * 0.65f;
+            var dir = Vector3.Normalize(new Vector3(x, y, z));
+            scene.Add(new Sphere3D
+            {
+                Name = "Background star " + i.ToString(CultureInfo.InvariantCulture),
+                Radius = i % 11 == 0 ? 0.022f : 0.012f,
+                Segments = 8,
+                Rings = 4,
+                Position = new Vector3(0f, 1.4f, 0f) + dir * (45f + (i % 17)),
+                Material = i % 9 == 0 ? warmStar : starMat,
+                IsPickable = false,
+                IsManipulationEnabled = false
+            });
+        }
     }
 
     private void AddPlanetDetails(Scene3D scene)
@@ -1568,215 +1755,159 @@ public partial class MainView : UserControl
 
     private void BuildBuildingWalkthroughScene(Scene3D scene)
     {
-        scene.Camera.Position = new Vector3(-4.8f, 1.56f, -6.6f);
-        scene.Camera.Target = new Vector3(-4.2f, 1.45f, -5.6f);
+        scene.Camera.Position = new Vector3(-4.4f, 1.56f, -7.2f);
+        scene.Camera.Target = new Vector3(-3.8f, 1.46f, -5.7f);
         scene.Camera.FieldOfViewDegrees = 68f;
-        scene.Camera.FarPlane = 180f;
-        scene.AmbientLightIntensity = 0.42f;
+        scene.Camera.FarPlane = 220f;
+        scene.AmbientLightIntensity = 0.50f;
         scene.Environment.Skybox.Mode = SkyboxMode3D.VerticalGradient;
-        scene.Environment.Skybox.TopColor = new ColorRgba(0.08f, 0.12f, 0.18f, 1f);
-        scene.Environment.Skybox.HorizonColor = new ColorRgba(0.16f, 0.20f, 0.26f, 1f);
-        scene.Environment.Skybox.BottomColor = new ColorRgba(0.025f, 0.030f, 0.038f, 1f);
+        scene.Environment.Skybox.TopColor = new ColorRgba(0.12f, 0.17f, 0.25f, 1f);
+        scene.Environment.Skybox.HorizonColor = new ColorRgba(0.30f, 0.36f, 0.42f, 1f);
+        scene.Environment.Skybox.BottomColor = new ColorRgba(0.045f, 0.055f, 0.065f, 1f);
 
-        scene.PhysicsCore = null; // Building walkthrough uses KinematicCharacterController3D in Scene3DControl, not default rigidbody physics.
+        scene.PhysicsCore = null;
+        scene.AddLight(new DirectionalLight3D { Direction = Vector3.Normalize(new Vector3(-0.40f, -0.76f, -0.30f)), Intensity = 1.15f, Color = new ColorRgba(1f, 0.94f, 0.84f, 1f) });
+        scene.AddLight(new PointLight3D { Position = new Vector3(-2.6f, 4.2f, -3.4f), Range = 18f, Intensity = 2.0f, Color = new ColorRgba(0.70f, 0.84f, 1f, 1f) });
+        scene.AddLight(new PointLight3D { Position = new Vector3(3.8f, 3.0f, 1.8f), Range = 14f, Intensity = 1.5f, Color = new ColorRgba(1f, 0.78f, 0.55f, 1f) });
 
-        scene.AddLight(new DirectionalLight3D
+        var concrete = Material3D.CreateLambert(new ColorRgba(0.34f, 0.37f, 0.39f, 1f));
+        var floorMat = Material3D.CreateLambert(new ColorRgba(0.26f, 0.29f, 0.32f, 1f));
+        var wallMat = Material3D.CreateLambert(new ColorRgba(0.72f, 0.74f, 0.70f, 1f));
+        var glass = new Material3D { BaseColor = new ColorRgba(0.42f, 0.72f, 1f, 0.22f), Opacity = 0.22f, Surface = SurfaceMode.Transparent, Lighting = LightingMode.Phong, SpecularStrength = 0.55f, Shininess = 80f };
+        var wood = Material3D.CreateLambert(new ColorRgba(0.55f, 0.36f, 0.20f, 1f));
+        var accent = Material3D.CreatePhong(new ColorRgba(0.16f, 0.48f, 0.92f, 1f), 0.30f, 46f);
+
+        StaticBox(scene, "Open plaza walkable slab", 28f, 0.20f, 24f, new Vector3(0f, -0.10f, 0f), concrete, pickable: false);
+        for (var i = 0; i < 10; i++)
         {
-            Direction = Vector3.Normalize(new Vector3(-0.42f, -0.72f, -0.34f)),
-            Intensity = 1.05f,
-            Color = new ColorRgba(1f, 0.95f, 0.86f, 1f)
-        });
-        scene.AddLight(new PointLight3D
-        {
-            Position = new Vector3(0f, 9.0f, -3.5f),
-            Range = 22f,
-            Intensity = 2.6f,
-            Color = new ColorRgba(0.78f, 0.86f, 1f, 1f)
-        });
+            var x = -12f + i * 2.8f;
+            StaticBox(scene, "Background city block " + i.ToString(CultureInfo.InvariantCulture), 1.2f, 1.8f + (i % 5) * 0.7f, 1.1f, new Vector3(x, 0.9f + (i % 5) * 0.35f, 10.5f), Material3D.CreateLambert(new ColorRgba(0.12f, 0.16f, 0.20f, 1f)), pickable: false);
+        }
 
-        var concrete = Material3D.CreateLambert(new ColorRgba(0.36f, 0.39f, 0.43f, 1f));
-        concrete.Roughness = 0.96f;
-        var wallMat = Material3D.CreateLambert(new ColorRgba(0.72f, 0.75f, 0.72f, 1f));
-        var glass = new Material3D
-        {
-            BaseColor = new ColorRgba(0.42f, 0.72f, 1f, 0.28f),
-            Opacity = 0.28f,
-            Surface = SurfaceMode.Transparent,
-            Lighting = LightingMode.Phong,
-            SpecularStrength = 0.55f,
-            Shininess = 80f
-        };
-        var floorMat = Material3D.CreateLambert(new ColorRgba(0.30f, 0.33f, 0.37f, 1f));
-        var accentA = Material3D.CreatePhong(new ColorRgba(0.20f, 0.48f, 0.86f, 1f), 0.30f, 48f);
-        var accentB = Material3D.CreateLambert(new ColorRgba(0.84f, 0.58f, 0.28f, 1f));
-
-        StaticBox(scene, "Outdoor site slab / walkable", 18f, 0.22f, 16f, new Vector3(0f, -0.11f, 0f), concrete, pickable: false);
-        StaticBox(scene, "Building foundation", 12.8f, 0.30f, 10.8f, new Vector3(0.0f, 0.05f, 0.0f), floorMat, pickable: false);
-
-        const int floors = 4;
-        const float floorHeight = 2.45f;
-        const float buildingWidth = 10.8f;
-        const float buildingDepth = 8.6f;
+        const int floors = 3;
+        const float floorHeight = 2.25f;
+        const float width = 10.4f;
+        const float depth = 8.0f;
+        StaticBox(scene, "Building foundation / walkable", width + 1.0f, 0.22f, depth + 1.0f, new Vector3(0f, 0.02f, 0f), floorMat, pickable: false);
         for (var f = 0; f < floors; f++)
         {
-            var y = 0.22f + f * floorHeight;
-            StaticBox(scene, $"Floor {f + 1} walkable slab", buildingWidth, 0.16f, buildingDepth, new Vector3(0f, y, 0f), floorMat, pickable: false);
-            StaticBox(scene, $"Floor {f + 1} ceiling slab", buildingWidth, 0.12f, buildingDepth, new Vector3(0f, y + floorHeight - 0.10f, 0f), floorMat, pickable: false);
-
-            StaticBox(scene, $"Floor {f + 1} north wall", buildingWidth, 1.85f, 0.16f, new Vector3(0f, y + 0.96f, buildingDepth * 0.5f), wallMat, pickable: false);
+            var y = 0.18f + f * floorHeight;
+            StaticBox(scene, $"Floor {f + 1} slab", width, 0.14f, depth, new Vector3(0f, y, 0f), floorMat, pickable: false);
+            StaticBox(scene, $"Floor {f + 1} ceiling", width, 0.10f, depth, new Vector3(0f, y + floorHeight - 0.08f, 0f), floorMat, pickable: false);
+            StaticBox(scene, $"Floor {f + 1} north wall", width, 1.80f, 0.14f, new Vector3(0f, y + 0.95f, depth * 0.5f), wallMat, pickable: false);
             if (f == 0)
             {
-                // Front facade with a real walk-through entrance. Earlier versions used a
-                // single solid south wall, so the Person camera started outside a sealed box.
-                StaticBox(scene, "Ground floor south wall / left of entrance", 0.36f, 1.85f, 0.16f, new Vector3(-5.22f, y + 0.96f, -buildingDepth * 0.5f), wallMat, pickable: false);
-                StaticBox(scene, "Ground floor south wall / right of entrance", 8.62f, 1.85f, 0.16f, new Vector3(1.10f, y + 0.96f, -buildingDepth * 0.5f), wallMat, pickable: false);
-                StaticBox(scene, "Ground floor entrance lintel", 1.82f, 0.24f, 0.18f, new Vector3(-4.16f, y + 1.78f, -buildingDepth * 0.5f), wallMat, pickable: false);
-                StaticBox(scene, "Open entrance threshold", 1.82f, 0.04f, 0.42f, new Vector3(-4.16f, y + 0.12f, -buildingDepth * 0.5f - 0.20f), accentB, pickable: true);
+                StaticBox(scene, "Entrance facade left", 3.6f, 1.80f, 0.14f, new Vector3(-3.4f, y + 0.95f, -depth * 0.5f), wallMat, pickable: false);
+                StaticBox(scene, "Entrance facade right", 3.6f, 1.80f, 0.14f, new Vector3(3.4f, y + 0.95f, -depth * 0.5f), wallMat, pickable: false);
+                StaticBox(scene, "Entrance header", 2.7f, 0.22f, 0.16f, new Vector3(0f, y + 1.92f, -depth * 0.5f), wallMat, pickable: false);
+                scene.Add(new Box3D
+                {
+                    Name = "Flush entrance guide stripe / visual only",
+                    Width = 2.3f,
+                    Height = 0.012f,
+                    Depth = 2.2f,
+                    Position = new Vector3(0f, y + 0.095f, -depth * 0.5f - 0.95f),
+                    Material = accent,
+                    IsPickable = false,
+                    IsManipulationEnabled = false,
+                    Collider = null
+                });
             }
             else
             {
-                StaticBox(scene, $"Floor {f + 1} south wall", buildingWidth, 1.85f, 0.16f, new Vector3(0f, y + 0.96f, -buildingDepth * 0.5f), wallMat, pickable: false);
+                StaticBox(scene, $"Floor {f + 1} south wall", width, 1.80f, 0.14f, new Vector3(0f, y + 0.95f, -depth * 0.5f), wallMat, pickable: false);
             }
-            StaticBox(scene, $"Floor {f + 1} west wall", 0.16f, 1.85f, buildingDepth, new Vector3(-buildingWidth * 0.5f, y + 0.96f, 0f), wallMat, pickable: false);
-            StaticBox(scene, $"Floor {f + 1} east glass wall", 0.10f, 1.75f, buildingDepth, new Vector3(buildingWidth * 0.5f, y + 1.0f, 0f), glass, pickable: false);
+            StaticBox(scene, $"Floor {f + 1} west wall", 0.14f, 1.80f, depth, new Vector3(-width * 0.5f, y + 0.95f, 0f), wallMat, pickable: false);
+            StaticBox(scene, $"Floor {f + 1} east glass facade", 0.10f, 1.72f, depth, new Vector3(width * 0.5f, y + 0.98f, 0f), glass, pickable: false);
 
-            for (var room = 0; room < 4; room++)
+            for (var room = 0; room < 3; room++)
             {
-                var x = -3.9f + room * 2.55f;
-                StaticBox(scene, $"Floor {f + 1} office {room + 1} partition A", 0.08f, 1.55f, 3.0f, new Vector3(x + 1.08f, y + 0.84f, -1.82f), wallMat, pickable: false);
-                StaticBox(scene, $"Floor {f + 1} office {room + 1} desk", 0.92f, 0.22f, 0.52f, new Vector3(x, y + 0.55f, -2.95f), accentA, pickable: true);
-                StaticBox(scene, $"Floor {f + 1} office {room + 1} cabinet", 0.32f, 1.10f, 0.44f, new Vector3(x - 0.72f, y + 0.73f, -3.74f), accentB, pickable: true);
-                var chair = scene.Add(new Cylinder3D
-                {
-                    Name = $"Floor {f + 1} office {room + 1} chair",
-                    Radius = 0.22f,
-                    Height = 0.34f,
-                    Segments = 24,
-                    Position = new Vector3(x + 0.12f, y + 0.36f, -2.36f),
-                    Material = Material3D.CreatePhong(new ColorRgba(0.10f, 0.12f, 0.15f, 1f), 0.35f, 38f),
-                    IsPickable = true
-                });
-                _selectableObjects.Add(chair);
-            }
-
-            // Low stair steps. Person collision can step over each riser but still collides with walls/floors.
-            if (f < floors - 1)
-            {
-                const int stairSteps = 22;
-                for (var s = 0; s < stairSteps; s++)
-                {
-                    var stepY = y + 0.08f + s * (floorHeight / stairSteps);
-                    var stepZ = 3.45f - s * 0.18f;
-                    StaticBox(scene, $"Stair {f + 1}->{f + 2} step {s + 1}", 1.25f, 0.105f, 0.32f, new Vector3(-4.65f, stepY, stepZ), concrete, pickable: false);
-                }
+                var x = -3.2f + room * 3.2f;
+                StaticBox(scene, $"Floor {f + 1} office partition {room + 1}", 0.08f, 1.42f, 2.55f, new Vector3(x + 1.20f, y + 0.78f, 1.25f), wallMat, pickable: false);
+                StaticBox(scene, $"Floor {f + 1} office desk {room + 1}", 0.92f, 0.22f, 0.52f, new Vector3(x, y + 0.52f, 2.80f), wood, pickable: true);
             }
         }
-
-        // Door opening guide / navigation landmarks.
-        StaticBox(scene, "Reception counter", 2.2f, 0.72f, 0.55f, new Vector3(-2.6f, 0.60f, -3.82f), accentA, pickable: true);
-        StaticBox(scene, "Server rack prop", 0.62f, 1.80f, 0.72f, new Vector3(3.9f, 0.98f, 2.95f), Material3D.CreatePhong(new ColorRgba(0.05f, 0.08f, 0.12f, 1f), 0.25f, 42f), pickable: true);
-        StaticBox(scene, "Elevator shaft marker", 1.25f, floors * floorHeight, 1.25f, new Vector3(4.25f, floors * floorHeight * 0.5f, 3.3f), new Material3D { BaseColor = new ColorRgba(0.18f, 0.22f, 0.28f, 0.48f), Opacity = 0.48f, Surface = SurfaceMode.Transparent, Lighting = LightingMode.Lambert }, pickable: false);
-
+        StaticBox(scene, "Reception counter / moved away from entrance", 1.8f, 0.70f, 0.48f, new Vector3(2.8f, 0.55f, -2.70f), accent, pickable: true);
+        StaticBox(scene, "Server display wall", 0.44f, 1.55f, 1.20f, new Vector3(4.25f, 0.93f, 2.65f), Material3D.CreatePhong(new ColorRgba(0.05f, 0.08f, 0.12f, 1f), 0.25f, 42f), pickable: true);
         ResetBuildingPersonCamera();
     }
+
 
     private void ResetBuildingPersonCamera()
     {
         var scene = _sceneControl.Scene;
-        scene.Camera.Position = new Vector3(-4.7f, 1.56f, -6.35f);
-        scene.Camera.Target = new Vector3(-4.16f, 1.48f, -4.35f);
+        scene.Camera.Position = new Vector3(-4.4f, 1.56f, -7.2f);
+        scene.Camera.Target = new Vector3(-3.8f, 1.46f, -5.7f);
         scene.Camera.FieldOfViewDegrees = 68f;
-        _sceneControl.ResetPersonNavigationState(grounded: false);
+        _sceneControl.ResetPersonNavigationState(grounded: true);
         _cameraFlight.Cancel();
     }
 
     private void BuildBridgeDigitalTwinScene(Scene3D scene)
     {
-        scene.Camera.Position = new Vector3(9.5f, 5.4f, -12.0f);
-        scene.Camera.Target = new Vector3(0f, 1.4f, 0f);
-        scene.Camera.FarPlane = 220f;
-        scene.AmbientLightIntensity = 0.32f;
+        scene.Camera.Position = new Vector3(26.0f, 12.0f, -30.0f);
+        scene.Camera.Target = new Vector3(0f, 3.0f, 0f);
+        scene.Camera.FarPlane = 520f;
+        scene.AmbientLightIntensity = 0.46f;
         scene.Environment.Skybox.Mode = SkyboxMode3D.VerticalGradient;
-        scene.Environment.Skybox.TopColor = new ColorRgba(0.06f, 0.10f, 0.16f, 1f);
-        scene.Environment.Skybox.HorizonColor = new ColorRgba(0.18f, 0.24f, 0.31f, 1f);
+        scene.Environment.Skybox.TopColor = new ColorRgba(0.05f, 0.09f, 0.15f, 1f);
+        scene.Environment.Skybox.HorizonColor = new ColorRgba(0.18f, 0.25f, 0.32f, 1f);
         scene.Environment.Skybox.BottomColor = new ColorRgba(0.02f, 0.03f, 0.04f, 1f);
+        scene.AddLight(new DirectionalLight3D { Direction = Vector3.Normalize(new Vector3(-0.36f, -0.80f, -0.24f)), Intensity = 1.15f, Color = new ColorRgba(1f, 0.92f, 0.80f, 1f) });
+        scene.AddLight(new PointLight3D { Position = new Vector3(0f, 10.0f, -8.0f), Range = 52f, Intensity = 2.4f, Color = new ColorRgba(0.54f, 0.75f, 1f, 1f) });
 
-        scene.AddLight(new DirectionalLight3D
+        var water = new Material3D { BaseColor = new ColorRgba(0.03f, 0.18f, 0.30f, 0.76f), Opacity = 0.76f, Surface = SurfaceMode.Transparent, Lighting = LightingMode.Phong, SpecularStrength = 0.65f, Shininess = 110f };
+        var concrete = Material3D.CreateLambert(new ColorRgba(0.31f, 0.34f, 0.34f, 1f));
+        var deck = Material3D.CreateLambert(new ColorRgba(0.20f, 0.21f, 0.22f, 1f));
+        var steel = Material3D.CreatePhong(new ColorRgba(0.52f, 0.56f, 0.60f, 1f), 0.44f, 68f);
+        var darkSteel = Material3D.CreatePhong(new ColorRgba(0.22f, 0.25f, 0.28f, 1f), 0.30f, 50f);
+        var road = Material3D.CreateLambert(new ColorRgba(0.075f, 0.080f, 0.085f, 1f));
+        StaticBox(scene, "Wide river surface", 70f, 0.04f, 34f, new Vector3(0f, -0.04f, 0f), water, pickable: false);
+        StaticBox(scene, "West embankment", 22f, 0.36f, 34f, new Vector3(-40f, 0.12f, 0f), concrete, pickable: false);
+        StaticBox(scene, "East embankment", 22f, 0.36f, 34f, new Vector3(40f, 0.12f, 0f), concrete, pickable: false);
+
+        for (var i = -7; i <= 7; i++)
         {
-            Direction = Vector3.Normalize(new Vector3(-0.32f, -0.82f, -0.36f)),
-            Intensity = 1.12f,
-            Color = new ColorRgba(1f, 0.92f, 0.80f, 1f)
-        });
-        scene.AddLight(new PointLight3D
-        {
-            Position = new Vector3(0f, 6.6f, -4.0f),
-            Range = 24f,
-            Intensity = 2.1f,
-            Color = new ColorRgba(0.55f, 0.75f, 1f, 1f)
-        });
-
-        var water = new Material3D
-        {
-            BaseColor = new ColorRgba(0.04f, 0.18f, 0.30f, 0.70f),
-            Opacity = 0.70f,
-            Surface = SurfaceMode.Transparent,
-            Lighting = LightingMode.Phong,
-            SpecularStrength = 0.62f,
-            Shininess = 96f
-        };
-        var steel = Material3D.CreatePhong(new ColorRgba(0.46f, 0.50f, 0.56f, 1f), 0.44f, 64f);
-        var deckMat = Material3D.CreateLambert(new ColorRgba(0.22f, 0.23f, 0.24f, 1f));
-        var towerMat = Material3D.CreatePhong(new ColorRgba(0.66f, 0.70f, 0.74f, 1f), 0.32f, 50f);
-
-        StaticBox(scene, "River water plane", 22f, 0.045f, 15f, new Vector3(0f, -0.035f, 0f), water, pickable: false);
-        StaticBox(scene, "West embankment", 7f, 0.30f, 15f, new Vector3(-10.8f, 0.08f, 0f), Material3D.CreateLambert(new ColorRgba(0.28f, 0.31f, 0.30f, 1f)), pickable: false);
-        StaticBox(scene, "East embankment", 7f, 0.30f, 15f, new Vector3(10.8f, 0.08f, 0f), Material3D.CreateLambert(new ColorRgba(0.28f, 0.31f, 0.30f, 1f)), pickable: false);
-
-        StaticBox(scene, "Fixed west approach deck", 6.2f, 0.26f, 2.5f, new Vector3(-6.8f, 0.78f, 0f), deckMat, pickable: true);
-        StaticBox(scene, "Fixed east approach deck", 6.2f, 0.26f, 2.5f, new Vector3(6.8f, 0.78f, 0f), deckMat, pickable: true);
-        StaticBox(scene, "Left bascule leaf / raised 18 deg", 4.0f, 0.24f, 2.42f, new Vector3(-2.15f, 1.12f, 0f), deckMat, new Vector3(0f, 0f, -18f), pickable: true);
-        StaticBox(scene, "Right bascule leaf / raised 18 deg", 4.0f, 0.24f, 2.42f, new Vector3(2.15f, 1.12f, 0f), deckMat, new Vector3(0f, 0f, 18f), pickable: true);
-
+            var x = i * 4.2f;
+            StaticBox(scene, "Deck segment " + i.ToString(CultureInfo.InvariantCulture), 4.0f, 0.30f, 5.2f, new Vector3(x, 1.15f, 0f), deck, pickable: true);
+            StaticBox(scene, "Asphalt lane " + i.ToString(CultureInfo.InvariantCulture), 3.8f, 0.035f, 4.3f, new Vector3(x, 1.33f, 0f), road, pickable: false);
+            StaticBox(scene, "Left guard rail " + i.ToString(CultureInfo.InvariantCulture), 4.0f, 0.18f, 0.12f, new Vector3(x, 1.62f, -2.72f), darkSteel, pickable: false);
+            StaticBox(scene, "Right guard rail " + i.ToString(CultureInfo.InvariantCulture), 4.0f, 0.18f, 0.12f, new Vector3(x, 1.62f, 2.72f), darkSteel, pickable: false);
+        }
         for (var side = -1; side <= 1; side += 2)
         {
-            StaticBox(scene, side < 0 ? "West drawbridge tower A" : "East drawbridge tower A", 0.58f, 4.6f, 0.58f, new Vector3(side * 4.0f, 2.55f, -1.55f), towerMat, pickable: true);
-            StaticBox(scene, side < 0 ? "West drawbridge tower B" : "East drawbridge tower B", 0.58f, 4.6f, 0.58f, new Vector3(side * 4.0f, 2.55f, 1.55f), towerMat, pickable: true);
-            StaticBox(scene, side < 0 ? "West tower crossbeam" : "East tower crossbeam", 0.76f, 0.35f, 3.65f, new Vector3(side * 4.0f, 4.85f, 0f), steel, pickable: true);
             for (var z = -1; z <= 1; z += 2)
             {
-                var cable = scene.Add(new Cylinder3D
-                {
-                    Name = side < 0 ? "West counterweight cable" : "East counterweight cable",
-                    Radius = 0.035f,
-                    Height = 4.2f,
-                    Segments = 16,
-                    Position = new Vector3(side * 2.85f, 2.95f, z * 1.55f),
-                    RotationDegrees = new Vector3(0f, 0f, side < 0 ? -32f : 32f),
-                    Material = steel,
-                    IsPickable = true
-                });
-                _selectableObjects.Add(cable);
+                StaticBox(scene, "Main pylon " + side.ToString(CultureInfo.InvariantCulture) + "/" + z.ToString(CultureInfo.InvariantCulture), 0.85f, 8.5f, 0.85f, new Vector3(side * 9.2f, 5.35f, z * 3.2f), steel, pickable: true);
+                StaticBox(scene, "Pylon cap " + side.ToString(CultureInfo.InvariantCulture) + "/" + z.ToString(CultureInfo.InvariantCulture), 1.35f, 0.42f, 1.35f, new Vector3(side * 9.2f, 9.85f, z * 3.2f), steel, pickable: false);
+            }
+            StaticBox(scene, "Pylon crossbeam " + side.ToString(CultureInfo.InvariantCulture), 1.15f, 0.42f, 7.5f, new Vector3(side * 9.2f, 8.95f, 0f), steel, pickable: true);
+            StaticBox(scene, "Lift machinery house " + side.ToString(CultureInfo.InvariantCulture), 2.2f, 1.1f, 2.0f, new Vector3(side * 12.4f, 2.35f, -3.7f), darkSteel, pickable: true);
+            for (var c = 0; c < 8; c++)
+            {
+                var z = -2.7f + c * 0.77f;
+                StaticBox(scene, "Suspender cable " + side.ToString(CultureInfo.InvariantCulture) + "/" + c.ToString(CultureInfo.InvariantCulture), 0.065f, 6.0f - c * 0.18f, 0.065f, new Vector3(side * (2.4f + c * 0.75f), 5.0f - c * 0.05f, z), darkSteel, new Vector3(0f, 0f, side * (18f + c * 2f)), pickable: false);
             }
         }
-
-        // Vehicles and service assets.
-        for (var i = 0; i < 6; i++)
+        for (var i = 0; i < 18; i++)
         {
-            var x = -8.2f + i * 3.1f;
-            StaticBox(scene, "Traffic vehicle " + (i + 1).ToString(CultureInfo.InvariantCulture), 0.76f, 0.42f, 0.52f, new Vector3(x, 1.14f, i % 2 == 0 ? -0.58f : 0.62f), Material3D.CreatePhong(ColorFromHue(0.02f + i * 0.12f), 0.30f, 46f), pickable: true);
+            var x = -28f + i * 3.3f;
+            var z = i % 2 == 0 ? -0.95f : 1.05f;
+            StaticBox(scene, "Traffic vehicle " + (i + 1).ToString(CultureInfo.InvariantCulture), 0.95f, 0.46f, 0.55f, new Vector3(x, 1.66f, z), Material3D.CreatePhong(ColorFromHue(0.02f + i * 0.08f), 0.30f, 46f), pickable: true);
         }
 
-        AddBridgeSensor(scene, "S-01 hinge torque west", new Vector3(-4.06f, 1.22f, -1.62f), "hinge torque: 41 kNm");
-        AddBridgeSensor(scene, "S-02 hinge torque east", new Vector3(4.06f, 1.22f, 1.62f), "hinge torque: 39 kNm");
-        AddBridgeSensor(scene, "S-03 leaf angle left", new Vector3(-1.45f, 1.52f, 1.38f), "leaf angle: 18.2°");
-        AddBridgeSensor(scene, "S-04 leaf angle right", new Vector3(1.45f, 1.52f, -1.38f), "leaf angle: 18.0°");
-        AddBridgeSensor(scene, "S-05 vibration tower W", new Vector3(-4.05f, 3.72f, -1.55f), "vibration: 0.12 g");
-        AddBridgeSensor(scene, "S-06 vibration tower E", new Vector3(4.05f, 3.72f, 1.55f), "vibration: 0.10 g");
-        AddBridgeSensor(scene, "S-07 wind sensor", new Vector3(0f, 5.45f, 0f), "wind: 7.4 m/s");
-        AddBridgeSensor(scene, "S-08 bearing temperature", new Vector3(-3.90f, 0.98f, 1.62f), "bearing temp: 48°C");
-        AddBridgeSensor(scene, "S-09 deck strain", new Vector3(0f, 1.28f, -1.30f), "strain: 214 με");
-        AddBridgeSensor(scene, "S-10 water level", new Vector3(0f, 0.32f, 2.65f), "water level: +0.8 m");
+        AddBridgeSensor(scene, "S-01 West hinge torque", new Vector3(-9.4f, 1.80f, -3.05f), "torque 41 kNm", "Main west hinge", "Hydraulic torque is within normal opening envelope.");
+        AddBridgeSensor(scene, "S-02 East hinge torque", new Vector3(9.4f, 1.80f, 3.05f), "torque 39 kNm", "Main east hinge", "Paired leaf follows target angle with 0.4° deviation.");
+        AddBridgeSensor(scene, "S-03 Left leaf strain", new Vector3(-3.2f, 1.72f, -2.45f), "strain 214 με", "Deck strain gauge", "Peak stress under simulated traffic lane A.");
+        AddBridgeSensor(scene, "S-04 Right leaf strain", new Vector3(3.2f, 1.72f, 2.45f), "strain 198 με", "Deck strain gauge", "Load distribution is balanced after latest calibration.");
+        AddBridgeSensor(scene, "S-05 West pylon vibration", new Vector3(-9.2f, 7.7f, -3.2f), "vibration 0.12 g", "Pylon accelerometer", "No resonance signature detected.");
+        AddBridgeSensor(scene, "S-06 East pylon vibration", new Vector3(9.2f, 7.7f, 3.2f), "vibration 0.10 g", "Pylon accelerometer", "Slight wind-induced vibration, below alert level.");
+        AddBridgeSensor(scene, "S-07 Wind mast", new Vector3(0f, 9.7f, 0f), "wind 7.4 m/s", "Anemometer", "Crosswind is safe for bridge opening sequence.");
+        AddBridgeSensor(scene, "S-08 Bearing temperature", new Vector3(-11.2f, 1.65f, 3.0f), "temp 48°C", "Bearing thermal sensor", "Temperature is elevated but inside warning band.");
+        AddBridgeSensor(scene, "S-09 Water level", new Vector3(0f, 0.40f, 7.8f), "level +0.8 m", "River gauge", "Navigation clearance remains sufficient.");
+        AddBridgeSensor(scene, "S-10 Control cabinet", new Vector3(12.8f, 2.95f, -3.8f), "PLC online", "Control electronics", "All actuator feedback channels are responding.");
     }
+
 
     private Object3D StaticBox(Scene3D scene, string name, float width, float height, float depth, Vector3 position, Material3D material, Vector3? rotationDegrees = null, bool pickable = false)
     {
@@ -1796,26 +1927,24 @@ public partial class MainView : UserControl
         return box;
     }
 
-    private void AddBridgeSensor(Scene3D scene, string name, Vector3 position, string telemetry)
+    private void AddBridgeSensor(Scene3D scene, string name, Vector3 position, string telemetry, string title, string details)
     {
         var sensor = scene.Add(new Sphere3D
         {
             Name = name + " / " + telemetry,
-            Radius = 0.115f,
-            Segments = 20,
-            Rings = 10,
+            Radius = 0.145f,
+            Segments = 24,
+            Rings = 12,
             Position = position,
-            Material = new Material3D
-            {
-                BaseColor = new ColorRgba(0.16f, 1.0f, 0.42f, 1f),
-                Lighting = LightingMode.Unlit
-            },
+            Material = new Material3D { BaseColor = new ColorRgba(0.16f, 1.0f, 0.42f, 1f), Lighting = LightingMode.Unlit },
             IsPickable = true,
-            IsManipulationEnabled = false
+            IsManipulationEnabled = false,
+            DataContext = title + "\n" + telemetry + "\n" + details
         });
         _bridgeSensors.Add(sensor);
         _selectableObjects.Add(sensor);
     }
+
 
     private void HighlightBridgeSensor(Object3D sensor)
     {
@@ -1827,8 +1956,57 @@ public partial class MainView : UserControl
                 Lighting = LightingMode.Unlit
             };
         }
+        ShowBridgeSensorPanel(sensor);
         _statusText.Text = "Bridge sensor selected:\n" + sensor.Name;
     }
+
+    private void ShowBridgeSensorPanel(Object3D sensor)
+    {
+        var scene = _sceneControl.Scene;
+        if (_bridgeSensorPanel is not null)
+        {
+            scene.Remove(_bridgeSensorPanel);
+            _bridgeSensorPanel = null;
+        }
+
+        var lines = (sensor.DataContext as string ?? sensor.Name).Split('\n');
+        var title = lines.Length > 0 ? lines[0] : sensor.Name;
+        var value = lines.Length > 1 ? lines[1] : "value unavailable";
+        var details = lines.Length > 2 ? lines[2] : "No diagnostics text.";
+        var panel = new Border
+        {
+            Width = 520,
+            Height = 220,
+            Background = new SolidColorBrush(Color.FromArgb(238, 9, 13, 22)),
+            BorderBrush = new SolidColorBrush(Color.FromRgb(86, 190, 255)),
+            BorderThickness = new Thickness(2),
+            CornerRadius = new CornerRadius(14),
+            Padding = new Thickness(16, 12),
+            Child = new StackPanel
+            {
+                Spacing = 7,
+                Children =
+                {
+                    new TextBlock { Text = title, Foreground = Brushes.White, FontWeight = FontWeight.Bold, FontSize = 21 },
+                    new TextBlock { Text = value, Foreground = new SolidColorBrush(Color.FromRgb(112, 235, 166)), FontSize = 19, FontWeight = FontWeight.SemiBold },
+                    new TextBlock { Text = details, Foreground = new SolidColorBrush(Color.FromRgb(196, 210, 228)), FontSize = 14, TextWrapping = TextWrapping.Wrap }
+                }
+            }
+        };
+        _bridgeSensorPanel = scene.Add(new ControlPlane3D(panel)
+        {
+            Name = "Bridge sensor info panel / " + title,
+            Width = 2.4f,
+            Height = 1.02f,
+            Position = sensor.Position + new Vector3(0.0f, 0.82f, 0.0f),
+            AlwaysFaceCamera = true,
+            RenderScale = global::System.OperatingSystem.IsBrowser() ? 1.25d : 3.5d,
+            IsPickable = false,
+            IsManipulationEnabled = false
+        });
+        _bridgeSensorPanel.FaceCamera(scene.Camera);
+    }
+
 
     private void RandomizeBridgeSensorAlert()
     {
@@ -2025,16 +2203,23 @@ public partial class MainView : UserControl
 
     private void OnAnimationTick(object? sender, EventArgs e)
     {
-        var now = _clock.Elapsed.TotalSeconds;
-        var dt = _lastFrameTime <= 0d ? 1d / 60d : System.Math.Clamp(now - _lastFrameTime, 0.001d, 0.05d);
-        _lastFrameTime = now;
-
-        if (_animateCheck.IsChecked == true)
+        try
         {
-            AnimateScene((float)now, (float)dt);
-        }
+            var now = _clock.Elapsed.TotalSeconds;
+            var dt = _lastFrameTime <= 0d ? 1d / 60d : System.Math.Clamp(now - _lastFrameTime, 0.001d, 0.05d);
+            _lastFrameTime = now;
 
-        UpdateStatus();
+            if (_animateCheck is not null && _animateCheck.IsChecked == true)
+            {
+                AnimateScene((float)now, (float)dt);
+            }
+
+            UpdateStatus();
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine("Avalonia3D demo animation tick failed: " + ex);
+        }
     }
 
     private void AnimateScene(float t, float dt)
@@ -2095,6 +2280,11 @@ public partial class MainView : UserControl
             if (_controlPlane is not null && !_controlPlane.AlwaysFaceCamera)
             {
                 _controlPlane.FaceCamera(scene.Camera);
+            }
+
+            if (_bridgeSensorPanel is not null)
+            {
+                _bridgeSensorPanel.FaceCamera(scene.Camera);
             }
 
             if (_particleSystem is not null)
@@ -2371,18 +2561,21 @@ public partial class MainView : UserControl
         var label = ResolveEarthLocationName(lat, lon);
         var panel = new Border
         {
-            Background = new SolidColorBrush(Color.FromArgb(226, 8, 12, 22)),
-            BorderBrush = new SolidColorBrush(Color.FromRgb(72, 148, 255)),
-            BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(10, 6),
+            Width = 560,
+            Height = 160,
+            Background = new SolidColorBrush(Color.FromArgb(236, 7, 11, 22)),
+            BorderBrush = new SolidColorBrush(Color.FromRgb(88, 160, 255)),
+            BorderThickness = new Thickness(2),
+            CornerRadius = new CornerRadius(14),
+            Padding = new Thickness(18, 12),
             Child = new StackPanel
             {
-                Spacing = 2,
+                Spacing = 4,
                 Children =
                 {
-                    new TextBlock { Text = label, Foreground = Brushes.White, FontWeight = FontWeight.Bold, FontSize = 13 },
-                    new TextBlock { Text = $"lat {lat:0.##}, lon {lon:0.##}", Foreground = new SolidColorBrush(Color.FromRgb(188, 208, 238)), FontSize = 11 }
+                    new TextBlock { Text = label, Foreground = Brushes.White, FontWeight = FontWeight.Bold, FontSize = 24 },
+                    new TextBlock { Text = $"lat {lat:0.##}, lon {lon:0.##}", Foreground = new SolidColorBrush(Color.FromRgb(190, 214, 248)), FontSize = 18 },
+                    new TextBlock { Text = "interactive geospatial marker", Foreground = new SolidColorBrush(Color.FromRgb(116, 168, 244)), FontSize = 14 }
                 }
             }
         };
@@ -2390,14 +2583,16 @@ public partial class MainView : UserControl
         _planetLabel = scene.Add(new ControlPlane3D(panel)
         {
             Name = "Planet location label / " + label,
-            Width = 1.18f,
-            Height = 0.38f,
+            Width = 1.75f,
+            Height = 0.50f,
             AlwaysFaceCamera = true,
+            RenderScale = global::System.OperatingSystem.IsBrowser() ? 1.25d : 4.0d,
             IsPickable = false,
             IsManipulationEnabled = false
         });
-        _planetLabel.Position = _planet.Position + Vector3.Normalize(normal) * (_planet.Radius + 0.38f);
+        _planetLabel.Position = _planet.Position + Vector3.Normalize(normal) * (_planet.Radius + 0.48f);
     }
+
 
     private static string ResolveEarthLocationName(float lat, float lon)
     {
@@ -2566,6 +2761,14 @@ public partial class MainView : UserControl
                 return;
             }
 
+            if (ReferenceEquals(e.Target, _planet))
+            {
+                var normal = Vector3.Normalize(e.WorldPosition - _planet.Position);
+                SetPlanetMarkerFromNormal(normal, showLabel: true);
+                SetSelection(_planetMarker);
+                return;
+            }
+
             if (ReferenceEquals(e.Target, _planetMarker))
             {
                 var normal = Vector3.Normalize(_planetMarker.Position - _planet.Position);
@@ -2609,6 +2812,11 @@ public partial class MainView : UserControl
 
     private void UpdateSelectionText()
     {
+        if (_selectionText is null)
+        {
+            return;
+        }
+
         _selectionText.Text = _selectedObject is null
             ? "Selection: none. Click a pickable object in the current demo."
             : $"Selection: {_selectedObject.Name}\nPosition: {FormatVector(_selectedObject.Position)}\nClicks: {_clickCount.ToString(CultureInfo.InvariantCulture)}";
@@ -2616,13 +2824,29 @@ public partial class MainView : UserControl
 
     private void OnFrameRendered(object? sender, SceneFrameRenderedEventArgs e)
     {
+        if (_backendText is null)
+        {
+            return;
+        }
+
         _lastFrame = e;
         _lastFps = e.FrameMilliseconds > 0d ? 1000d / e.FrameMilliseconds : 0d;
-        _backendText.Text = $"Backend: {e.Kind} | frame {e.FrameMilliseconds:0.00} ms";
+
+        var now = Stopwatch.GetTimestamp();
+        if (_lastBackendTextTicks == 0 || (now - _lastBackendTextTicks) >= Stopwatch.Frequency / 4)
+        {
+            _lastBackendTextTicks = now;
+            _backendText.Text = $"Backend: {e.Kind} | frame {e.FrameMilliseconds:0.00} ms";
+        }
     }
 
     private void UpdateStatus(bool force = false)
     {
+        if (_statusText is null)
+        {
+            return;
+        }
+
         var now = Stopwatch.GetTimestamp();
         if (!force && _lastStatusTicks != 0 && (now - _lastStatusTicks) < Stopwatch.Frequency / 4)
         {
@@ -2653,7 +2877,10 @@ public partial class MainView : UserControl
         {
             for (var x = 0; x < columns; x++)
             {
-                var y = (x + z) % 3 == 0 ? 0.06f : 0f;
+                // Rack mesh parts are authored around their local origin. Keep the rack
+                // center above the floor so the ground/depth pass cannot hide the retained
+                // high-scale layer from the default demo camera.
+                var y = 1.06f + ((x + z) % 3 == 0 ? 0.06f : 0f);
                 yield return Matrix4x4.CreateRotationY(((x + z) & 1) == 0 ? 0f : MathF.PI) *
                              Matrix4x4.CreateTranslation(x * spacingX - offsetX, y, z * spacingZ - offsetZ);
             }

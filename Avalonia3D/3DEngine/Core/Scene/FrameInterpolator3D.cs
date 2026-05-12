@@ -14,10 +14,18 @@ public sealed class FrameInterpolator3D
     private readonly Dictionary<string, Matrix4x4> _current = new(StringComparer.Ordinal);
     private readonly List<string> _staleKeys = new();
     private long _currentTickTimestamp;
+    private int _renderVersion;
+    private double _lastPublishedAlpha = double.NaN;
 
     public bool Enabled { get; set; }
     public double SimulationTickFps { get; set; } = 20d;
     public double Alpha { get; private set; } = 1d;
+
+    /// <summary>
+    /// Version of the render-time interpolation transform stream. Retained renderers use it
+    /// to upload transform slots when only interpolation alpha changed between simulation ticks.
+    /// </summary>
+    public int RenderVersion => _renderVersion;
 
     public void BeginTick(Scene3D scene)
     {
@@ -33,25 +41,36 @@ public sealed class FrameInterpolator3D
     {
         if (!Enabled) return;
         _current.Clear();
-        foreach (var obj in scene.Registry.Renderables)
+        foreach (var obj in scene.Registry.SnapshotRenderables())
         {
             _current[obj.Id] = obj.GetModelMatrix();
         }
         _currentTickTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
         Alpha = 0d;
+        _lastPublishedAlpha = double.NaN;
+        _renderVersion++;
         RemoveStalePreviousKeys();
     }
 
     public void UpdateAlpha()
     {
+        var previous = Alpha;
         if (!Enabled || _currentTickTimestamp == 0)
         {
             Alpha = 1d;
-            return;
         }
-        var tickMs = 1000d / System.Math.Clamp(SimulationTickFps, 1d, 240d);
-        var elapsedMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _currentTickTimestamp) * 1000d / System.Diagnostics.Stopwatch.Frequency;
-        Alpha = System.Math.Clamp(elapsedMs / tickMs, 0d, 1d);
+        else
+        {
+            var tickMs = 1000d / System.Math.Clamp(SimulationTickFps, 1d, 240d);
+            var elapsedMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _currentTickTimestamp) * 1000d / System.Diagnostics.Stopwatch.Frequency;
+            Alpha = System.Math.Clamp(elapsedMs / tickMs, 0d, 1d);
+        }
+
+        if (double.IsNaN(_lastPublishedAlpha) || System.Math.Abs(Alpha - previous) > 0.000001d || System.Math.Abs(Alpha - _lastPublishedAlpha) > 0.000001d)
+        {
+            _lastPublishedAlpha = Alpha;
+            _renderVersion++;
+        }
     }
 
     public bool TryGetInterpolatedModel(string objectId, out Matrix4x4 model)
@@ -77,6 +96,8 @@ public sealed class FrameInterpolator3D
         _staleKeys.Clear();
         _currentTickTimestamp = 0;
         Alpha = 1d;
+        _lastPublishedAlpha = double.NaN;
+        _renderVersion++;
     }
 
     private void RemoveStalePreviousKeys()

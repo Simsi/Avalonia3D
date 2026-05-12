@@ -1,5 +1,6 @@
 using System;
 using System.Numerics;
+using System.Runtime.InteropServices;
 using ThreeDEngine.Core.Collision;
 using ThreeDEngine.Core.Primitives;
 using ThreeDEngine.Core.Geometry.Surfaces;
@@ -12,6 +13,9 @@ namespace ThreeDEngine.Core.Geometry;
 /// </summary>
 public sealed class RenderGeometry3D
 {
+    private WebGlGeometryPayload3D? _webGlPayload;
+    private WebGlGeometryPayload3D? _webGlPayloadWithWireframe;
+
     public RenderGeometry3D(
         Vector3[] positions,
         Vector3[] normals,
@@ -84,6 +88,90 @@ public sealed class RenderGeometry3D
     public static RenderGeometry3D FromMesh(Mesh3D mesh)
         => new(mesh.Positions, mesh.Normals, mesh.Indices, mesh.ResourceKey, mesh.TexCoords0, mesh.VertexColors0, mesh.Tangents, mesh.MaterialSlots, mesh.BoneIndices0, mesh.BoneWeights0);
 
+
+
+    public WebGlGeometryPayload3D GetWebGlPayload(bool includeWireframe)
+    {
+        if (includeWireframe)
+        {
+            return _webGlPayloadWithWireframe ??= BuildWebGlPayload(includeWireframe: true);
+        }
+
+        return _webGlPayload ??= BuildWebGlPayload(includeWireframe: false);
+    }
+
+    private WebGlGeometryPayload3D BuildWebGlPayload(bool includeWireframe)
+    {
+        var (indexBytes, indexElementSize) = ConvertIndicesToBytes(Indices, forceUInt16: false);
+        var (wireframeBytes, wireframeElementSize) = includeWireframe
+            ? ConvertIndicesToBytes(WireframeIndices, forceUInt16: true)
+            : (Array.Empty<byte>(), sizeof(ushort));
+
+        return new WebGlGeometryPayload3D(
+            VertexCount,
+            IndexCount,
+            CopyStructBytes(Positions),
+            CopyStructBytes(HasNormals ? Normals : CreateDefaultNormals(Positions.Length)),
+            HasTexCoords0 ? CopyStructBytes(TexCoords0) : Array.Empty<byte>(),
+            HasTangents ? CopyStructBytes(Tangents) : Array.Empty<byte>(),
+            HasColors0 ? CopyStructBytes(Colors0) : Array.Empty<byte>(),
+            HasMaterialSlots ? CopyFloatBytes(MaterialSlots) : Array.Empty<byte>(),
+            HasSkinWeights ? CopyStructBytes(BoneIndices0) : Array.Empty<byte>(),
+            HasSkinWeights ? CopyStructBytes(BoneWeights0) : Array.Empty<byte>(),
+            indexBytes,
+            indexElementSize,
+            wireframeBytes,
+            wireframeElementSize,
+            HasTexCoords0,
+            HasTangents,
+            HasColors0,
+            HasMaterialSlots,
+            HasSkinWeights,
+            Layout.ToString());
+    }
+
+    private static byte[] CopyFloatBytes(float[] values)
+    {
+        if (values.Length == 0) return Array.Empty<byte>();
+        var bytes = new byte[values.Length * sizeof(float)];
+        Buffer.BlockCopy(values, 0, bytes, 0, bytes.Length);
+        return bytes;
+    }
+
+    private static byte[] CopyStructBytes<T>(T[] values)
+        where T : struct
+    {
+        if (values.Length == 0) return Array.Empty<byte>();
+        var source = MemoryMarshal.AsBytes(values.AsSpan());
+        return source.ToArray();
+    }
+
+    private static (byte[] Bytes, int ElementSize) ConvertIndicesToBytes(int[] indices, bool forceUInt16)
+    {
+        if (indices.Length == 0) return (Array.Empty<byte>(), sizeof(ushort));
+        var maxIndex = 0;
+        for (var i = 0; i < indices.Length; i++)
+        {
+            if (indices[i] > maxIndex) maxIndex = indices[i];
+        }
+
+        if (forceUInt16 || maxIndex <= ushort.MaxValue)
+        {
+            var compact = new ushort[indices.Length];
+            for (var i = 0; i < indices.Length; i++)
+            {
+                compact[i] = (ushort)global::System.Math.Clamp(indices[i], 0, ushort.MaxValue);
+            }
+
+            var bytes = new byte[compact.Length * sizeof(ushort)];
+            Buffer.BlockCopy(compact, 0, bytes, 0, bytes.Length);
+            return (bytes, sizeof(ushort));
+        }
+
+        var full = new byte[indices.Length * sizeof(int)];
+        Buffer.BlockCopy(indices, 0, full, 0, full.Length);
+        return (full, sizeof(int));
+    }
 
     private static void ValidateBaseGeometry(Vector3[] positions, int[] indices, string resourceKey)
     {

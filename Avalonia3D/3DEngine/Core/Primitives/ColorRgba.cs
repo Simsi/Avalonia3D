@@ -1,4 +1,5 @@
 using System;
+using System.Numerics;
 
 namespace ThreeDEngine.Core.Primitives;
 
@@ -19,6 +20,8 @@ public readonly record struct ColorRgba(float R, float G, float B, float A)
             B + (other.B - B) * amount,
             A + (other.A - A) * amount);
     }
+
+    public Vector3 ToVector3() => new(R, G, B);
 
     public float[] ToArray() => new float[] { R, G, B, A };
 }

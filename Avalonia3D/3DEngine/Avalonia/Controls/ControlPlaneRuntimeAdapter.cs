@@ -90,8 +90,10 @@ internal sealed class ControlPlaneRuntimeAdapter : IDisposable
         }
 
         var size = DetermineRenderSize(_sourceControl);
-        var pixelWidth = System.Math.Max((int)System.Math.Ceiling(size.Width), 1);
-        var pixelHeight = System.Math.Max((int)System.Math.Ceiling(size.Height), 1);
+        var maxRenderScale = OperatingSystem.IsBrowser() ? 1.5d : 4d;
+        var renderScale = global::System.Math.Clamp(_plane.RenderScale, 1d, maxRenderScale);
+        var pixelWidth = System.Math.Max((int)System.Math.Ceiling(size.Width * renderScale), 1);
+        var pixelHeight = System.Math.Max((int)System.Math.Ceiling(size.Height * renderScale), 1);
 
         _isUpdatingSnapshot = true;
         try
@@ -103,11 +105,11 @@ internal sealed class ControlPlaneRuntimeAdapter : IDisposable
             if (_bitmap is null || _bitmap.PixelSize.Width != pixelWidth || _bitmap.PixelSize.Height != pixelHeight)
             {
                 _bitmap?.Dispose();
-                _bitmap = new RenderTargetBitmap(new PixelSize(pixelWidth, pixelHeight));
+                _bitmap = new RenderTargetBitmap(new PixelSize(pixelWidth, pixelHeight), new global::Avalonia.Vector(96d * renderScale, 96d * renderScale));
             }
 
             _bitmap.Render(_sourceControl);
-            _plane.UpdateSnapshot(_bitmap, pixelWidth, pixelHeight);
+            _plane.UpdateSnapshot(_bitmap, pixelWidth, pixelHeight, size.Width, size.Height);
             _lastSnapshotUtc = DateTime.UtcNow;
             _lastRenderedSize = size;
         }
@@ -268,6 +270,7 @@ internal sealed class ControlPlaneRuntimeAdapter : IDisposable
 
         _lastLocalPoint = localPoint;
 
+        var hoverChanged = false;
         Interactive target;
         if (_isPointerCaptured && _pressedElement is not null)
         {
@@ -276,7 +279,7 @@ internal sealed class ControlPlaneRuntimeAdapter : IDisposable
         else
         {
             target = ResolveInteractiveTarget(localPoint);
-            UpdateHoverTarget(target, sourceEvent, rootVisual, localPoint);
+            hoverChanged = UpdateHoverTarget(target, sourceEvent, rootVisual, localPoint);
         }
 
         var eventRoot = GetEventRootVisual(rootVisual);
@@ -295,7 +298,10 @@ internal sealed class ControlPlaneRuntimeAdapter : IDisposable
             return false;
         }
 
-        MarkDirty();
+        if (_isPointerCaptured || hoverChanged)
+        {
+            MarkDirty();
+        }
         return true;
     }
 
@@ -487,11 +493,11 @@ internal sealed class ControlPlaneRuntimeAdapter : IDisposable
         return forwarded.Handled;
     }
 
-    private void UpdateHoverTarget(Interactive target, PointerEventArgs sourceEvent, Visual rootVisual, Point localPoint)
+    private bool UpdateHoverTarget(Interactive target, PointerEventArgs sourceEvent, Visual rootVisual, Point localPoint)
     {
         if (ReferenceEquals(_hoveredElement, target))
         {
-            return;
+            return false;
         }
 
         var eventRoot = GetEventRootVisual(rootVisual);
@@ -522,6 +528,7 @@ internal sealed class ControlPlaneRuntimeAdapter : IDisposable
             sourceEvent.KeyModifiers);
         TryRaiseEvent(target, enterArgs);
         ClearTextFocusIfPointerLeftFocusedElement(target);
+        return true;
     }
 
     private void ClearTextFocusIfPointerLeftFocusedElement(Interactive target)

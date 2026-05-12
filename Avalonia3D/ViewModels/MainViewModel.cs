@@ -1,6 +1,5 @@
-﻿namespace Avalonia3D.ViewModels;
+namespace Avalonia3D.ViewModels;
 
-public class MainViewModel : ViewModelBase
+public sealed class MainViewModel
 {
-    public string Greeting => "Welcome to Avalonia!";
 }

@@ -74,6 +74,7 @@ public sealed class KinematicCharacterController3D
     private Vector3 MoveAxis(Scene3D scene, Vector3 position, Vector3 motion)
     {
         if (motion.LengthSquared() < 0.0000001f) return position;
+
         var next = position + motion;
         var bounds = GetBounds(next);
         foreach (var obj in GetStaticColliders(scene, bounds))
@@ -82,6 +83,22 @@ public sealed class KinematicCharacterController3D
             var other = obj.Collider.GetWorldBounds(obj);
             if (!other.IsValid || !bounds.Intersects(other)) continue;
 
+            // Floors, flush guide strips and low walkable platforms must not be
+            // treated as horizontal walls. The old AABB controller resolved any
+            // overlap by pushing sideways, which made the player slide/teleport
+            // off the entrance platform and jump to its corner.
+            if (IsWalkableSupport(position, other))
+            {
+                continue;
+            }
+
+            // Ignore geometry above the character head for the horizontal pass.
+            // It will be handled by the vertical pass if the player jumps into it.
+            if (other.Min.Y >= position.Y + Height - 0.03f)
+            {
+                continue;
+            }
+
             if (TryStepOver(scene, position, motion, other, out var stepped))
             {
                 next = stepped;
@@ -89,13 +106,13 @@ public sealed class KinematicCharacterController3D
                 continue;
             }
 
-            if (motion.X > 0f) next.X = other.Min.X - Radius;
-            else if (motion.X < 0f) next.X = other.Max.X + Radius;
-            if (motion.Z > 0f) next.Z = other.Min.Z - Radius;
-            else if (motion.Z < 0f) next.Z = other.Max.Z + Radius;
+            if (motion.X > 0f) next.X = other.Min.X - Radius - 0.001f;
+            else if (motion.X < 0f) next.X = other.Max.X + Radius + 0.001f;
+            if (motion.Z > 0f) next.Z = other.Min.Z - Radius - 0.001f;
+            else if (motion.Z < 0f) next.Z = other.Max.Z + Radius + 0.001f;
 
-            // Remove the blocked component from velocity so a wall contact cannot
-            // accumulate horizontal energy over repeated navigation ticks.
+            // Remove only the blocked component. Keep the vertical velocity and
+            // the perpendicular horizontal component so wall sliding remains smooth.
             if (MathF.Abs(motion.X) > 0f) Velocity = new Vector3(0f, Velocity.Y, Velocity.Z);
             if (MathF.Abs(motion.Z) > 0f) Velocity = new Vector3(Velocity.X, Velocity.Y, 0f);
             bounds = GetBounds(next);
@@ -108,11 +125,10 @@ public sealed class KinematicCharacterController3D
         stepped = position;
         if (!IsGrounded || StepHeight <= 0.0001f) return false;
 
-        var currentBounds = GetBounds(position);
-        var obstacleHeight = blockingBounds.Max.Y - currentBounds.Min.Y;
-        if (obstacleHeight < -0.02f || obstacleHeight > StepHeight + 0.02f) return false;
+        var obstacleHeight = blockingBounds.Max.Y - position.Y;
+        if (obstacleHeight < -0.05f || obstacleHeight > StepHeight + 0.04f) return false;
 
-        var raised = position + new Vector3(0f, StepHeight, 0f);
+        var raised = position + new Vector3(0f, obstacleHeight + 0.025f, 0f);
         var horizontal = raised + motion;
         var testBounds = GetBounds(horizontal);
         foreach (var obj in GetStaticColliders(scene, testBounds))
@@ -120,6 +136,8 @@ public sealed class KinematicCharacterController3D
             if (obj.Collider is null) continue;
             var other = obj.Collider.GetWorldBounds(obj);
             if (!other.IsValid) continue;
+            if (IsWalkableSupport(horizontal, other)) continue;
+            if (other.Min.Y >= horizontal.Y + Height - 0.03f) continue;
             if (testBounds.Intersects(other)) return false;
         }
 
@@ -133,40 +151,61 @@ public sealed class KinematicCharacterController3D
         IsGrounded = false;
         GroundNormal = Vector3.UnitY;
         if (MathF.Abs(deltaY) < 0.0000001f) return position;
+
         var next = position + new Vector3(0f, deltaY, 0f);
-        var bounds = GetBounds(next);
-        foreach (var obj in GetStaticColliders(scene, bounds))
+        var horizontalProbe = GetBounds(next);
+        foreach (var obj in GetStaticColliders(scene, horizontalProbe))
         {
             if (obj.Collider is null) continue;
             var other = obj.Collider.GetWorldBounds(obj);
-            if (!other.IsValid || !bounds.Intersects(other)) continue;
+            if (!other.IsValid) continue;
+            if (!OverlapsXZ(horizontalProbe, other)) continue;
+
             if (deltaY < 0f)
             {
-                next.Y = other.Max.Y;
-                Velocity = new Vector3(Velocity.X, 0f, Velocity.Z);
-                IsGrounded = true;
-                GroundNormal = Vector3.UnitY;
+                // Only land on surfaces crossed from above. Side walls that overlap
+                // the capsule vertically must not snap the player upward.
+                if (position.Y + 0.02f >= other.Max.Y && next.Y <= other.Max.Y + 0.02f)
+                {
+                    next.Y = other.Max.Y;
+                    Velocity = new Vector3(Velocity.X, 0f, Velocity.Z);
+                    IsGrounded = true;
+                    GroundNormal = Vector3.UnitY;
+                }
             }
             else
             {
-                next.Y = other.Min.Y - Height;
-                if (Velocity.Y > 0f) Velocity = new Vector3(Velocity.X, 0f, Velocity.Z);
+                var oldHead = position.Y + Height;
+                var newHead = next.Y + Height;
+                // Only ceilings above the current head can stop a jump. The old
+                // code also resolved the floor under the player as a ceiling, which
+                // caused the visible space-key teleport.
+                if (oldHead <= other.Min.Y + 0.02f && newHead >= other.Min.Y - 0.02f)
+                {
+                    next.Y = other.Min.Y - Height - 0.001f;
+                    if (Velocity.Y > 0f) Velocity = new Vector3(Velocity.X, 0f, Velocity.Z);
+                }
             }
-            bounds = GetBounds(next);
         }
         return next;
     }
 
     private void SnapToGround(Scene3D scene, ref Vector3 position)
     {
-        var snap = MathF.Max(GroundSnapDistance, MathF.Min(0.2f, StepHeight + 0.02f));
+        var snap = MathF.Max(GroundSnapDistance, MathF.Min(0.22f, StepHeight + 0.03f));
         if (TryProbeGround(scene, position, snap, out var groundY, out var groundNormal))
         {
-            position.Y = groundY;
-            Velocity = new Vector3(Velocity.X, 0f, Velocity.Z);
-            IsGrounded = true;
-            GroundNormal = groundNormal;
-            return;
+            // Do not pull the character upward onto a ledge/wall face far above
+            // the current foot. Snap is only for the support surface directly below
+            // or a small step.
+            if (groundY <= position.Y + StepHeight + 0.045f && groundY >= position.Y - snap - 0.045f)
+            {
+                position.Y = groundY;
+                Velocity = new Vector3(Velocity.X, 0f, Velocity.Z);
+                IsGrounded = true;
+                GroundNormal = groundNormal;
+                return;
+            }
         }
 
         var probe = GetBounds(position + new Vector3(0f, -snap, 0f));
@@ -176,9 +215,8 @@ public sealed class KinematicCharacterController3D
             if (obj.Collider is null) continue;
             var other = obj.Collider.GetWorldBounds(obj);
             if (!other.IsValid) continue;
-            var horizontal = !(probe.Max.X < other.Min.X || probe.Min.X > other.Max.X || probe.Max.Z < other.Min.Z || probe.Min.Z > other.Max.Z);
-            if (!horizontal) continue;
-            if (other.Max.Y <= position.Y + 0.05f && other.Max.Y >= position.Y - snap && other.Max.Y > bestY)
+            if (!OverlapsXZ(probe, other)) continue;
+            if (other.Max.Y <= position.Y + StepHeight + 0.045f && other.Max.Y >= position.Y - snap - 0.045f && other.Max.Y > bestY)
             {
                 bestY = other.Max.Y;
             }
@@ -191,6 +229,18 @@ public sealed class KinematicCharacterController3D
             IsGrounded = true;
             GroundNormal = Vector3.UnitY;
         }
+    }
+
+    private bool IsWalkableSupport(Vector3 footPosition, Bounds3D other)
+    {
+        return other.Max.Y <= footPosition.Y + StepHeight + 0.035f &&
+               other.Max.Y >= footPosition.Y - MathF.Max(GroundSnapDistance, 0.08f) - 0.04f;
+    }
+
+    private static bool OverlapsXZ(Bounds3D a, Bounds3D b)
+    {
+        return a.Min.X <= b.Max.X && a.Max.X >= b.Min.X &&
+               a.Min.Z <= b.Max.Z && a.Max.Z >= b.Min.Z;
     }
 
     private bool TryProbeGround(Scene3D scene, Vector3 footPosition, float snap, out float groundY, out Vector3 groundNormal)

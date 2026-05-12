@@ -2,7 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Numerics;
-using System.Text.Json;
+using System.IO;
+using System.Text;
 using ThreeDEngine.Avalonia.WebGL.Interop;
 using ThreeDEngine.Core.Environment;
 using ThreeDEngine.Core.HighScale;
@@ -23,7 +24,8 @@ internal sealed class WebGlClientHighScaleRenderer
 {
     private const int TransformFloatStride = 16;
     private const int StateFloatStride = 4;
-    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+    private const int SnapshotMagic = 0x314C5348; // HSL1, little-endian
+    private const int SnapshotProtocolVersion = 1;
     private static readonly HighScaleLodLevel3D[] RuntimeLods =
     {
         HighScaleLodLevel3D.Detailed,
@@ -33,11 +35,29 @@ internal sealed class WebGlClientHighScaleRenderer
     };
 
     private readonly Dictionary<string, LayerRuntime> _layers = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _liveLayerIdsScratch = new(StringComparer.Ordinal);
+    private readonly List<string> _deadLayerIdsScratch = new(16);
     private readonly List<int> _dirtyTransformIndices = new(1024);
     private int[] _dirtyTransformScratch = Array.Empty<int>();
     private readonly Stopwatch _animationClock = Stopwatch.StartNew();
+    private readonly byte[] _viewProjectionBytes = new byte[16 * sizeof(float)];
+    private readonly byte[] _cameraBytes = new byte[12 * sizeof(float)];
+    private readonly byte[] _lightingBytes = new byte[33 * sizeof(float)];
+    private readonly byte[] _styleBytes = new byte[24 * sizeof(float)];
+
+    public const string DrawCommandPrefix = "__hs64:";
+
+    private ulong _version;
 
     public bool HasRuntimeState => _layers.Count != 0;
+    public ulong Version => _version;
+
+    public static string BuildLayerDrawCommandId(string layerId)
+    {
+        if (string.IsNullOrEmpty(layerId)) return DrawCommandPrefix;
+        return DrawCommandPrefix + Convert.ToBase64String(Encoding.UTF8.GetBytes(layerId));
+    }
+
 
     public void Reset(int hostId)
     {
@@ -52,66 +72,91 @@ internal sealed class WebGlClientHighScaleRenderer
         }
 
         _layers.Clear();
+        _version++;
     }
 
-    public void RenderFrame(int hostId, Scene3D scene, float width, float height, Matrix4x4 viewProjection, RenderStats stats)
+    public void SyncFrame(int hostId, Scene3D scene, IReadOnlyList<HighScaleInstanceLayer3D> visibleLayers, float width, float height, Matrix4x4 viewProjection, DirectionalShadowSnapshot3D shadow, RenderStats stats)
     {
         stats.WebGlClientHighScaleRuntime = true;
         stats.WebGlClientGpuTransformAnimation = scene.Performance.EnableWebGlClientGpuTransformAnimation;
         stats.SkyboxEnabled = scene.Environment.Skybox.Mode != SkyboxMode3D.None;
         stats.SkyboxMode = (int)scene.Environment.Skybox.Mode;
-        var initialShadow = DirectionalShadowResolver3D.Resolve(scene);
-        stats.DirectionalShadowEnabled = initialShadow.IsEnabled;
-        stats.ShadowMapResolution = initialShadow.Resolution;
-        stats.ShadowMapReason = initialShadow.Reason;
-        EnsureSnapshots(hostId, scene, stats);
-        ApplyPatches(hostId, scene, stats);
+        if (visibleLayers is null) throw new ArgumentNullException(nameof(visibleLayers));
+        if (shadow is null) throw new ArgumentNullException(nameof(shadow));
+        stats.DirectionalShadowEnabled = shadow.IsEnabled;
+        stats.ShadowMapResolution = shadow.Resolution;
+        stats.ShadowMapReason = shadow.Reason;
+        EnsureSnapshots(hostId, scene, visibleLayers, stats);
+        ApplyPatches(hostId, scene, visibleLayers, stats);
 
-        var light = ResolveLight(scene);
-        var shadow = DirectionalShadowResolver3D.Resolve(scene);
+        var light = SceneLightingResolver3D.Resolve(scene);
         var skybox = scene.Environment.Skybox;
-        var frameJson = JsonSerializer.Serialize(new
-        {
+
+        Span<float> view = stackalloc float[16];
+        WriteMatrix(view, viewProjection);
+
+        Span<float> camera = stackalloc float[12];
+        WriteVector3(camera, 0, scene.Camera.Position);
+        WriteVector3(camera, 3, scene.Camera.Right);
+        WriteVector3(camera, 6, scene.Camera.SafeUp);
+        WriteVector3(camera, 9, scene.Camera.Forward);
+
+        Span<float> lighting = stackalloc float[33];
+        WriteVector3(lighting, 0, light.Ambient);
+        WriteVector3(lighting, 3, light.DirectionalDirection);
+        WriteVector3(lighting, 6, light.DirectionalColor);
+        WriteVector4(lighting, 9, light.PointPosition);
+        WriteVector4(lighting, 13, light.PointColor);
+        // Spots are not currently resolved by the high-scale lighting helper; reserve slots for ABI parity.
+        lighting[17] = 0f; lighting[18] = 0f; lighting[19] = 0f; lighting[20] = 1f;
+        lighting[21] = 0f; lighting[22] = -1f; lighting[23] = 0f; lighting[24] = 0f;
+        lighting[25] = 0f; lighting[26] = 0f; lighting[27] = 0f; lighting[28] = 0f;
+        lighting[29] = 0.95f; lighting[30] = 0.85f; lighting[31] = 1f; lighting[32] = 0f;
+
+        Span<float> style = stackalloc float[24];
+        WriteColor(style, 0, scene.BackgroundColor);
+        WriteVector3Array(style, 4, skybox.TopColor.ToVector3());
+        WriteVector3Array(style, 7, skybox.HorizonColor.ToVector3());
+        WriteVector3Array(style, 10, skybox.BottomColor.ToVector3());
+        style[13] = skybox.Intensity;
+        style[14] = scene.RenderPipeline.ToneMapping.Exposure;
+        style[15] = scene.RenderPipeline.ToneMapping.Gamma;
+        style[16] = scene.RenderPipeline.Ssao.Strength;
+        style[17] = scene.RenderPipeline.Ssao.Radius;
+        style[18] = scene.RenderPipeline.Ssao.Bias;
+        style[19] = scene.RenderPipeline.Ssao.SampleCount;
+        style[20] = scene.Performance.EnableWebGlClientGpuTransformAnimation ? (float)_animationClock.Elapsed.TotalSeconds : 0f;
+        style[21] = scene.Performance.WebGlClientGpuTransformAnimationAmplitude;
+        style[22] = shadow.Strength;
+        style[23] = shadow.Bias;
+
+        var flags = 0;
+        if (skybox.Mode != SkyboxMode3D.None) flags |= 1;
+        if (scene.Performance.EnableWebGlClientGpuTransformAnimation) flags |= 2;
+        if (shadow.IsEnabled) flags |= 4;
+        if (scene.RenderPipeline.Ssao.Enabled) flags |= 8;
+        if (scene.RenderPipeline.EnableHdr || scene.RenderPipeline.ToneMapping.Enabled) flags |= 16;
+
+        WebGlInterop.SyncHighScaleFrameDirect(
+            hostId,
             width,
             height,
-            clearColor = new[] { scene.BackgroundColor.R, scene.BackgroundColor.G, scene.BackgroundColor.B, scene.BackgroundColor.A },
-            viewProjection = ToArray(viewProjection),
-            cameraPosition = new[] { scene.Camera.Position.X, scene.Camera.Position.Y, scene.Camera.Position.Z },
-            ambientLight = light.Ambient,
-            directionalLightDirection = light.Direction,
-            directionalLightColor = light.DirectionalColor,
-            pointLightPosition = light.PointPosition,
-            pointLightColor = light.PointColor,
-            skyboxEnabled = skybox.Mode != SkyboxMode3D.None,
-            skyboxMode = (int)skybox.Mode,
-            skyboxTopColor = skybox.TopColor.ToArray(),
-            skyboxHorizonColor = skybox.HorizonColor.ToArray(),
-            skyboxBottomColor = skybox.BottomColor.ToArray(),
-            skyboxIntensity = skybox.Intensity,
-            directionalShadowEnabled = shadow.IsEnabled,
-            directionalShadowResolution = shadow.Resolution,
-            directionalShadowStrength = shadow.Strength,
-            directionalShadowBias = shadow.Bias,
-            directionalShadowReason = shadow.Reason,
-            clientAnimationEnabled = scene.Performance.EnableWebGlClientGpuTransformAnimation,
-            clientAnimationTime = scene.Performance.EnableWebGlClientGpuTransformAnimation ? (float)_animationClock.Elapsed.TotalSeconds : 0f,
-            clientAnimationAmplitude = scene.Performance.WebGlClientGpuTransformAnimationAmplitude
-        }, JsonOptions);
-
-        var metrics = WebGlInterop.RenderHighScaleFrame(hostId, frameJson);
-        ApplyJsMetrics(metrics, stats);
+            flags,
+            (int)skybox.Mode,
+            shadow.Resolution,
+            shadow.Reason ?? string.Empty,
+            CopyFloatsToFrameBuffer(view, _viewProjectionBytes),
+            CopyFloatsToFrameBuffer(camera, _cameraBytes),
+            CopyFloatsToFrameBuffer(lighting, _lightingBytes),
+            CopyFloatsToFrameBuffer(style, _styleBytes));
     }
 
-    private void EnsureSnapshots(int hostId, Scene3D scene, RenderStats stats)
+    private void EnsureSnapshots(int hostId, Scene3D scene, IReadOnlyList<HighScaleInstanceLayer3D> visibleLayers, RenderStats stats)
     {
-        var liveLayerIds = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var layer in EnumerateHighScaleLayers(scene))
+        var liveLayerIds = _liveLayerIdsScratch;
+        liveLayerIds.Clear();
+        foreach (var layer in visibleLayers)
         {
-            if (!layer.IsVisible || layer.Instances.Count == 0)
-            {
-                continue;
-            }
-
             liveLayerIds.Add(layer.Id);
             var hasRuntime = _layers.TryGetValue(layer.Id, out var runtime);
 
@@ -151,11 +196,13 @@ internal sealed class WebGlClientHighScaleRenderer
 
             runtime = BuildAndUploadLayer(hostId, layer, scene, structuralVersion, stats);
             _layers[layer.Id] = runtime;
-            WebGlInterop.UploadHighScaleLayerSnapshot(hostId, layer.Id, runtime.SnapshotJson);
+            WebGlInterop.UploadHighScaleLayerSnapshotBytes(hostId, layer.Id, runtime.SnapshotBytes);
+            _version++;
             layer.StateBuffer.ClearDirty();
         }
 
-        var dead = new List<string>();
+        var dead = _deadLayerIdsScratch;
+        dead.Clear();
         foreach (var id in _layers.Keys)
         {
             if (!liveLayerIds.Contains(id)) dead.Add(id);
@@ -166,51 +213,27 @@ internal sealed class WebGlClientHighScaleRenderer
             var runtime = _layers[dead[i]];
             DestroyLayer(hostId, runtime);
             _layers.Remove(dead[i]);
+            _version++;
         }
     }
 
     private static int BuildStructuralVersion(HighScaleInstanceLayer3D layer, Scene3D scene)
     {
-        // Browser client runtime buffers are structural only when the topology that feeds
-        // retained batches changes. Use a deterministic sorted hash: Dictionary.Values
-        // enumeration order is not a safe render-frame identity, and a volatile hash here
-        // causes a full 10k transform/state upload every frame.
-        var chunks = new List<HighScaleChunk3D>(layer.Chunks.Chunks);
-        chunks.Sort(static (a, b) =>
-        {
-            var c = a.Key.X.CompareTo(b.Key.X);
-            if (c != 0) return c;
-            c = a.Key.Y.CompareTo(b.Key.Y);
-            if (c != 0) return c;
-            return a.Key.Z.CompareTo(b.Key.Z);
-        });
-
-        unchecked
-        {
-            var hash = 17;
-            hash = (hash * 31) + layer.Template.Id;
-            hash = (hash * 31) + layer.Instances.Count;
-            hash = (hash * 31) + layer.Template.Parts.Count;
-            hash = (hash * 31) + (scene.Performance.EnableHighScalePaletteTexture ? 1 : 0);
-            hash = (hash * 31) + layer.Chunks.CellSize.GetHashCode();
-            hash = (hash * 31) + chunks.Count;
-            for (var i = 0; i < chunks.Count; i++)
-            {
-                var chunk = chunks[i];
-                hash = (hash * 31) + chunk.Key.X;
-                hash = (hash * 31) + chunk.Key.Y;
-                hash = (hash * 31) + chunk.Key.Z;
-                hash = (hash * 31) + chunk.InstanceIndices.Count;
-            }
-
-            return hash;
-        }
+        // The chunk index already owns a topology/version counter. Do not sort and hash every
+        // chunk in the render frame. Deep rebuild happens only when the index version changes.
+        return HashCode.Combine(
+            layer.Template.Id,
+            layer.Instances.Count,
+            layer.Template.Parts.Count,
+            layer.Chunks.Version,
+            layer.Chunks.CellSize,
+            scene.Performance.EnableHighScalePaletteTexture);
     }
 
     private LayerRuntime BuildAndUploadLayer(int hostId, HighScaleInstanceLayer3D layer, Scene3D scene, int structuralVersion, RenderStats stats)
     {
         var runtime = new LayerRuntime(layer.Id, structuralVersion, layer.Template.Id, layer.Instances.Count, scene.Performance.EnableHighScalePaletteTexture);
-        var chunks = new List<object>();
+        var chunks = new List<HighScaleSnapshotChunk>();
 
         foreach (var chunk in layer.Chunks.Chunks)
         {
@@ -251,18 +274,12 @@ internal sealed class WebGlClientHighScaleRenderer
             var extents = chunk.Bounds.Size * 0.5f;
             // Conservative expansion compensates small animated movement between structural rebuilds.
             extents += new Vector3(System.MathF.Max(0.5f, layer.Chunks.CellSize * 0.10f));
-            chunks.Add(new
-            {
-                id = chunk.Key.ToString(),
-                cx = center.X,
-                cy = center.Y,
-                cz = center.Z,
-                ex = extents.X,
-                ey = extents.Y,
-                ez = extents.Z,
-                instanceCount = chunk.InstanceIndices.Count,
-                batchesByLod = batchIdsByLod
-            });
+            chunks.Add(new HighScaleSnapshotChunk(
+                chunk.Key.ToString(),
+                center,
+                extents,
+                chunk.InstanceIndices.Count,
+                batchIdsByLod));
         }
 
         runtime.EnsureTransformVersionCapacity(layer.Instances.Count);
@@ -272,21 +289,65 @@ internal sealed class WebGlClientHighScaleRenderer
         }
         ClearInitialTransformDirtyQueue(layer);
 
-        runtime.SnapshotJson = JsonSerializer.Serialize(new
-        {
-            layerId = layer.Id,
-            version = structuralVersion,
-            visible = layer.IsVisible,
-            detailedDistance = layer.LodPolicy.DetailedDistance,
-            simplifiedDistance = layer.LodPolicy.SimplifiedDistance,
-            proxyDistance = layer.LodPolicy.ProxyDistance,
-            drawDistance = layer.LodPolicy.DrawDistance,
-            enableBillboardFallback = layer.LodPolicy.EnableBillboardFallback,
-            chunks
-        }, JsonOptions);
+        runtime.SnapshotBytes = BuildSnapshotBytes(layer, structuralVersion, chunks);
 
         stats.TotalChunkCount += layer.Chunks.Chunks.Count;
         return runtime;
+    }
+
+
+    private static byte[] BuildSnapshotBytes(HighScaleInstanceLayer3D layer, int structuralVersion, IReadOnlyList<HighScaleSnapshotChunk> chunks)
+    {
+        using var stream = new MemoryStream(Math.Max(128, 96 + chunks.Count * 96));
+        using var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
+        writer.Write(SnapshotMagic);
+        writer.Write(SnapshotProtocolVersion);
+        WriteString(writer, layer.Id);
+        writer.Write(structuralVersion);
+        writer.Write(layer.IsVisible ? 1 : 0);
+        writer.Write(layer.LodPolicy.DetailedDistance);
+        writer.Write(layer.LodPolicy.SimplifiedDistance);
+        writer.Write(layer.LodPolicy.ProxyDistance);
+        writer.Write(layer.LodPolicy.DrawDistance);
+        writer.Write(layer.LodPolicy.EnableBillboardFallback ? 1 : 0);
+        writer.Write(chunks.Count);
+        for (var i = 0; i < chunks.Count; i++)
+        {
+            var chunk = chunks[i];
+            WriteString(writer, chunk.Id);
+            writer.Write(chunk.Center.X);
+            writer.Write(chunk.Center.Y);
+            writer.Write(chunk.Center.Z);
+            writer.Write(chunk.Extents.X);
+            writer.Write(chunk.Extents.Y);
+            writer.Write(chunk.Extents.Z);
+            writer.Write(chunk.InstanceCount);
+            for (var lod = 0; lod < 4; lod++)
+            {
+                var ids = chunk.BatchIdsByLod[lod];
+                writer.Write(ids.Count);
+                for (var j = 0; j < ids.Count; j++)
+                {
+                    WriteString(writer, ids[j]);
+                }
+            }
+        }
+
+        writer.Flush();
+        return stream.ToArray();
+    }
+
+    private static void WriteString(BinaryWriter writer, string value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            writer.Write(0);
+            return;
+        }
+
+        var bytes = Encoding.UTF8.GetBytes(value);
+        writer.Write(bytes.Length);
+        writer.Write(bytes);
     }
 
     private static BatchRuntime BuildBatchRuntime(
@@ -340,14 +401,14 @@ internal sealed class WebGlClientHighScaleRenderer
             batch.LightingEnabled,
             batch.UsePalette,
             batch.InstanceCount,
-            FloatsToBytes(batch.TransformData));
+            batch.CopyTransformBytes());
         WebGlInterop.UploadRetainedBatchStateBytes(
             hostId,
             batch.BatchId,
             batch.UsePalette,
             batch.PaletteWidth,
             batch.PaletteHeight,
-            FloatsToBytes(batch.StateData),
+            batch.CopyStateBytes(),
             batch.PaletteBytes);
         stats.InstanceBufferUploads++;
         stats.StateBufferUploads++;
@@ -356,10 +417,10 @@ internal sealed class WebGlClientHighScaleRenderer
         stats.StateUploadBytes += batch.StateData.Length * sizeof(float);
     }
 
-    private void ApplyPatches(int hostId, Scene3D scene, RenderStats stats)
+    private void ApplyPatches(int hostId, Scene3D scene, IReadOnlyList<HighScaleInstanceLayer3D> visibleLayers, RenderStats stats)
     {
         var start = Stopwatch.GetTimestamp();
-        foreach (var layer in EnumerateHighScaleLayers(scene))
+        foreach (var layer in visibleLayers)
         {
             if (!_layers.TryGetValue(layer.Id, out var runtime))
             {
@@ -389,7 +450,7 @@ internal sealed class WebGlClientHighScaleRenderer
                             batch.LightingEnabled,
                             batch.UsePalette,
                             batch.InstanceCount,
-                            FloatsToBytes(batch.TransformData));
+                            batch.CopyTransformBytes());
                         stats.InstanceBufferUploads++;
                         stats.InstanceUploadBytes += batch.TransformData.Length * sizeof(float);
                         stats.TransformUploadBytes += batch.TransformData.Length * sizeof(float);
@@ -407,7 +468,7 @@ internal sealed class WebGlClientHighScaleRenderer
                 if (forceFullState)
                 {
                     RebuildFullState(layer, batch);
-                    WebGlInterop.UploadRetainedBatchStateBytes(hostId, batch.BatchId, batch.UsePalette, batch.PaletteWidth, batch.PaletteHeight, FloatsToBytes(batch.StateData), batch.PaletteBytes);
+                    WebGlInterop.UploadRetainedBatchStateBytes(hostId, batch.BatchId, batch.UsePalette, batch.PaletteWidth, batch.PaletteHeight, batch.CopyStateBytes(), batch.PaletteBytes);
                     stats.StateBufferUploads++;
                     stats.StateUploadBytes += batch.StateData.Length * sizeof(float);
                     batch.StateVersion = layer.StateBuffer.Version;
@@ -421,7 +482,7 @@ internal sealed class WebGlClientHighScaleRenderer
                     {
                         if (stateDirtyCount > System.Math.Max(32, batch.InstanceCount / 3))
                         {
-                            WebGlInterop.UploadRetainedBatchStateBytes(hostId, batch.BatchId, batch.UsePalette, batch.PaletteWidth, batch.PaletteHeight, FloatsToBytes(batch.StateData), Array.Empty<byte>());
+                            WebGlInterop.UploadRetainedBatchStateBytes(hostId, batch.BatchId, batch.UsePalette, batch.PaletteWidth, batch.PaletteHeight, batch.CopyStateBytes(), Array.Empty<byte>());
                             stats.StateBufferUploads++;
                             stats.StateUploadBytes += batch.StateData.Length * sizeof(float);
                         }
@@ -591,7 +652,7 @@ internal sealed class WebGlClientHighScaleRenderer
             batch.TransformDirtyOffsetCount,
             batch.GetTransformDirtyOffsetAt,
             TransformFloatStride,
-            batch.TransformData,
+            batch.CopyTransformRangeBytes,
             performance,
             (startInstance, bytes) => WebGlInterop.UploadRetainedBatchTransformsRangeBytes(hostId, batch.BatchId, startInstance, bytes),
             rangeBytes =>
@@ -610,7 +671,7 @@ internal sealed class WebGlClientHighScaleRenderer
             batch.StateDirtyOffsetCount,
             batch.GetStateDirtyOffsetAt,
             StateFloatStride,
-            batch.StateData,
+            batch.CopyStateRangeBytes,
             performance,
             (startInstance, bytes) => WebGlInterop.UploadRetainedBatchStateRangeBytes(hostId, batch.BatchId, startInstance, bytes),
             rangeBytes =>
@@ -622,7 +683,7 @@ internal sealed class WebGlClientHighScaleRenderer
             });
     }
 
-    private static void UploadRanges(int dirtyCount, Func<int, int> getOffset, int stride, float[] data, ScenePerformanceOptions performance, Action<int, byte[]> upload, Action<int> updateStats)
+    private static void UploadRanges(int dirtyCount, Func<int, int> getOffset, int stride, Func<int, int, byte[]> copyBytes, ScenePerformanceOptions performance, Action<int, byte[]> upload, Action<int> updateStats)
     {
         if (dirtyCount <= 0)
         {
@@ -643,7 +704,7 @@ internal sealed class WebGlClientHighScaleRenderer
 
             var floatOffset = rangeStart * stride;
             var floatCount = (previous - rangeStart + 1) * stride;
-            var bytes = FloatsToBytes(data, floatOffset, floatCount);
+            var bytes = copyBytes(floatOffset, floatCount);
             upload(rangeStart, bytes);
             updateStats(bytes.Length);
             rangeStart = current;
@@ -661,46 +722,118 @@ internal sealed class WebGlClientHighScaleRenderer
         WebGlInterop.DestroyHighScaleLayer(hostId, runtime.LayerId);
     }
 
-    private static IEnumerable<HighScaleInstanceLayer3D> EnumerateHighScaleLayers(Scene3D scene)
+
+    private static void WriteMatrix(Span<float> buffer, Matrix4x4 matrix)
     {
-        foreach (var obj in scene.Registry.AllObjects)
-        {
-            if (obj is HighScaleInstanceLayer3D layer)
-            {
-                yield return layer;
-            }
-        }
+        buffer[0] = matrix.M11; buffer[1] = matrix.M12; buffer[2] = matrix.M13; buffer[3] = matrix.M14;
+        buffer[4] = matrix.M21; buffer[5] = matrix.M22; buffer[6] = matrix.M23; buffer[7] = matrix.M24;
+        buffer[8] = matrix.M31; buffer[9] = matrix.M32; buffer[10] = matrix.M33; buffer[11] = matrix.M34;
+        buffer[12] = matrix.M41; buffer[13] = matrix.M42; buffer[14] = matrix.M43; buffer[15] = matrix.M44;
     }
 
-    private static void ApplyJsMetrics(string? metrics, RenderStats stats)
+    private static void WriteVector3(Span<float> buffer, int offset, Vector3 value)
     {
-        if (string.IsNullOrWhiteSpace(metrics)) return;
-        var parts = metrics.Split(',');
-        if (parts.Length < 16) return;
-        static bool TryInt(string value, out int result) => int.TryParse(value, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out result);
-        static bool TryDouble(string value, out double result) => double.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out result);
+        buffer[offset] = value.X;
+        buffer[offset + 1] = value.Y;
+        buffer[offset + 2] = value.Z;
+    }
 
-        if (TryInt(parts[0], out var visibleChunks)) stats.VisibleChunkCount = visibleChunks;
-        if (TryInt(parts[1], out var totalChunks)) stats.TotalChunkCount = totalChunks;
-        if (TryInt(parts[2], out var culled)) stats.CulledObjectCount = culled;
-        if (TryInt(parts[3], out var lodD)) stats.LodDetailedCount = lodD;
-        if (TryInt(parts[4], out var lodS)) stats.LodSimplifiedCount = lodS;
-        if (TryInt(parts[5], out var lodP)) stats.LodProxyCount = lodP;
-        if (TryInt(parts[6], out var lodB)) stats.LodBillboardCount = lodB;
-        if (TryInt(parts[7], out var lodC)) stats.LodCulledCount = lodC;
-        if (TryInt(parts[8], out var drawCalls)) stats.DrawCallCount = drawCalls;
-        if (TryInt(parts[9], out var batches)) { stats.InstancedBatchCount = batches; stats.JsDrawBatchCount = batches; }
-        if (TryInt(parts[10], out var triangles)) stats.TriangleCount = triangles;
-        if (TryInt(parts[11], out var partInstances)) { stats.HighScaleVisiblePartInstanceCount = partInstances; stats.VisibleMeshCount = partInstances; }
-        if (TryDouble(parts[12], out var cullMs)) stats.JsCullMilliseconds = cullMs;
-        if (TryDouble(parts[13], out var drawMs)) stats.JsDrawMilliseconds = drawMs;
-        if (TryDouble(parts[14], out var frameMs)) stats.JsFrameMilliseconds = frameMs;
-        if (TryInt(parts[15], out var webGlVersion)) stats.WebGlVersion = webGlVersion;
-        if (parts.Length > 16 && TryInt(parts[16], out var animBatches)) stats.JsAnimationUploadBatches = animBatches;
-        if (parts.Length > 17 && TryInt(parts[17], out var animBytes)) stats.JsAnimationUploadBytes = animBytes;
-        if (parts.Length > 18 && TryInt(parts[18], out var textureErrors)) stats.JsTexturePayloadErrors = textureErrors;
-        if (parts.Length > 19 && TryInt(parts[19], out var paletteErrors)) stats.JsPalettePayloadErrors = paletteErrors;
-        stats.EstimatedDrawCallCount = stats.DrawCallCount;
+    private static void WriteVector3Array(Span<float> buffer, int offset, float[] value)
+    {
+        buffer[offset] = value.Length > 0 ? value[0] : 0f;
+        buffer[offset + 1] = value.Length > 1 ? value[1] : 0f;
+        buffer[offset + 2] = value.Length > 2 ? value[2] : 0f;
+    }
+
+    private static void WriteVector3Array(Span<float> buffer, int offset, Vector3 value)
+    {
+        buffer[offset] = value.X;
+        buffer[offset + 1] = value.Y;
+        buffer[offset + 2] = value.Z;
+    }
+
+    private static void WriteVector4(Span<float> buffer, int offset, Vector4 value)
+    {
+        buffer[offset] = value.X;
+        buffer[offset + 1] = value.Y;
+        buffer[offset + 2] = value.Z;
+        buffer[offset + 3] = value.W;
+    }
+
+    private static void WriteColor(Span<float> buffer, int offset, ColorRgba value)
+    {
+        buffer[offset] = value.R;
+        buffer[offset + 1] = value.G;
+        buffer[offset + 2] = value.B;
+        buffer[offset + 3] = value.A;
+    }
+
+    private static byte[] CopyFloatsToFrameBuffer(ReadOnlySpan<float> values, byte[] destination)
+    {
+        var byteCount = values.Length * sizeof(float);
+        if (destination.Length != byteCount)
+        {
+            throw new ArgumentException("Frame state buffer size does not match payload size.", nameof(destination));
+        }
+
+        for (var i = 0; i < values.Length; i++)
+        {
+            WriteFloat(destination, i * sizeof(float), values[i]);
+        }
+
+        return destination;
+    }
+
+    private static void WriteFloat(byte[] destination, int byteOffset, float value)
+    {
+        var bits = BitConverter.SingleToInt32Bits(value);
+        destination[byteOffset + 0] = (byte)bits;
+        destination[byteOffset + 1] = (byte)(bits >> 8);
+        destination[byteOffset + 2] = (byte)(bits >> 16);
+        destination[byteOffset + 3] = (byte)(bits >> 24);
+    }
+
+    public static void ApplyJsMetrics(int hostId, RenderStats stats)
+    {
+        static int MetricInt(int hostId, int index) => unchecked((int)Math.Round(WebGlInterop.GetLastHighScaleMetric(hostId, index)));
+        static double MetricDouble(int hostId, int index) => WebGlInterop.GetLastHighScaleMetric(hostId, index);
+
+        var visibleChunks = MetricInt(hostId, 0);
+        var totalChunks = MetricInt(hostId, 1);
+        var culled = MetricInt(hostId, 2);
+        var lodD = MetricInt(hostId, 3);
+        var lodS = MetricInt(hostId, 4);
+        var lodP = MetricInt(hostId, 5);
+        var lodB = MetricInt(hostId, 6);
+        var lodC = MetricInt(hostId, 7);
+        var drawCalls = MetricInt(hostId, 8);
+        var batches = MetricInt(hostId, 9);
+        var triangles = MetricInt(hostId, 10);
+        var partInstances = MetricInt(hostId, 11);
+
+        stats.VisibleChunkCount += visibleChunks;
+        stats.TotalChunkCount += totalChunks;
+        stats.CulledObjectCount += culled;
+        stats.LodDetailedCount += lodD;
+        stats.LodSimplifiedCount += lodS;
+        stats.LodProxyCount += lodP;
+        stats.LodBillboardCount += lodB;
+        stats.LodCulledCount += lodC;
+        stats.DrawCallCount += drawCalls;
+        stats.EstimatedDrawCallCount += drawCalls;
+        stats.InstancedBatchCount += batches;
+        stats.JsDrawBatchCount = batches;
+        stats.TriangleCount += triangles;
+        stats.HighScaleVisiblePartInstanceCount += partInstances;
+        stats.VisibleMeshCount += partInstances;
+        stats.JsCullMilliseconds = MetricDouble(hostId, 12);
+        stats.JsDrawMilliseconds = MetricDouble(hostId, 13);
+        stats.JsFrameMilliseconds = MetricDouble(hostId, 14);
+        stats.WebGlVersion = MetricInt(hostId, 15);
+        stats.JsAnimationUploadBatches = MetricInt(hostId, 16);
+        stats.JsAnimationUploadBytes = MetricInt(hostId, 17);
+        stats.JsTexturePayloadErrors = MetricInt(hostId, 18);
+        stats.JsPalettePayloadErrors = MetricInt(hostId, 19);
     }
 
     private static void WriteTransform(HighScaleInstanceLayer3D layer, int instanceIndex, CompositePartTemplate3D part, float[] destination, int destinationOffset)
@@ -791,41 +924,29 @@ internal sealed class WebGlClientHighScaleRenderer
 
     private static byte ToByte(float value) => (byte)System.Math.Clamp((int)MathF.Round(System.Math.Clamp(value, 0f, 1f) * 255f), 0, 255);
 
-    private static byte[] FloatsToBytes(float[] values) => FloatsToBytes(values, 0, values.Length);
-
-    private static byte[] FloatsToBytes(float[] values, int start, int count)
-    {
-        if (count <= 0) return Array.Empty<byte>();
-        var bytes = new byte[count * sizeof(float)];
-        Buffer.BlockCopy(values, start * sizeof(float), bytes, 0, bytes.Length);
-        return bytes;
-    }
-
     private static string BuildBatchId(HighScaleInstanceLayer3D layer, HighScaleChunkKey3D chunkKey, HighScaleLodLevel3D lod, int partIndex)
-        => $"hs:{layer.Id}:{chunkKey.X}:{chunkKey.Y}:{chunkKey.Z}:{(int)lod}:{partIndex}";
-
-    private static (float[] Ambient, float[] Direction, float[] DirectionalColor, float[] PointPosition, float[] PointColor) ResolveLight(Scene3D scene)
-    {
-        var light = SceneLightingResolver3D.Resolve(scene);
-        return (ToArray(light.Ambient), ToArray(light.DirectionalDirection), ToArray(light.DirectionalColor), ToArray(light.PointPosition), ToArray(light.PointColor));
-    }
+        => RenderId3D.BuildHighScaleBatchId(layer.Id, chunkKey.X, chunkKey.Y, chunkKey.Z, (int)lod, partIndex);
 
     private static float ToLightingUniform(LightingMode mode)
         => mode == LightingMode.Unlit ? 0f : mode == LightingMode.Lambert ? 1f : mode == LightingMode.Phong ? 2f : 3f;
 
-    private static float[] ToArray(Vector3 value) => new[] { value.X, value.Y, value.Z };
 
-    private static float[] ToArray(Vector4 value) => new[] { value.X, value.Y, value.Z, value.W };
-
-    private static float[] ToArray(Matrix4x4 matrix)
+    private sealed class HighScaleSnapshotChunk
     {
-        return new[]
+        public HighScaleSnapshotChunk(string id, Vector3 center, Vector3 extents, int instanceCount, IReadOnlyList<string>[] batchIdsByLod)
         {
-            matrix.M11, matrix.M12, matrix.M13, matrix.M14,
-            matrix.M21, matrix.M22, matrix.M23, matrix.M24,
-            matrix.M31, matrix.M32, matrix.M33, matrix.M34,
-            matrix.M41, matrix.M42, matrix.M43, matrix.M44
-        };
+            Id = id;
+            Center = center;
+            Extents = extents;
+            InstanceCount = instanceCount;
+            BatchIdsByLod = batchIdsByLod;
+        }
+
+        public string Id { get; }
+        public Vector3 Center { get; }
+        public Vector3 Extents { get; }
+        public int InstanceCount { get; }
+        public IReadOnlyList<string>[] BatchIdsByLod { get; }
     }
 
     private sealed class LayerRuntime
@@ -846,7 +967,7 @@ internal sealed class WebGlClientHighScaleRenderer
         public int InstanceCount { get; }
         public bool PaletteTextureEnabled { get; }
         private int[] _transformVersionsByInstance;
-        public string SnapshotJson { get; set; } = string.Empty;
+        public byte[] SnapshotBytes { get; set; } = Array.Empty<byte>();
         public List<BatchRuntime> Batches { get; } = new();
         public Dictionary<string, BatchRuntime> BatchesById { get; } = new(StringComparer.Ordinal);
         public int[] TransformVersionsByInstance => _transformVersionsByInstance;
@@ -903,6 +1024,25 @@ internal sealed class WebGlClientHighScaleRenderer
         public byte[] PaletteBytes { get; set; } = Array.Empty<byte>();
         public int StateDirtyOffsetCount => _stateDirtyOffsetCount;
         public int TransformDirtyOffsetCount => _transformDirtyOffsetCount;
+
+        private byte[] _transformBytes = Array.Empty<byte>();
+        private byte[] _stateBytes = Array.Empty<byte>();
+        private byte[] _transformRangeBytes = Array.Empty<byte>();
+        private byte[] _stateRangeBytes = Array.Empty<byte>();
+
+        public byte[] CopyTransformBytes() => CopyFloatsToExactBuffer(TransformData, 0, TransformData.Length, ref _transformBytes);
+        public byte[] CopyStateBytes() => CopyFloatsToExactBuffer(StateData, 0, StateData.Length, ref _stateBytes);
+        public byte[] CopyTransformRangeBytes(int floatOffset, int floatCount) => CopyFloatsToExactBuffer(TransformData, floatOffset, floatCount, ref _transformRangeBytes);
+        public byte[] CopyStateRangeBytes(int floatOffset, int floatCount) => CopyFloatsToExactBuffer(StateData, floatOffset, floatCount, ref _stateRangeBytes);
+
+        private static byte[] CopyFloatsToExactBuffer(float[] source, int floatOffset, int floatCount, ref byte[] buffer)
+        {
+            if (floatCount <= 0) return Array.Empty<byte>();
+            var byteCount = floatCount * sizeof(float);
+            if (buffer.Length != byteCount) buffer = new byte[byteCount];
+            Buffer.BlockCopy(source, floatOffset * sizeof(float), buffer, 0, byteCount);
+            return buffer;
+        }
 
         public void ResetStateDirtyOffsets() => _stateDirtyOffsetCount = 0;
         public void ResetTransformDirtyOffsets() => _transformDirtyOffsetCount = 0;

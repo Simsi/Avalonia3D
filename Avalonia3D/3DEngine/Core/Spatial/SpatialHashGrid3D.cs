@@ -7,11 +7,24 @@ using ThreeDEngine.Core.Scene;
 
 namespace ThreeDEngine.Core.Spatial;
 
+public sealed class SpatialQueryScratch3D
+{
+    public readonly List<Object3D> Results = new(64);
+    internal readonly HashSet<Object3D> Seen = new(SpatialHashGrid3D.ObjectReferenceComparer.Instance);
+
+    public void Clear()
+    {
+        Results.Clear();
+        Seen.Clear();
+    }
+}
+
 public sealed class SpatialHashGrid3D
 {
     private const int MaxCellsPerObject = 10000;
     private const int MaxCellsPerQuery = 20000;
     private readonly Dictionary<CellKey, List<Object3D>> _cells = new();
+    private readonly Dictionary<Object3D, List<CellKey>> _objectCells = new(ObjectReferenceComparer.Instance);
     private float _cellSize;
 
     public SpatialHashGrid3D(float cellSize = 8f)
@@ -29,15 +42,41 @@ public sealed class SpatialHashGrid3D
     public void Clear()
     {
         _cells.Clear();
+        _objectCells.Clear();
         Version++;
     }
 
     public void Add(Object3D obj, Bounds3D bounds)
     {
-        if (obj is null || !IsUsable(bounds)) return;
+        if (obj is null) return;
+
+        // Reuse the per-object cell list across transform-only updates. The old
+        // implementation allocated a new List<CellKey> for every Add/Update, which
+        // showed up in pointer-picking and physics-heavy scenes.
+        if (!_objectCells.TryGetValue(obj, out var keys))
+        {
+            keys = new List<CellKey>(8);
+            _objectCells[obj] = keys;
+        }
+        else if (keys.Count > 0)
+        {
+            RemoveFromCells(obj, keys);
+            keys.Clear();
+        }
+
+        if (!IsUsable(bounds))
+        {
+            Version++;
+            return;
+        }
+
         var min = ToCell(bounds.Min);
         var max = ToCell(bounds.Max);
-        if (!CanEnumerateCellRange(min, max, MaxCellsPerObject)) return;
+        if (!CanEnumerateCellRange(min, max, MaxCellsPerObject))
+        {
+            Version++;
+            return;
+        }
 
         for (var x = min.X; x <= max.X; x++)
         for (var y = min.Y; y <= max.Y; y++)
@@ -50,40 +89,79 @@ public sealed class SpatialHashGrid3D
                 _cells[key] = bucket;
             }
 
-            if (!bucket.Contains(obj)) bucket.Add(obj);
+            bucket.Add(obj);
+            keys.Add(key);
+        }
+
+        Version++;
+    }
+
+    public bool Remove(Object3D obj)
+    {
+        if (obj is null || !_objectCells.TryGetValue(obj, out var keys)) return false;
+        RemoveFromCells(obj, keys);
+        _objectCells.Remove(obj);
+        keys.Clear();
+        Version++;
+        return true;
+    }
+
+    public void Update(Object3D obj, Bounds3D bounds)
+    {
+        Add(obj, bounds);
+    }
+
+    private void RemoveFromCells(Object3D obj, List<CellKey> keys)
+    {
+        for (var i = 0; i < keys.Count; i++)
+        {
+            var key = keys[i];
+            if (!_cells.TryGetValue(key, out var bucket)) continue;
+            for (var j = bucket.Count - 1; j >= 0; j--)
+            {
+                if (ReferenceEquals(bucket[j], obj)) bucket.RemoveAt(j);
+            }
+            if (bucket.Count == 0) _cells.Remove(key);
         }
     }
 
     public IReadOnlyList<Object3D> QueryBounds(Bounds3D bounds)
     {
-        var result = new List<Object3D>();
-        if (!IsUsable(bounds)) return result;
-        var seen = new HashSet<Object3D>(ObjectReferenceComparer.Instance);
+        var scratch = new SpatialQueryScratch3D();
+        QueryBounds(bounds, scratch);
+        return scratch.Results.ToArray();
+    }
+
+    public List<Object3D> QueryBounds(Bounds3D bounds, SpatialQueryScratch3D scratch)
+    {
+        scratch.Clear();
+        if (!IsUsable(bounds)) return scratch.Results;
         var min = ToCell(bounds.Min);
         var max = ToCell(bounds.Max);
-        if (!CanEnumerateCellRange(min, max, MaxCellsPerQuery)) return result;
+        if (!CanEnumerateCellRange(min, max, MaxCellsPerQuery)) return scratch.Results;
 
         for (var x = min.X; x <= max.X; x++)
         for (var y = min.Y; y <= max.Y; y++)
         for (var z = min.Z; z <= max.Z; z++)
         {
-            if (!_cells.TryGetValue(new CellKey(x, y, z), out var bucket)) continue;
-            for (var i = 0; i < bucket.Count; i++)
-            {
-                var obj = bucket[i];
-                if (seen.Add(obj)) result.Add(obj);
-            }
+            AddCellObjects(new CellKey(x, y, z), scratch.Seen, scratch.Results);
         }
-        return result;
+        return scratch.Results;
     }
 
     public IReadOnlyList<Object3D> QueryRay(Ray ray, float maxDistance = 10000f, int maxSteps = 2048)
     {
-        var result = new List<Object3D>();
-        if (!IsFinite(ray.Origin) || !IsFinite(ray.Direction) || ray.Direction.LengthSquared() < 0.000001f) return result;
-        if (!float.IsFinite(maxDistance) || maxDistance <= 0f || maxSteps <= 0) return result;
+        var scratch = new SpatialQueryScratch3D();
+        QueryRay(ray, scratch, maxDistance, maxSteps);
+        return scratch.Results.ToArray();
+    }
 
-        var seen = new HashSet<Object3D>(ObjectReferenceComparer.Instance);
+    public List<Object3D> QueryRay(Ray ray, SpatialQueryScratch3D scratch, float maxDistance = 10000f, int maxSteps = 2048)
+    {
+        scratch.Clear();
+        if (!IsFinite(ray.Origin) || !IsFinite(ray.Direction) || ray.Direction.LengthSquared() < 0.000001f) return scratch.Results;
+        if (!float.IsFinite(maxDistance) || maxDistance <= 0f || maxSteps <= 0) return scratch.Results;
+
         var direction = Vector3.Normalize(ray.Direction);
         var cell = ToCell(ray.Origin);
         var stepX = direction.X >= 0f ? 1 : -1;
@@ -104,7 +182,7 @@ public sealed class SpatialHashGrid3D
         var distance = 0f;
         for (var i = 0; i < maxSteps && distance <= maxDistance; i++)
         {
-            AddCellObjects(cell, seen, result);
+            AddCellObjects(cell, scratch.Seen, scratch.Results);
 
             if (tMaxX <= tMaxY && tMaxX <= tMaxZ)
             {
@@ -127,7 +205,7 @@ public sealed class SpatialHashGrid3D
 
             if (!float.IsFinite(distance)) break;
         }
-        return result;
+        return scratch.Results;
     }
 
     private void AddCellObjects(CellKey key, HashSet<Object3D> seen, List<Object3D> result)
@@ -161,7 +239,7 @@ public sealed class SpatialHashGrid3D
         return value < i ? i - 1 : i;
     }
 
-    private sealed class ObjectReferenceComparer : IEqualityComparer<Object3D>
+    internal sealed class ObjectReferenceComparer : IEqualityComparer<Object3D>
     {
         public static readonly ObjectReferenceComparer Instance = new();
         public bool Equals(Object3D? x, Object3D? y) => ReferenceEquals(x, y);

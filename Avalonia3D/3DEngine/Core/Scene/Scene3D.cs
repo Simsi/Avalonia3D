@@ -30,7 +30,14 @@ public sealed class Scene3D
     private int _updateDepth;
     private SceneChangedEventArgs? _pendingChange;
     private int _changeVersion;
+    private int _batchContentVersion;
+    private int _batchTransformVersion;
+    private int _particleContentVersion;
+    private int _cameraVersion;
     private int _structureVersion;
+    private const int MaxBatchTransformChangeLogEntries = 8192;
+    private readonly List<BatchTransformChangeRecord> _batchTransformChangeLog = new();
+    private int _batchTransformChangeLogFirstVersion = 1;
 
     public Scene3D()
     {
@@ -84,7 +91,70 @@ public sealed class Scene3D
 
     public int ChangeVersion => _changeVersion;
 
+    /// <summary>
+    /// Version for renderer-side retained object/particle batch data. Camera, lighting,
+    /// environment and debug-only changes update frame uniforms but do not require a CPU
+    /// batch rebuild.
+    /// </summary>
+    public int BatchContentVersion => _batchContentVersion;
+
+    /// <summary>
+    /// Version for renderer-side retained per-object transform/state slots. Unlike
+    /// <see cref="BatchContentVersion"/>, this changes for transform/animation updates
+    /// without implying that mesh/material batch membership has to be rebuilt.
+    /// </summary>
+    public int BatchTransformVersion => _batchTransformVersion;
+
+    /// <summary>
+    /// Version for retained particle instance payloads. Particle simulation advances are
+    /// transform-like Object3D changes, but renderers need to know when particle payloads,
+    /// not ordinary mesh batch membership, changed.
+    /// </summary>
+    public int ParticleContentVersion => _particleContentVersion;
+
+    /// <summary>
+    /// Version for camera-only dependencies such as transparent draw order. Ordinary retained
+    /// batch content must not depend on it unless the batch contains transparent items.
+    /// </summary>
+    public int CameraVersion => _cameraVersion;
+
     public int StructureVersion => _structureVersion;
+
+    public bool TryCopyBatchTransformChangesSince(int lastObservedBatchTransformVersion, List<Object3D> output)
+    {
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        output.Clear();
+        if (lastObservedBatchTransformVersion == _batchTransformVersion)
+        {
+            return true;
+        }
+
+        if (lastObservedBatchTransformVersion < 0 || lastObservedBatchTransformVersion < _batchTransformChangeLogFirstVersion - 1)
+        {
+            return false;
+        }
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        for (var i = 0; i < _batchTransformChangeLog.Count; i++)
+        {
+            var record = _batchTransformChangeLog[i];
+            if (record.Version <= lastObservedBatchTransformVersion)
+            {
+                continue;
+            }
+
+            if (record.Source is null)
+            {
+                output.Clear();
+                return false;
+            }
+
+            AddTransformChangedObject(record.Source, output, seen);
+        }
+
+        return true;
+    }
+
 
     public ColorRgba BackgroundColor
     {
@@ -168,7 +238,7 @@ public sealed class Scene3D
         }
 
         var result = new List<Object3D>();
-        foreach (var obj in Registry.AllObjects)
+        foreach (var obj in Registry.SnapshotAllObjects())
         {
             if (obj is not CompositeObject3D)
             {
@@ -197,7 +267,7 @@ public sealed class Scene3D
         }
 
         var count = 0;
-        foreach (var obj in Registry.AllObjects)
+        foreach (var obj in Registry.SnapshotAllObjects())
         {
             if (obj is not CompositeObject3D)
             {
@@ -319,8 +389,11 @@ public sealed class Scene3D
 
     public void AdvanceParticles(float deltaSeconds)
     {
-        var objects = Registry.AllObjects;
-        for (var i = 0; i < objects.Count; i++)
+        // Particle systems can rebuild their dynamic mesh while advancing. Use a
+        // frame snapshot so a SceneChanged/registry rebuild cannot invalidate an
+        // active List<T> enumerator or shift indexes mid-frame.
+        var objects = Registry.SnapshotAllObjects();
+        for (var i = 0; i < objects.Length; i++)
         {
             if (objects[i] is ParticleSystem3D particles)
             {
@@ -331,8 +404,11 @@ public sealed class Scene3D
 
     public void AdvanceAnimations(float deltaSeconds)
     {
-        var objects = Registry.AllObjects;
-        for (var i = 0; i < objects.Count; i++)
+        // Imported/skinned models can mark geometry dirty and raise SceneChanged
+        // from inside AdvanceAnimation. Keep this pass isolated from registry
+        // mutations caused by those callbacks.
+        var objects = Registry.SnapshotAllObjects();
+        for (var i = 0; i < objects.Length; i++)
         {
             if (objects[i] is ImportedModel3D model)
             {
@@ -431,7 +507,7 @@ public sealed class Scene3D
 
     private IEnumerable<Object3D> EnumerateWithoutCompositeRoots()
     {
-        foreach (var obj in Registry.AllObjects)
+        foreach (var obj in Registry.SnapshotAllObjects())
         {
             if (obj is not CompositeObject3D)
             {
@@ -462,9 +538,26 @@ public sealed class Scene3D
     private void RaiseChanged(SceneChangeKind kind, Object3D? source = null)
     {
         _changeVersion++;
+        if (RequiresBatchContentInvalidation(kind))
+        {
+            _batchContentVersion++;
+        }
+        if (RequiresBatchTransformInvalidation(kind))
+        {
+            _batchTransformVersion++;
+            AppendBatchTransformChange(_batchTransformVersion, IsIncrementalBatchTransformChange(kind) ? source : null);
+        }
+        if (RequiresParticleContentInvalidation(kind, source))
+        {
+            _particleContentVersion++;
+        }
+        if (kind == SceneChangeKind.Camera)
+        {
+            _cameraVersion++;
+        }
         if (RequiresRegistryInvalidation(kind))
         {
-            Registry.Invalidate();
+            Registry.Invalidate(kind, source);
         }
         if (kind == SceneChangeKind.Structure)
         {
@@ -480,6 +573,77 @@ public sealed class Scene3D
 
         SceneChangedDetailed?.Invoke(this, args);
         SceneChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void AppendBatchTransformChange(int version, Object3D? source)
+    {
+        if (_batchTransformChangeLog.Count == 0)
+        {
+            _batchTransformChangeLogFirstVersion = version;
+        }
+
+        _batchTransformChangeLog.Add(new BatchTransformChangeRecord(version, source));
+        if (_batchTransformChangeLog.Count <= MaxBatchTransformChangeLogEntries)
+        {
+            return;
+        }
+
+        var removeCount = _batchTransformChangeLog.Count - MaxBatchTransformChangeLogEntries;
+        _batchTransformChangeLog.RemoveRange(0, removeCount);
+        _batchTransformChangeLogFirstVersion = _batchTransformChangeLog[0].Version;
+    }
+
+    private static void AddTransformChangedObject(Object3D obj, List<Object3D> output, HashSet<string> seen)
+    {
+        if (seen.Add(obj.Id))
+        {
+            output.Add(obj);
+        }
+
+        if (obj is not CompositeObject3D composite)
+        {
+            return;
+        }
+
+        foreach (var child in composite.EnumerateDescendants())
+        {
+            if (seen.Add(child.Id))
+            {
+                output.Add(child);
+            }
+        }
+    }
+
+    private static bool IsIncrementalBatchTransformChange(SceneChangeKind kind)
+    {
+        return kind == SceneChangeKind.Transform || kind == SceneChangeKind.Physics;
+    }
+
+    private static bool RequiresBatchContentInvalidation(SceneChangeKind kind)
+    {
+        return kind == SceneChangeKind.Structure ||
+               kind == SceneChangeKind.Material ||
+               kind == SceneChangeKind.Geometry ||
+               kind == SceneChangeKind.Visibility ||
+               kind == SceneChangeKind.Unknown;
+    }
+
+    private static bool RequiresBatchTransformInvalidation(SceneChangeKind kind)
+    {
+        return kind == SceneChangeKind.Transform ||
+               kind == SceneChangeKind.Physics ||
+               kind == SceneChangeKind.Unknown;
+    }
+
+    private static bool RequiresParticleContentInvalidation(SceneChangeKind kind, Object3D? source)
+    {
+        return kind == SceneChangeKind.Structure ||
+               kind == SceneChangeKind.Unknown ||
+               source is ParticleSystem3D &&
+               (kind == SceneChangeKind.Transform ||
+                kind == SceneChangeKind.Geometry ||
+                kind == SceneChangeKind.Material ||
+                kind == SceneChangeKind.Visibility);
     }
 
     private static bool RequiresRegistryInvalidation(SceneChangeKind kind)
@@ -524,6 +688,18 @@ public sealed class Scene3D
         _pendingChange = null;
         SceneChangedDetailed?.Invoke(this, pending);
         SceneChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private readonly struct BatchTransformChangeRecord
+    {
+        public BatchTransformChangeRecord(int version, Object3D? source)
+        {
+            Version = version;
+            Source = source;
+        }
+
+        public int Version { get; }
+        public Object3D? Source { get; }
     }
 
     private sealed class SceneUpdateScope : IDisposable

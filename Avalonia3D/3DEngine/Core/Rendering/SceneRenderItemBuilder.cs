@@ -14,16 +14,18 @@ public static class SceneRenderItemBuilder
 
     public static void AddMeshItems(Scene3D scene, ICollection<MeshRenderItem3D> output)
     {
-        foreach (var obj in scene.Registry.Renderables)
+        var ordinary = new List<OrdinaryRenderItem3D>();
+        SceneOrdinaryRenderItemBuilder3D.Build(scene, scene.Registry.GetFrameSnapshot(), ordinary);
+        for (var i = 0; i < ordinary.Count; i++)
         {
-            var mesh = obj.GetMesh();
+            var item = ordinary[i];
             output.Add(new MeshRenderItem3D(
-                obj,
-                mesh.RenderGeometry,
-                MaterialBinding3D.FromMaterial(obj.Material),
-                obj.GetModelMatrix(),
-                obj.IsEffectivelyHovered,
-                obj.IsEffectivelySelected));
+                item.Owner,
+                item.Mesh.RenderGeometry,
+                item.Material,
+                item.Model,
+                item.Owner.IsEffectivelyHovered,
+                item.Owner.IsEffectivelySelected));
         }
     }
 }

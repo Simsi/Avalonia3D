@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using ThreeDEngine.Core.HighScale;
 using ThreeDEngine.Core.Spatial;
 
 namespace ThreeDEngine.Core.Scene;
@@ -17,8 +18,10 @@ public sealed class SceneObjectRegistry
     private readonly List<Object3D> _colliders = new();
     private readonly List<Object3D> _dynamicBodies = new();
     private readonly List<Object3D> _staticColliders = new();
+    private readonly List<HighScaleInstanceLayer3D> _highScaleLayers = new();
     private bool _dirty = true;
     private int _version;
+    private SceneFrameSnapshot3D? _cachedFrameSnapshot;
 
     internal SceneObjectRegistry(Scene3D scene)
     {
@@ -41,12 +44,35 @@ public sealed class SceneObjectRegistry
     public IReadOnlyList<Object3D> StaticColliders { get { EnsureCurrent(); return _staticColliders; } }
 
 
-    public Object3D[] SnapshotAllObjects() => CopyToArray(AllObjects);
-    public Object3D[] SnapshotRenderables() => CopyToArray(Renderables);
-    public Object3D[] SnapshotPickables() => CopyToArray(Pickables);
-    public Object3D[] SnapshotColliders() => CopyToArray(Colliders);
-    public Object3D[] SnapshotDynamicBodies() => CopyToArray(DynamicBodies);
-    public Object3D[] SnapshotStaticColliders() => CopyToArray(StaticColliders);
+    public SceneFrameSnapshot3D GetFrameSnapshot()
+    {
+        EnsureCurrent();
+        if (_cachedFrameSnapshot is { RegistryVersion: var version } && version == _version)
+        {
+            return _cachedFrameSnapshot;
+        }
+
+        _cachedFrameSnapshot = new SceneFrameSnapshot3D
+        {
+            RegistryVersion = _version,
+            AllObjects = CopyToArray(_allObjects),
+            Renderables = CopyToArray(_renderables),
+            Pickables = CopyToArray(_pickables),
+            Colliders = CopyToArray(_colliders),
+            DynamicBodies = CopyToArray(_dynamicBodies),
+            StaticColliders = CopyToArray(_staticColliders),
+            HighScaleLayers = CopyHighScaleLayersToArray(_highScaleLayers)
+        };
+        return _cachedFrameSnapshot;
+    }
+
+    public Object3D[] SnapshotAllObjects() => GetFrameSnapshot().AllObjects;
+    public Object3D[] SnapshotRenderables() => GetFrameSnapshot().Renderables;
+    public Object3D[] SnapshotPickables() => GetFrameSnapshot().Pickables;
+    public Object3D[] SnapshotColliders() => GetFrameSnapshot().Colliders;
+    public Object3D[] SnapshotDynamicBodies() => GetFrameSnapshot().DynamicBodies;
+    public Object3D[] SnapshotStaticColliders() => GetFrameSnapshot().StaticColliders;
+    public HighScaleInstanceLayer3D[] SnapshotHighScaleLayers() => GetFrameSnapshot().HighScaleLayers;
 
     private static Object3D[] CopyToArray(IReadOnlyList<Object3D> source)
     {
@@ -55,7 +81,63 @@ public sealed class SceneObjectRegistry
         return snapshot;
     }
 
-    internal void Invalidate() => _dirty = true;
+    private static HighScaleInstanceLayer3D[] CopyHighScaleLayersToArray(IReadOnlyList<HighScaleInstanceLayer3D> source)
+    {
+        var snapshot = new HighScaleInstanceLayer3D[source.Count];
+        for (var i = 0; i < snapshot.Length; i++) snapshot[i] = source[i];
+        return snapshot;
+    }
+
+    internal void Invalidate()
+    {
+        _dirty = true;
+        _cachedFrameSnapshot = null;
+    }
+
+    internal void Invalidate(SceneChangeKind kind, Object3D? source)
+    {
+        if (kind == SceneChangeKind.Transform && !_dirty && source is not null)
+        {
+            RefreshSpatialIndexes(source);
+            return;
+        }
+
+        Invalidate();
+    }
+
+    private void RefreshSpatialIndexes(Object3D source)
+    {
+        RefreshSpatialIndexesForObject(source);
+        if (source is CompositeObject3D composite)
+        {
+            foreach (var child in composite.EnumerateDescendants())
+            {
+                RefreshSpatialIndexesForObject(child);
+            }
+        }
+    }
+
+    private void RefreshSpatialIndexesForObject(Object3D obj)
+    {
+        if (obj.IsVisible && obj.UseScenePicking)
+        {
+            var bounds = obj.Collider?.GetWorldBounds(obj) ?? obj.GetWorldBounds();
+            PickableIndex.Update(obj, bounds);
+        }
+        else
+        {
+            PickableIndex.Remove(obj);
+        }
+
+        if (obj.IsVisible && obj.Collider is not null)
+        {
+            ColliderIndex.Update(obj, obj.Collider.GetWorldBounds(obj));
+        }
+        else
+        {
+            ColliderIndex.Remove(obj);
+        }
+    }
 
     private void EnsureCurrent()
     {
@@ -71,6 +153,7 @@ public sealed class SceneObjectRegistry
         _colliders.Clear();
         _dynamicBodies.Clear();
         _staticColliders.Clear();
+        _highScaleLayers.Clear();
         PickableIndex.Clear();
         ColliderIndex.Clear();
 
@@ -88,6 +171,11 @@ public sealed class SceneObjectRegistry
         if (includeCompositeRoot || obj is not CompositeObject3D)
         {
             _allObjects.Add(obj);
+
+            if (obj is HighScaleInstanceLayer3D highScaleLayer)
+            {
+                _highScaleLayers.Add(highScaleLayer);
+            }
 
             if (obj.IsVisible && obj.UseMeshRendering)
             {

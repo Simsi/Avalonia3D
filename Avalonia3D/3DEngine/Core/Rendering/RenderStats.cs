@@ -99,6 +99,7 @@ public string SkinningFallbackReason { get; set; } = string.Empty;
     public int LodCulledCount { get; set; }
     public int HighScaleVisiblePartInstanceCount { get; set; }
     public int InstanceBufferUploads { get; set; }
+    public int RetainedTransformSlotUpdateCount { get; set; }
     public int InstanceBufferSubDataUploads { get; set; }
     public int StateBufferUploads { get; set; }
     public int StateBufferSubDataUploads { get; set; }
@@ -152,6 +153,11 @@ public string SkinningFallbackReason { get; set; } = string.Empty;
     public long JsAnimationUploadBytes { get; set; }
     public int JsTexturePayloadErrors { get; set; }
     public int JsPalettePayloadErrors { get; set; }
+    public int WebGlStateChanges { get; set; }
+    public int WebGlUniformUpdates { get; set; }
+    public int WebGlTextureBinds { get; set; }
+    public int WebGlBufferBinds { get; set; }
+    public int WebGlVaoBinds { get; set; }
 
     public static RenderStats Empty => new RenderStats();
 }

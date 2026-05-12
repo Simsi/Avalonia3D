@@ -1,6 +1,5 @@
 using System;
 using System.IO;
-using System.Runtime.InteropServices;
 using Avalonia;
 using Avalonia.Media.Imaging;
 
@@ -45,23 +44,32 @@ internal static class TextureDecodeHelper3D
             var stride = width * 4;
             var bufferSize = stride * height;
             var bgraPixels = new byte[bufferSize];
-            var handle = GCHandle.Alloc(bgraPixels, GCHandleType.Pinned);
-            try
+            unsafe
             {
-                bitmap.CopyPixels(new PixelRect(0, 0, width, height), handle.AddrOfPinnedObject(), bufferSize, stride);
-            }
-            finally
-            {
-                handle.Free();
+                fixed (byte* ptr = bgraPixels)
+                {
+                    bitmap.CopyPixels(new PixelRect(0, 0, width, height), (IntPtr)ptr, bufferSize, stride);
+                }
             }
 
-            var rgbaPixels = new byte[bufferSize];
-            for (var i = 0; i < bufferSize; i += 4)
+            byte[] rgbaPixels;
+            if (OperatingSystem.IsBrowser())
             {
-                rgbaPixels[i + 0] = bgraPixels[i + 2];
-                rgbaPixels[i + 1] = bgraPixels[i + 1];
-                rgbaPixels[i + 2] = bgraPixels[i + 0];
-                rgbaPixels[i + 3] = bgraPixels[i + 3];
+                // Avalonia Browser already exposes Bitmap.CopyPixels data in RGBA order for WebAssembly-backed
+                // bitmaps. Applying the desktop BGRA->RGBA conversion again swaps red/blue channels, which made
+                // blue desktop materials/textures appear orange in WebGL.
+                rgbaPixels = bgraPixels;
+            }
+            else
+            {
+                rgbaPixels = new byte[bufferSize];
+                for (var i = 0; i < bufferSize; i += 4)
+                {
+                    rgbaPixels[i + 0] = bgraPixels[i + 2];
+                    rgbaPixels[i + 1] = bgraPixels[i + 1];
+                    rgbaPixels[i + 2] = bgraPixels[i + 0];
+                    rgbaPixels[i + 3] = bgraPixels[i + 3];
+                }
             }
 
             decoded = new DecodedTexture3D(width, height, rgbaPixels);

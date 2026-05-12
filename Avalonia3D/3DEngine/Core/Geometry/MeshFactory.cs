@@ -152,11 +152,11 @@ public static class MeshFactory
             normals.Add(normal0);
 
             indices.Add(baseIndex + 0);
+            indices.Add(baseIndex + 2);
             indices.Add(baseIndex + 1);
-            indices.Add(baseIndex + 2);
             indices.Add(baseIndex + 0);
-            indices.Add(baseIndex + 2);
             indices.Add(baseIndex + 3);
+            indices.Add(baseIndex + 2);
         }
 
         return new Mesh3D(positions.ToArray(), normals.ToArray(), indices.ToArray());
@@ -274,11 +274,11 @@ public static class MeshFactory
             positions.Add(p3); normals.Add(n0);
 
             indices.Add(baseIndex);
+            indices.Add(baseIndex + 2);
             indices.Add(baseIndex + 1);
-            indices.Add(baseIndex + 2);
             indices.Add(baseIndex);
-            indices.Add(baseIndex + 2);
             indices.Add(baseIndex + 3);
+            indices.Add(baseIndex + 2);
         }
 
         return new Mesh3D(positions.ToArray(), normals.ToArray(), indices.ToArray());
@@ -320,7 +320,7 @@ public static class MeshFactory
             var angle1 = System.MathF.PI * 2f * ((i + 1) % segments) / segments;
             var p0 = new Vector3(System.MathF.Cos(angle0) * radius, -halfHeight, System.MathF.Sin(angle0) * radius);
             var p1 = new Vector3(System.MathF.Cos(angle1) * radius, -halfHeight, System.MathF.Sin(angle1) * radius);
-            var faceNormal = Vector3.Normalize(Vector3.Cross(p1 - p0, apex - p0));
+            var faceNormal = Vector3.Normalize(Vector3.Cross(apex - p0, p1 - p0));
 
             var baseIndex = positions.Count;
             positions.Add(p0); normals.Add(faceNormal);
@@ -328,8 +328,8 @@ public static class MeshFactory
             positions.Add(apex); normals.Add(faceNormal);
 
             indices.Add(baseIndex);
-            indices.Add(baseIndex + 1);
             indices.Add(baseIndex + 2);
+            indices.Add(baseIndex + 1);
         }
 
         return new Mesh3D(positions.ToArray(), normals.ToArray(), indices.ToArray());
@@ -343,6 +343,7 @@ public static class MeshFactory
 
         var positions = new List<Vector3>();
         var normals = new List<Vector3>();
+        var texCoords0 = new List<Vector2>();
         var indices = new List<int>();
 
         for (var y = 0; y <= rings; y++)
@@ -368,6 +369,7 @@ public static class MeshFactory
 
                 positions.Add(normal * radius);
                 normals.Add(normal);
+                texCoords0.Add(new Vector2(u, 1f - v));
             }
         }
 
@@ -382,15 +384,15 @@ public static class MeshFactory
                 var i3 = i0 + stride;
 
                 indices.Add(i0);
+                indices.Add(i2);
                 indices.Add(i1);
-                indices.Add(i2);
                 indices.Add(i0);
-                indices.Add(i2);
                 indices.Add(i3);
+                indices.Add(i2);
             }
         }
 
-        return new Mesh3D(positions.ToArray(), normals.ToArray(), indices.ToArray());
+        return new Mesh3D(positions.ToArray(), normals.ToArray(), indices.ToArray(), texCoords0: texCoords0.ToArray());
     }
 
     private static void AddQuad(

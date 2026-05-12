@@ -8,6 +8,9 @@ namespace ThreeDEngine.Core.Rendering.Shadows;
 public static class DirectionalShadowResolver3D
 {
     public static DirectionalShadowSnapshot3D Resolve(Scene3D scene)
+        => Resolve(scene, scene.Registry.GetFrameSnapshot());
+
+    public static DirectionalShadowSnapshot3D Resolve(Scene3D scene, SceneFrameSnapshot3D snapshot)
     {
         var settings = scene.Environment.DirectionalShadows;
         if (!settings.IsEnabled)
@@ -21,12 +24,12 @@ public static class DirectionalShadowResolver3D
             return new DirectionalShadowSnapshot3D { IsEnabled = false, Reason = "no-enabled-directional-light" };
         }
 
-        if (scene.Registry.Renderables.Count == 0)
+        if (snapshot.Renderables.Length == 0)
         {
             return new DirectionalShadowSnapshot3D { IsEnabled = false, Reason = "no-shadow-casters" };
         }
 
-        var center = ResolveSceneCenter(scene);
+        var center = ResolveSceneCenter(snapshot);
         var direction = light.Direction.LengthSquared() > 0.000001f ? Vector3.Normalize(light.Direction) : Vector3.Normalize(new Vector3(-0.35f, -0.75f, -0.55f));
         var up = MathF.Abs(Vector3.Dot(direction, Vector3.UnitY)) > 0.95f ? Vector3.UnitZ : Vector3.UnitY;
         var distance = settings.Distance;
@@ -57,14 +60,14 @@ public static class DirectionalShadowResolver3D
         return null;
     }
 
-    private static Vector3 ResolveSceneCenter(Scene3D scene)
+    private static Vector3 ResolveSceneCenter(SceneFrameSnapshot3D snapshot)
     {
-        if (scene.Registry.Renderables.Count == 0) return Vector3.Zero;
+        if (snapshot.Renderables.Length == 0) return Vector3.Zero;
 
         var min = new Vector3(float.PositiveInfinity, float.PositiveInfinity, float.PositiveInfinity);
         var max = new Vector3(float.NegativeInfinity, float.NegativeInfinity, float.NegativeInfinity);
         var any = false;
-        foreach (var obj in scene.Registry.Renderables)
+        foreach (var obj in snapshot.Renderables)
         {
             var bounds = obj.GetMesh().LocalBounds;
             var model = obj.GetModelMatrix();

@@ -1,13 +1,25 @@
 using System;
+using System.Collections.Generic;
 using System.Numerics;
 using ThreeDEngine.Core.Assets.Models;
+using ThreeDEngine.Core.Collision;
+using ThreeDEngine.Core.Geometry;
 using ThreeDEngine.Core.Math;
 using ThreeDEngine.Core.Scene;
+using ThreeDEngine.Core.Spatial;
 
 namespace ThreeDEngine.Core.Interaction;
 
 public static class Raycaster
 {
+    private const int MaxCachedBvhs = 256;
+    private static readonly object BvhCacheLock = new();
+    private static readonly Dictionary<MeshBvhCacheKey, BvhCacheEntry> BvhCache = new();
+    private static readonly LinkedList<MeshBvhCacheKey> BvhLru = new();
+
+    [ThreadStatic]
+    private static SpatialQueryScratch3D? _queryScratch;
+
     public static PickingResult? Pick(Scene3D scene, Vector2 viewportPosition, Vector2 viewportSize)
         => Pick(scene, viewportPosition, viewportSize, null);
 
@@ -20,13 +32,15 @@ public static class Raycaster
         var ray = ProjectionHelper.CreateRay(scene.Camera, viewportPosition, viewportSize);
         PickingResult? closest = null;
 
-        var candidates = scene.Registry.PickableIndex.QueryRay(ray);
-        var objects = candidates.Count == 0 && scene.Performance.AllowPickingFullScanFallback && scene.Registry.Pickables.Count <= scene.Performance.MaxPickingFullScanFallbackObjects
+        var scratch = _queryScratch ??= new SpatialQueryScratch3D();
+        var candidates = scene.Registry.PickableIndex.QueryRay(ray, scratch);
+        IReadOnlyList<Object3D> objects = candidates.Count == 0 && scene.Performance.AllowPickingFullScanFallback && scene.Registry.Pickables.Count <= scene.Performance.MaxPickingFullScanFallbackObjects
             ? scene.Registry.SnapshotPickables()
             : candidates;
 
-        foreach (var obj in objects)
+        for (var objectIndex = 0; objectIndex < objects.Count; objectIndex++)
         {
+            var obj = objects[objectIndex];
             if (predicate is not null && !predicate(obj))
             {
                 continue;
@@ -56,7 +70,7 @@ public static class Raycaster
         return closest;
     }
 
-    private static PickingResult? PickObjectTriangles(Object3D obj, Ray ray)
+    private static PickingResult? PickObjectTriangles(Object3D obj, Ray worldRay)
     {
         var mesh = obj.GetMesh();
         if (mesh.Indices.Length < 3 || mesh.Positions.Length == 0)
@@ -65,101 +79,95 @@ public static class Raycaster
         }
 
         var model = obj.GetModelMatrix();
-        var sphereCenter = mesh.LocalBounds.IsValid
-            ? Vector3.Transform(mesh.LocalBounds.Center, model)
-            : Vector3.Transform(Vector3.Zero, model);
-
-        if (!IntersectsBoundingSphere(ray, sphereCenter, mesh.BoundingRadius * GetAbsMax(model)))
+        if (!TryCreateLocalRay(worldRay, model, out var localRay))
         {
             return null;
         }
 
-        PickingResult? closest = null;
-        for (var i = 0; i + 2 < mesh.Indices.Length; i += 3)
+        if (mesh.LocalBounds.IsValid && !IntersectsBounds(localRay, mesh.LocalBounds, out _, out _))
         {
-            var i0 = mesh.Indices[i];
-            var i1 = mesh.Indices[i + 1];
-            var i2 = mesh.Indices[i + 2];
-            if (!IsValidTriangleIndex(mesh.Positions.Length, i0, i1, i2))
-            {
-                continue;
-            }
-
-            var p0 = Vector3.Transform(mesh.Positions[i0], model);
-            var p1 = Vector3.Transform(mesh.Positions[i1], model);
-            var p2 = Vector3.Transform(mesh.Positions[i2], model);
-
-            if (!IntersectTriangle(ray, p0, p1, p2, out var distance, out var worldPoint))
-            {
-                continue;
-            }
-
-            if (closest is null || distance < closest.Distance)
-            {
-                closest = new PickingResult(obj, worldPoint, distance);
-            }
+            return null;
         }
 
-        return closest;
+        var bvh = GetOrCreateBvh(mesh.ResourceKey, mesh.GeometryVersion, mesh.Positions, mesh.Indices);
+        if (!bvh.Raycast(localRay, mesh.Positions, mesh.Indices, out var localDistance, out var localPoint, out _))
+        {
+            return null;
+        }
+
+        var worldPoint = Vector3.Transform(localPoint, model);
+        var worldDistance = Vector3.Distance(worldRay.Origin, worldPoint);
+        return new PickingResult(obj, worldPoint, worldDistance);
     }
 
-    private static PickingResult? PickModelPart(ModelPart3D part, Ray ray)
+    private static PickingResult? PickModelPart(ModelPart3D part, Ray worldRay)
     {
-        var mesh = part.GetMesh();
         var model = part.GetModelMatrix();
-        var sphereCenter = mesh.LocalBounds.IsValid
-            ? Vector3.Transform(mesh.LocalBounds.Center, model)
-            : Vector3.Transform(Vector3.Zero, model);
-
-        if (!IntersectsBoundingSphere(ray, sphereCenter, mesh.BoundingRadius * GetAbsMax(model)))
+        if (!TryCreateLocalRay(worldRay, model, out var localRay))
         {
             return null;
         }
 
-        PickingResult? closest = null;
-        for (var i = 0; i + 2 < part.Primitive.Indices.Length; i += 3)
+        var useSkinnedFallback = part.IsSkinned && part.CurrentSkinMatrices.Length > 0;
+        if (useSkinnedFallback)
         {
-            var i0 = part.Primitive.Indices[i];
-            var i1 = part.Primitive.Indices[i + 1];
-            var i2 = part.Primitive.Indices[i + 2];
-            if (!IsValidTriangleIndex(part.Primitive.Positions.Length, i0, i1, i2))
+            // CPU-skinned fallback meshes and their BVHs are intentionally deferred until the
+            // cheap conservative world-bounds test passes. This keeps hover picking over large
+            // animated models from deforming/rebuilding data for rays that cannot hit the part.
+            var worldBounds = part.GetWorldBounds();
+            if (worldBounds.IsValid && !IntersectsBounds(worldRay, worldBounds, out _, out _))
             {
-                continue;
+                return null;
             }
-
-            var p0 = Vector3.Transform(part.Primitive.Positions[i0], model);
-            var p1 = Vector3.Transform(part.Primitive.Positions[i1], model);
-            var p2 = Vector3.Transform(part.Primitive.Positions[i2], model);
-
-            if (!IntersectTriangle(ray, p0, p1, p2, out var distance, out var worldPoint))
-            {
-                continue;
-            }
-
-            if (closest is not null && distance >= closest.Distance)
-            {
-                continue;
-            }
-
-            var triangleIndex = i / 3;
-            var worldNormal = Vector3.Cross(p1 - p0, p2 - p0);
-            if (worldNormal.LengthSquared() < 1e-12f && part.Primitive.Normals.Length == part.Primitive.Positions.Length)
-            {
-                worldNormal = Vector3.TransformNormal(part.Primitive.Normals[i0], model);
-            }
-
-            var elementId = new ModelElementId3D(
-                part.Model.Asset.AssetId,
-                part.Node.Path,
-                part.Node.Index,
-                part.MeshAsset.Index,
-                part.PrimitiveIndex,
-                triangleIndex);
-            var modelHit = new ModelHitResult3D(part.Model, part, elementId, worldPoint, worldNormal, distance);
-            closest = new PickingResult(part, worldPoint, distance, modelHit);
         }
 
-        return closest;
+        var mesh = useSkinnedFallback ? part.GetCpuSkinnedFallbackMesh() : part.GetMesh();
+        var positions = mesh.Positions;
+        var indices = mesh.Indices;
+        if (indices.Length < 3 || positions.Length == 0)
+        {
+            return null;
+        }
+
+        if (mesh.LocalBounds.IsValid && !IntersectsBounds(localRay, mesh.LocalBounds, out _, out _))
+        {
+            return null;
+        }
+
+        var bvh = GetOrCreateBvh(mesh.ResourceKey, mesh.GeometryVersion, positions, indices);
+        if (!bvh.Raycast(localRay, positions, indices, out _, out var localPoint, out var triangleIndex))
+        {
+            return null;
+        }
+
+        var worldPoint = Vector3.Transform(localPoint, model);
+        var worldDistance = Vector3.Distance(worldRay.Origin, worldPoint);
+        var baseIndex = triangleIndex * 3;
+        var i0 = indices[baseIndex];
+        var i1 = indices[baseIndex + 1];
+        var i2 = indices[baseIndex + 2];
+        var p0 = positions[i0];
+        var p1 = positions[i1];
+        var p2 = positions[i2];
+        var worldNormal = Vector3.TransformNormal(Vector3.Cross(p1 - p0, p2 - p0), model);
+        if (worldNormal.LengthSquared() < 1e-12f && mesh.Normals.Length == positions.Length)
+        {
+            worldNormal = Vector3.TransformNormal(mesh.Normals[i0], model);
+        }
+        if (worldNormal.LengthSquared() > 1e-12f)
+        {
+            worldNormal = Vector3.Normalize(worldNormal);
+        }
+
+        var elementId = new ModelElementId3D(
+            part.Model.Asset.AssetId,
+            part.Node.Path,
+            part.Node.Index,
+            part.MeshAsset.Index,
+            part.PrimitiveIndex,
+            triangleIndex);
+        var modelHit = new ModelHitResult3D(part.Model, part, elementId, worldPoint, worldNormal, worldDistance);
+        return new PickingResult(part, worldPoint, worldDistance, modelHit);
     }
 
     private static ModelHitResult3D? TryBuildBoundsModelHit(Object3D obj, Vector3 point, float distance)
@@ -178,19 +186,87 @@ public static class Raycaster
         return new ModelHitResult3D(part.Model, part, elementId, point, Vector3.UnitY, distance);
     }
 
+    private static TriangleBvh GetOrCreateBvh(string resourceKey, int geometryVersion, Vector3[] positions, int[] indices)
+        => GetOrCreateBvh(new MeshBvhCacheKey(resourceKey, geometryVersion), positions, indices);
+
+    private static TriangleBvh GetOrCreateBvh(MeshBvhCacheKey key, Vector3[] positions, int[] indices)
+    {
+        lock (BvhCacheLock)
+        {
+            if (BvhCache.TryGetValue(key, out var entry))
+            {
+                BvhLru.Remove(entry.Node);
+                BvhLru.AddFirst(entry.Node);
+                return entry.Bvh;
+            }
+
+            var bvh = TriangleBvh.Build(positions, indices);
+            var node = new LinkedListNode<MeshBvhCacheKey>(key);
+            BvhLru.AddFirst(node);
+            BvhCache[key] = new BvhCacheEntry(bvh, node);
+            while (BvhCache.Count > MaxCachedBvhs && BvhLru.Last is not null)
+            {
+                var evict = BvhLru.Last;
+                BvhLru.RemoveLast();
+                BvhCache.Remove(evict.Value);
+            }
+
+            return bvh;
+        }
+    }
+
+    private static bool TryCreateLocalRay(Ray worldRay, Matrix4x4 model, out Ray localRay)
+    {
+        if (!Matrix4x4.Invert(model, out var inverse))
+        {
+            localRay = default;
+            return false;
+        }
+
+        var origin = Vector3.Transform(worldRay.Origin, inverse);
+        var direction = Vector3.TransformNormal(worldRay.Direction, inverse);
+        if (direction.LengthSquared() < 0.000001f || !IsFinite(origin) || !IsFinite(direction))
+        {
+            localRay = default;
+            return false;
+        }
+
+        localRay = new Ray(origin, Vector3.Normalize(direction));
+        return true;
+    }
+
     private static bool IsValidTriangleIndex(int vertexCount, int i0, int i1, int i2)
         => i0 >= 0 && i0 < vertexCount &&
            i1 >= 0 && i1 < vertexCount &&
            i2 >= 0 && i2 < vertexCount;
 
-    private static bool IntersectsBoundingSphere(Ray ray, Vector3 center, float radius)
+    private static bool IntersectsBounds(Ray ray, Bounds3D bounds, out float near, out float far)
     {
-        if (radius <= 0f) return false;
-        var oc = ray.Origin - center;
-        var b = Vector3.Dot(oc, ray.Direction);
-        var c = Vector3.Dot(oc, oc) - (radius * radius);
-        return (b * b) - c >= 0f;
+        near = 0f;
+        far = float.PositiveInfinity;
+        if (!Slab(ray.Origin.X, ray.Direction.X, bounds.Min.X, bounds.Max.X, ref near, ref far)) return false;
+        if (!Slab(ray.Origin.Y, ray.Direction.Y, bounds.Min.Y, bounds.Max.Y, ref near, ref far)) return false;
+        if (!Slab(ray.Origin.Z, ray.Direction.Z, bounds.Min.Z, bounds.Max.Z, ref near, ref far)) return false;
+        return far >= 0f && near <= far;
     }
+
+    private static bool Slab(float origin, float direction, float min, float max, ref float near, ref float far)
+    {
+        if (System.MathF.Abs(direction) < 1e-6f)
+        {
+            return origin >= min && origin <= max;
+        }
+
+        var inv = 1f / direction;
+        var t0 = (min - origin) * inv;
+        var t1 = (max - origin) * inv;
+        if (t0 > t1) (t0, t1) = (t1, t0);
+        if (t0 > near) near = t0;
+        if (t1 < far) far = t1;
+        return near <= far;
+    }
+
+    private static bool IsFinite(Vector3 p) => float.IsFinite(p.X) && float.IsFinite(p.Y) && float.IsFinite(p.Z);
 
     public static bool IntersectTriangle(
         Ray ray,
@@ -244,11 +320,203 @@ public static class Raycaster
         return true;
     }
 
-    private static float GetAbsMax(Matrix4x4 model)
+    private readonly struct MeshBvhCacheKey : IEquatable<MeshBvhCacheKey>
     {
-        var x = Vector3.TransformNormal(Vector3.UnitX, model).Length();
-        var y = Vector3.TransformNormal(Vector3.UnitY, model).Length();
-        var z = Vector3.TransformNormal(Vector3.UnitZ, model).Length();
-        return System.Math.Max(x, System.Math.Max(y, z));
+        private readonly string _resourceKey;
+        private readonly int _version;
+
+        public MeshBvhCacheKey(string resourceKey, int version)
+        {
+            _resourceKey = resourceKey ?? string.Empty;
+            _version = version;
+        }
+
+        public bool Equals(MeshBvhCacheKey other) => _version == other._version && string.Equals(_resourceKey, other._resourceKey, StringComparison.Ordinal);
+        public override bool Equals(object? obj) => obj is MeshBvhCacheKey other && Equals(other);
+        public override int GetHashCode() => HashCode.Combine(_resourceKey, _version);
+    }
+
+    private sealed class BvhCacheEntry
+    {
+        public BvhCacheEntry(TriangleBvh bvh, LinkedListNode<MeshBvhCacheKey> node)
+        {
+            Bvh = bvh;
+            Node = node;
+        }
+
+        public TriangleBvh Bvh { get; }
+        public LinkedListNode<MeshBvhCacheKey> Node { get; }
+    }
+
+    private sealed class TriangleBvh
+    {
+        private const int LeafTriangleCount = 12;
+        private readonly Node[] _nodes;
+        private readonly int[] _triangleIndices;
+
+        private TriangleBvh(Node[] nodes, int[] triangleIndices)
+        {
+            _nodes = nodes;
+            _triangleIndices = triangleIndices;
+        }
+
+        public static TriangleBvh Build(Vector3[] positions, int[] indices)
+        {
+            var triangleCount = indices.Length / 3;
+            if (triangleCount <= 0) return new TriangleBvh(Array.Empty<Node>(), Array.Empty<int>());
+            var triangles = new int[triangleCount];
+            for (var i = 0; i < triangles.Length; i++) triangles[i] = i;
+            var nodes = new List<Node>(triangleCount / LeafTriangleCount + 1);
+            BuildNode(positions, indices, triangles, 0, triangles.Length, nodes);
+            return new TriangleBvh(nodes.ToArray(), triangles);
+        }
+
+        public bool Raycast(Ray ray, Vector3[] positions, int[] indices, out float distance, out Vector3 point, out int triangleIndex)
+        {
+            distance = float.PositiveInfinity;
+            point = default;
+            triangleIndex = -1;
+            if (_nodes.Length == 0) return false;
+            var hit = false;
+            Span<int> stack = stackalloc int[64];
+            var stackCount = 0;
+            stack[stackCount++] = 0;
+            while (stackCount > 0)
+            {
+                var nodeIndex = stack[--stackCount];
+                var node = _nodes[nodeIndex];
+                if (!IntersectsBounds(ray, node.Bounds, out var near, out _) || near > distance) continue;
+                if (node.IsLeaf)
+                {
+                    for (var i = 0; i < node.Count; i++)
+                    {
+                        var tri = _triangleIndices[node.Start + i];
+                        var baseIndex = tri * 3;
+                        var i0 = indices[baseIndex];
+                        var i1 = indices[baseIndex + 1];
+                        var i2 = indices[baseIndex + 2];
+                        if (!IsValidTriangleIndex(positions.Length, i0, i1, i2)) continue;
+                        if (!IntersectTriangle(ray, positions[i0], positions[i1], positions[i2], out var triDistance, out var triPoint)) continue;
+                        if (triDistance >= distance) continue;
+                        distance = triDistance;
+                        point = triPoint;
+                        triangleIndex = tri;
+                        hit = true;
+                    }
+                }
+                else
+                {
+                    if (stackCount + 2 >= stack.Length)
+                    {
+                        continue;
+                    }
+                    stack[stackCount++] = node.Left;
+                    stack[stackCount++] = node.Right;
+                }
+            }
+
+            return hit;
+        }
+
+        private static int BuildNode(Vector3[] positions, int[] indices, int[] triangles, int start, int count, List<Node> nodes)
+        {
+            var nodeIndex = nodes.Count;
+            nodes.Add(default);
+            var bounds = ComputeBounds(positions, indices, triangles, start, count);
+            if (count <= LeafTriangleCount)
+            {
+                nodes[nodeIndex] = new Node(bounds, start, count, -1, -1);
+                return nodeIndex;
+            }
+
+            var centroidBounds = ComputeCentroidBounds(positions, indices, triangles, start, count);
+            var axis = LongestAxis(centroidBounds.Size);
+            Array.Sort(triangles, start, count, new TriangleCentroidComparer(positions, indices, axis));
+            var leftCount = count / 2;
+            var left = BuildNode(positions, indices, triangles, start, leftCount, nodes);
+            var right = BuildNode(positions, indices, triangles, start + leftCount, count - leftCount, nodes);
+            nodes[nodeIndex] = new Node(bounds, start, count, left, right);
+            return nodeIndex;
+        }
+
+        private static Bounds3D ComputeBounds(Vector3[] positions, int[] indices, int[] triangles, int start, int count)
+        {
+            var bounds = Bounds3D.Empty;
+            for (var i = 0; i < count; i++)
+            {
+                var tri = triangles[start + i] * 3;
+                var i0 = indices[tri];
+                var i1 = indices[tri + 1];
+                var i2 = indices[tri + 2];
+                if (!IsValidTriangleIndex(positions.Length, i0, i1, i2)) continue;
+                bounds = bounds.Encapsulate(positions[i0]).Encapsulate(positions[i1]).Encapsulate(positions[i2]);
+            }
+            return bounds;
+        }
+
+        private static Bounds3D ComputeCentroidBounds(Vector3[] positions, int[] indices, int[] triangles, int start, int count)
+        {
+            var bounds = Bounds3D.Empty;
+            for (var i = 0; i < count; i++)
+            {
+                bounds = bounds.Encapsulate(Centroid(positions, indices, triangles[start + i]));
+            }
+            return bounds;
+        }
+
+        private static Vector3 Centroid(Vector3[] positions, int[] indices, int triangle)
+        {
+            var baseIndex = triangle * 3;
+            var i0 = indices[baseIndex];
+            var i1 = indices[baseIndex + 1];
+            var i2 = indices[baseIndex + 2];
+            if (!IsValidTriangleIndex(positions.Length, i0, i1, i2)) return Vector3.Zero;
+            return (positions[i0] + positions[i1] + positions[i2]) / 3f;
+        }
+
+        private static int LongestAxis(Vector3 size)
+            => size.X >= size.Y && size.X >= size.Z ? 0 : size.Y >= size.Z ? 1 : 2;
+
+        private readonly struct Node
+        {
+            public Node(Bounds3D bounds, int start, int count, int left, int right)
+            {
+                Bounds = bounds;
+                Start = start;
+                Count = count;
+                Left = left;
+                Right = right;
+            }
+
+            public Bounds3D Bounds { get; }
+            public int Start { get; }
+            public int Count { get; }
+            public int Left { get; }
+            public int Right { get; }
+            public bool IsLeaf => Left < 0 || Right < 0;
+        }
+
+        private sealed class TriangleCentroidComparer : IComparer<int>
+        {
+            private readonly Vector3[] _positions;
+            private readonly int[] _indices;
+            private readonly int _axis;
+
+            public TriangleCentroidComparer(Vector3[] positions, int[] indices, int axis)
+            {
+                _positions = positions;
+                _indices = indices;
+                _axis = axis;
+            }
+
+            public int Compare(int x, int y)
+            {
+                var cx = Centroid(_positions, _indices, x);
+                var cy = Centroid(_positions, _indices, y);
+                var vx = _axis == 0 ? cx.X : _axis == 1 ? cx.Y : cx.Z;
+                var vy = _axis == 0 ? cy.X : _axis == 1 ? cy.Y : cy.Z;
+                return vx.CompareTo(vy);
+            }
+        }
     }
 }

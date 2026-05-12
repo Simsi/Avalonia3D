@@ -66,6 +66,13 @@ public sealed class ScenePerformanceOptions
 
     public float MinimumAdaptiveDrawDistance { get; set; } = 300f;
 
+    // Transparent ordinary rendering. Exact per-object sorting is best for quality, but
+    // creates one draw call per object. Above this threshold the Core planner switches
+    // to depth-bin + material/mesh batching so large translucent scenes stay bounded.
+    public int TransparentOrdinaryObjectSortThreshold { get; set; } = 256;
+    public int TransparentOrdinaryDepthBinCount { get; set; } = 16;
+    public bool EnableAdaptiveTransparentOrdinaryBatching { get; set; } = true;
+
     public static ScenePerformanceOptions CreateDefault() => new();
 
     public static ScenePerformanceOptions CreateExtremeScale() => new()
@@ -106,6 +113,9 @@ public sealed class ScenePerformanceOptions
         EnableBakedHighScaleDetailedMeshes = true,
         EnableHighScalePaletteTexture = true,
         EnableHighScaleAggregateLayerBatches = false,
-        HighScaleAggregateLayerInstanceThreshold = 15000
+        HighScaleAggregateLayerInstanceThreshold = 15000,
+        TransparentOrdinaryObjectSortThreshold = 256,
+        TransparentOrdinaryDepthBinCount = 16,
+        EnableAdaptiveTransparentOrdinaryBatching = true
     };
 }

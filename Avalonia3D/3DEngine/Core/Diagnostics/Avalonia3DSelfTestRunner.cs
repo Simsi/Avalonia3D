@@ -332,10 +332,14 @@ public static class Avalonia3DSelfTestRunner
         particles.Emit(1);
         particles.SetBillboardBasis(Vector3.UnitX, Vector3.UnitY, Vector3.UnitZ);
         var meshA = particles.GetMesh();
+        var versionA = meshA.GeometryVersion;
         particles.SetBillboardBasis(Vector3.UnitZ, Vector3.UnitY, -Vector3.UnitX);
         var meshB = particles.GetMesh();
-        Expect(meshA.Positions.Length == 4 && meshB.Positions.Length == 4, "A single quad particle must generate four vertices.");
-        Expect(Vector3.DistanceSquared(meshA.Positions[0], meshB.Positions[0]) > 0.0001f, "Changing the billboard basis must rotate camera-facing particle geometry.");
+
+        Expect(ReferenceEquals(meshA, meshB), "Particle billboard mesh must stay retained/static across camera basis changes.");
+        Expect(meshA.Positions.Length == 4 && meshA.Indices.Length == 6, "A camera-facing particle system must expose the shared static quad mesh.");
+        Expect(meshB.GeometryVersion == versionA, "Changing the billboard basis must not dirty CPU particle geometry; billboarding is a renderer/shader responsibility.");
+        Expect(particles.AliveCount == 1 && particles.Particles.Count == 1, "Particle instances must remain available as renderer instance data.");
     }
 
     private static void Expect(bool condition, string message)

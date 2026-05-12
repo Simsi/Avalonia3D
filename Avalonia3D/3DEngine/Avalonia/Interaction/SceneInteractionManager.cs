@@ -182,16 +182,11 @@ public sealed class SceneInteractionManager
             }
         }
 
-        UpdateHover(owner, position, SceneMouseButton.Unknown);
-
-        if (HoveredObject is not null)
+        var hoverPick = UpdateHover(owner, position, SceneMouseButton.Unknown);
+        if (HoveredObject is not null && hoverPick is not null)
         {
-            var hoverPick = Pick(owner, position);
-            if (hoverPick is not null)
-            {
-                HoveredObject.RaisePointerMoved(CreatePointerArgs(hoverPick, position, SceneMouseButton.Unknown));
-                DispatchModelPointerEvent(hoverPick, ModelPointerEventKind.PointerMoved, position, SceneMouseButton.Unknown);
-            }
+            HoveredObject.RaisePointerMoved(CreatePointerArgs(hoverPick, position, SceneMouseButton.Unknown));
+            DispatchModelPointerEvent(hoverPick, ModelPointerEventKind.PointerMoved, position, SceneMouseButton.Unknown);
         }
 
         _lastPosition = position;
@@ -199,16 +194,11 @@ public sealed class SceneInteractionManager
 
     public void HandlePointerHover(Control owner, PointerEventArgs e, Vector2 position)
     {
-        UpdateHover(owner, position, SceneMouseButton.Unknown);
-
-        if (HoveredObject is not null)
+        var hoverPick = UpdateHover(owner, position, SceneMouseButton.Unknown);
+        if (HoveredObject is not null && hoverPick is not null)
         {
-            var hoverPick = Pick(owner, position);
-            if (hoverPick is not null)
-            {
-                HoveredObject.RaisePointerMoved(CreatePointerArgs(hoverPick, position, SceneMouseButton.Unknown));
-                DispatchModelPointerEvent(hoverPick, ModelPointerEventKind.PointerMoved, position, SceneMouseButton.Unknown);
-            }
+            HoveredObject.RaisePointerMoved(CreatePointerArgs(hoverPick, position, SceneMouseButton.Unknown));
+            DispatchModelPointerEvent(hoverPick, ModelPointerEventKind.PointerMoved, position, SceneMouseButton.Unknown);
         }
 
         _lastPosition = position;
@@ -239,7 +229,7 @@ public sealed class SceneInteractionManager
         SelectedObject.Position += translation;
     }
 
-    private void UpdateHover(Control owner, Vector2 position, SceneMouseButton button)
+    private PickingResult? UpdateHover(Control owner, Vector2 position, SceneMouseButton button)
     {
         var pick = Pick(owner, position);
         var oldHovered = HoveredObject;
@@ -249,7 +239,7 @@ public sealed class SceneInteractionManager
         var modelElementChanged = !AreSameModelHover(_hoveredModelHit, pick?.ModelHit);
         if (!hoverTargetChanged && !modelElementChanged)
         {
-            return;
+            return pick;
         }
 
         if (oldHovered is not null && hoverTargetChanged)
@@ -268,6 +258,7 @@ public sealed class SceneInteractionManager
         }
 
         _requestRender();
+        return pick;
     }
 
     private void UpdateSelection(Object3D? newSelection)

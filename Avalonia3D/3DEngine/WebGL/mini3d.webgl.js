@@ -1,5 +1,6 @@
 const hosts = new Map();
 let nextHostId = 1;
+const uniformCacheByContext = new WeakMap();
 
 function createShader(gl, type, source) {
   const shader = gl.createShader(type);
@@ -29,6 +30,9 @@ function createProgram(gl, vertexSource, fragmentSource) {
   gl.bindAttribLocation(program, 7, 'aMaterialSlot');
   gl.bindAttribLocation(program, 8, 'aTexCoord0');
   gl.bindAttribLocation(program, 9, 'aTangent');
+  gl.bindAttribLocation(program, 10, 'aVertexColor');
+  gl.bindAttribLocation(program, 11, 'aBoneIndices');
+  gl.bindAttribLocation(program, 12, 'aBoneWeights');
   gl.linkProgram(program);
   gl.deleteShader(vs);
   gl.deleteShader(fs);
@@ -46,6 +50,9 @@ attribute vec3 aPosition;
 attribute vec3 aNormal;
 attribute vec2 aTexCoord0;
 attribute vec4 aTangent;
+attribute vec4 aVertexColor;
+attribute vec4 aBoneIndices;
+attribute vec4 aBoneWeights;
 attribute vec4 aInstanceModel0;
 attribute vec4 aInstanceModel1;
 attribute vec4 aInstanceModel2;
@@ -60,27 +67,74 @@ uniform float uUsePalette;
 uniform float uClientAnimationEnabled;
 uniform float uClientAnimationTime;
 uniform float uClientAnimationAmplitude;
+uniform float uParticleMode;
+uniform vec3 uCameraRight;
+uniform vec3 uCameraUp;
+uniform float uSkinningEnabled;
+uniform sampler2D uBoneTexture;
+uniform float uBoneTextureHeight;
 varying vec3 vWorldPos;
 varying vec3 vNormal;
 varying vec3 vTangent;
 varying vec2 vTexCoord0;
 varying vec4 vColor;
+varying vec4 vVertexColor;
 varying float vMaterialSlot;
+mat4 readBoneMatrix(float boneIndex) {
+  float y = (floor(boneIndex + 0.5) + 0.5) / max(uBoneTextureHeight, 1.0);
+  vec4 c0 = texture2D(uBoneTexture, vec2(0.125, y));
+  vec4 c1 = texture2D(uBoneTexture, vec2(0.375, y));
+  vec4 c2 = texture2D(uBoneTexture, vec2(0.625, y));
+  vec4 c3 = texture2D(uBoneTexture, vec2(0.875, y));
+  return mat4(c0, c1, c2, c3);
+}
 void main() {
   mat4 instanceModel = mat4(aInstanceModel0, aInstanceModel1, aInstanceModel2, aInstanceModel3);
   mat4 model = uUseInstancing > 0.5 ? instanceModel : uModel;
-  vec4 world = model * vec4(aPosition, 1.0);
-  if (uClientAnimationEnabled > 0.5) {
-    float phase = world.x * 0.033 + world.z * 0.047;
-    world.x += sin(uClientAnimationTime + phase) * uClientAnimationAmplitude;
-    world.z += cos(uClientAnimationTime * 0.7 + phase * 1.7) * uClientAnimationAmplitude;
+  vec4 world;
+  vec3 normal;
+  vec3 tangent;
+  if (uParticleMode > 0.5) {
+    vec3 center = aInstanceModel0.xyz;
+    float size = max(aInstanceModel0.w, 0.0001);
+    if (uParticleMode < 1.5) {
+      world = vec4(center + uCameraRight * (aPosition.x * size) + uCameraUp * (aPosition.y * size), 1.0);
+      normal = normalize(-cross(uCameraRight, uCameraUp));
+      tangent = normalize(uCameraRight);
+    } else {
+      world = instanceModel * vec4(aPosition, 1.0);
+      normal = normalize(mat3(instanceModel) * aNormal);
+      tangent = normalize(mat3(instanceModel) * aTangent.xyz);
+    }
+  } else {
+    vec4 localPosition = vec4(aPosition, 1.0);
+    vec3 localNormal = aNormal;
+    vec3 localTangent = aTangent.xyz;
+    if (uSkinningEnabled > 0.5) {
+      mat4 skin = readBoneMatrix(aBoneIndices.x) * aBoneWeights.x;
+      skin += readBoneMatrix(aBoneIndices.y) * aBoneWeights.y;
+      skin += readBoneMatrix(aBoneIndices.z) * aBoneWeights.z;
+      skin += readBoneMatrix(aBoneIndices.w) * aBoneWeights.w;
+      localPosition = skin * localPosition;
+      localNormal = normalize(mat3(skin) * localNormal);
+      localTangent = normalize(mat3(skin) * localTangent);
+    }
+    world = model * localPosition;
+    if (uClientAnimationEnabled > 0.5) {
+      float phase = world.x * 0.033 + world.z * 0.047;
+      world.x += sin(uClientAnimationTime + phase) * uClientAnimationAmplitude;
+      world.z += cos(uClientAnimationTime * 0.7 + phase * 1.7) * uClientAnimationAmplitude;
+    }
+    mat3 normalMatrix = mat3(model);
+    normal = normalize(normalMatrix * localNormal);
+    tangent = normalize(normalMatrix * localTangent);
   }
   vWorldPos = world.xyz;
-  mat3 normalMatrix = mat3(model);
-  vNormal = normalize(normalMatrix * aNormal);
-  vTangent = normalize(normalMatrix * aTangent.xyz);
+  vNormal = normal;
+  vTangent = tangent;
   vTexCoord0 = aTexCoord0;
   vColor = uUseInstancing > 0.5 ? aInstanceColor : uColor;
+  vVertexColor = aVertexColor;
   vMaterialSlot = aMaterialSlot;
   gl_Position = uViewProj * world;
 }
@@ -119,9 +173,10 @@ varying vec3 vNormal;
 varying vec3 vTangent;
 varying vec2 vTexCoord0;
 varying vec4 vColor;
+varying vec4 vVertexColor;
 varying float vMaterialSlot;
 void main() {
-  vec4 color = vColor;
+  vec4 color = vec4(vColor.rgb * vVertexColor.rgb, vColor.a * vVertexColor.a);
   vec3 surfaceNormal = normalize(vNormal);
   if (uUsePalette > 0.5) {
     float sx = (floor(vMaterialSlot + 0.5) + 0.5) / max(uPaletteSize.x, 1.0);
@@ -363,6 +418,9 @@ void main() {
     meshMaterialSlotLocation: gl.getAttribLocation(meshProgram, 'aMaterialSlot'),
     meshTexCoordLocation: gl.getAttribLocation(meshProgram, 'aTexCoord0'),
     meshTangentLocation: gl.getAttribLocation(meshProgram, 'aTangent'),
+    meshVertexColorLocation: gl.getAttribLocation(meshProgram, 'aVertexColor'),
+    meshBoneIndicesLocation: gl.getAttribLocation(meshProgram, 'aBoneIndices'),
+    meshBoneWeightsLocation: gl.getAttribLocation(meshProgram, 'aBoneWeights'),
     meshViewProjLocation: gl.getUniformLocation(meshProgram, 'uViewProj'),
     meshModelLocation: gl.getUniformLocation(meshProgram, 'uModel'),
     meshColorLocation: gl.getUniformLocation(meshProgram, 'uColor'),
@@ -371,6 +429,12 @@ void main() {
     meshClientAnimationEnabledLocation: gl.getUniformLocation(meshProgram, 'uClientAnimationEnabled'),
     meshClientAnimationTimeLocation: gl.getUniformLocation(meshProgram, 'uClientAnimationTime'),
     meshClientAnimationAmplitudeLocation: gl.getUniformLocation(meshProgram, 'uClientAnimationAmplitude'),
+    meshParticleModeLocation: gl.getUniformLocation(meshProgram, 'uParticleMode'),
+    meshCameraRightUniformLocation: gl.getUniformLocation(meshProgram, 'uCameraRight'),
+    meshCameraUpUniformLocation: gl.getUniformLocation(meshProgram, 'uCameraUp'),
+    meshSkinningEnabledLocation: gl.getUniformLocation(meshProgram, 'uSkinningEnabled'),
+    meshBoneTextureLocation: gl.getUniformLocation(meshProgram, 'uBoneTexture'),
+    meshBoneTextureHeightLocation: gl.getUniformLocation(meshProgram, 'uBoneTextureHeight'),
     meshPaletteLocation: gl.getUniformLocation(meshProgram, 'uPalette'),
     meshPaletteSizeLocation: gl.getUniformLocation(meshProgram, 'uPaletteSize'),
     meshBaseColorTextureLocation: gl.getUniformLocation(meshProgram, 'uBaseColorTexture'),
@@ -410,9 +474,52 @@ void main() {
     retainedBatches: new Map(),
     retainedBatchList: [],
     retainedBatchIdToIndex: new Map(),
+    retainedDrawOrder: [],
+    controlPlanes: [],
+    controlPlaneDrawList: [],
+    emptyBatches: [],
     highScaleLayers: new Map(),
     highScaleDrawList: [],
+    highScaleFramePacket: null,
+    retainedDirectFramePacket: null,
+    retainedCubemapIdsKey: null,
+    retainedCubemapIds: [],
+    forceAlphaDitherOpaque: false,
     frameViewProjection: new Float32Array(16),
+    scratch3: new Float32Array(3),
+    scratch4: new Float32Array(4),
+    scratch16: new Float32Array(16),
+    vaoExt: gl.createVertexArray ? null : gl.getExtension('OES_vertex_array_object'),
+    glState: {
+      activeTextureUnit: -1,
+      texture2D: new Array(16).fill(null),
+      program: null,
+      arrayBuffer: null,
+      elementArrayBuffer: null,
+      vao: null,
+      blend: null,
+      depthTest: null,
+      depthMask: null,
+      blendSrc: null,
+      blendDst: null,
+      depthFunc: null,
+      materialKey: '',
+      stateChanges: 0,
+      uniformUpdates: 0,
+      textureBinds: 0,
+      bufferBinds: 0,
+      vaoBinds: 0
+    },
+    maxDevicePixelRatio: 1.0,
+    gpuSkinningSupported: (gl.getParameter(gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS) || 0) > 0 && (!!gl.getExtension('OES_texture_float') || !!gl.texImage3D),
+    lastCssLeft: null,
+    lastCssTop: null,
+    lastCssWidth: null,
+    lastCssHeight: null,
+    lastDisplay: null,
+    lastMetricsText: null,
+    lastMetricsVisible: false,
+    lastCenterCursorVisible: false,
     frameId: 0,
     texturePayloadErrors: 0,
     palettePayloadErrors: 0,
@@ -421,6 +528,8 @@ void main() {
     textureResources: new Map(),
     controlVertexBuffers: new Map(),
     elementIndexUintExt: gl.drawElementsInstanced ? true : gl.getExtension('OES_element_index_uint'),
+    textureFloatExt: gl.getExtension('OES_texture_float'),
+    vertexTextureUnits: gl.getParameter(gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS) || 0,
     width: 0,
     height: 0,
     centerCursorVisible: false,
@@ -510,6 +619,30 @@ export function createHost() {
       host.pointerDeltaY = 0;
     }
   };
+  host.contextLostHandler = (event) => {
+    event.preventDefault();
+    host.contextLost = true;
+    host.cachedScenePacket = null;
+  };
+  host.contextRestoredHandler = () => {
+    // WebGL invalidates every program/buffer/texture on context loss. Rebuild the JS-side
+    // GPU runtime immediately and ask C# to clear its upload-version caches on the next frame.
+    const pointerMoveHandler = host.pointerMoveHandler;
+    const pointerLockChangeHandler = host.pointerLockChangeHandler;
+    const contextLostHandler = host.contextLostHandler;
+    const contextRestoredHandler = host.contextRestoredHandler;
+    const fresh = createHostState(canvas, gl, metricsElement, centerCursorElement);
+    Object.assign(host, fresh);
+    host.pointerMoveHandler = pointerMoveHandler;
+    host.pointerLockChangeHandler = pointerLockChangeHandler;
+    host.contextLostHandler = contextLostHandler;
+    host.contextRestoredHandler = contextRestoredHandler;
+    host.contextLost = false;
+    host.contextResetPending = true;
+    host.cachedScenePacket = null;
+  };
+  canvas.addEventListener('webglcontextlost', host.contextLostHandler, false);
+  canvas.addEventListener('webglcontextrestored', host.contextRestoredHandler, false);
   document.addEventListener('mousemove', host.pointerMoveHandler, true);
   document.addEventListener('pointerlockchange', host.pointerLockChangeHandler, true);
   document.addEventListener('mozpointerlockchange', host.pointerLockChangeHandler, true);
@@ -524,12 +657,14 @@ export function destroyHost(hostId) {
   const { gl } = host;
   for (const r of host.meshResources.values()) disposeMeshResource(gl, r);
   for (const b of host.instanceBuffers.values()) gl.deleteBuffer(b);
-  for (const b of host.retainedBatches.values()) { gl.deleteBuffer(b.transformBuffer); gl.deleteBuffer(b.stateBuffer); if (b.paletteTexture) gl.deleteTexture(b.paletteTexture); }
+  for (const b of host.retainedBatches.values()) { gl.deleteBuffer(b.transformBuffer); gl.deleteBuffer(b.stateBuffer); if (b.particleBuffer) gl.deleteBuffer(b.particleBuffer); if (b.paletteTexture) gl.deleteTexture(b.paletteTexture); if (b.boneTexture) gl.deleteTexture(b.boneTexture); }
   for (const t of host.textureResources.values()) gl.deleteTexture(t.texture);
   for (const b of host.controlVertexBuffers.values()) gl.deleteBuffer(b);
   gl.deleteBuffer(host.quadIndexBuffer);
   gl.deleteProgram(host.meshProgram);
   gl.deleteProgram(host.texturedProgram);
+  if (host.contextLostHandler) host.canvas.removeEventListener('webglcontextlost', host.contextLostHandler, false);
+  if (host.contextRestoredHandler) host.canvas.removeEventListener('webglcontextrestored', host.contextRestoredHandler, false);
   if (host.pointerMoveHandler) document.removeEventListener('mousemove', host.pointerMoveHandler, true);
   if (host.pointerLockChangeHandler) {
     document.removeEventListener('pointerlockchange', host.pointerLockChangeHandler, true);
@@ -547,18 +682,31 @@ export function updateHost(hostId, x, y, width, height, visible) {
   const host = hosts.get(hostId);
   if (!host) return;
   const canvas = host.canvas;
-  if (!visible || width <= 0 || height <= 0) {
-    canvas.style.display = 'none';
-    host.metricsElement.style.display = 'none';
-    host.centerCursorElement.style.display = 'none';
+  const show = !!visible && width > 0 && height > 0;
+  const display = show ? 'block' : 'none';
+  if (host.lastDisplay !== display) {
+    canvas.style.display = display;
+    host.lastDisplay = display;
+  }
+  if (!show) {
+    if (host.lastMetricsVisible) updateMetrics(hostId, '', false);
+    if (host.lastCenterCursorVisible) updateCenterCursor(hostId, false);
     return;
   }
-  canvas.style.display = 'block';
-  canvas.style.left = `${x}px`;
-  canvas.style.top = `${y}px`;
-  canvas.style.width = `${width}px`;
-  canvas.style.height = `${height}px`;
-  const dpr = window.devicePixelRatio || 1;
+
+  const left = `${x}px`;
+  const top = `${y}px`;
+  const cssWidth = `${width}px`;
+  const cssHeight = `${height}px`;
+  if (host.lastCssLeft !== left) { canvas.style.left = left; host.lastCssLeft = left; }
+  if (host.lastCssTop !== top) { canvas.style.top = top; host.lastCssTop = top; }
+  if (host.lastCssWidth !== cssWidth) { canvas.style.width = cssWidth; host.lastCssWidth = cssWidth; }
+  if (host.lastCssHeight !== cssHeight) { canvas.style.height = cssHeight; host.lastCssHeight = cssHeight; }
+
+  // Hard-cap browser DPR. Retina/HiDPI displays otherwise multiply fragment cost by 4x
+  // and make small demos look CPU/GPU-bound even when the scene itself is simple.
+  const deviceDpr = window.devicePixelRatio || 1;
+  const dpr = Math.max(1, Math.min(host.maxDevicePixelRatio || 1.25, deviceDpr));
   const pixelWidth = Math.max(1, Math.round(width * dpr));
   const pixelHeight = Math.max(1, Math.round(height * dpr));
   if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
@@ -567,20 +715,25 @@ export function updateHost(hostId, x, y, width, height, visible) {
     host.width = pixelWidth;
     host.height = pixelHeight;
   }
-  host.metricsElement.style.left = `${x + width - host.metricsElement.offsetWidth - 8}px`;
-  host.metricsElement.style.top = `${y + 8}px`;
-  updateCenterCursor(hostId, host.centerCursorVisible);
 }
 
 function disposeMeshResource(gl, r) {
   if (!r) return;
-  gl.deleteBuffer(r.vertexBuffer);
-  gl.deleteBuffer(r.normalBuffer);
-  gl.deleteBuffer(r.texCoordBuffer);
-  gl.deleteBuffer(r.tangentBuffer);
-  gl.deleteBuffer(r.materialSlotBuffer);
-  gl.deleteBuffer(r.indexBuffer);
-  gl.deleteBuffer(r.wireframeIndexBuffer);
+  if (r.vao) {
+    if (gl.deleteVertexArray) gl.deleteVertexArray(r.vao);
+    else if (r.vaoExt && r.vaoExt.deleteVertexArrayOES) r.vaoExt.deleteVertexArrayOES(r.vao);
+    r.vao = null;
+  }
+  if (r.vertexBuffer) gl.deleteBuffer(r.vertexBuffer);
+  if (r.normalBuffer) gl.deleteBuffer(r.normalBuffer);
+  if (r.texCoordBuffer) gl.deleteBuffer(r.texCoordBuffer);
+  if (r.tangentBuffer) gl.deleteBuffer(r.tangentBuffer);
+  if (r.colorBuffer) gl.deleteBuffer(r.colorBuffer);
+  if (r.materialSlotBuffer) gl.deleteBuffer(r.materialSlotBuffer);
+  if (r.boneIndexBuffer) gl.deleteBuffer(r.boneIndexBuffer);
+  if (r.boneWeightBuffer) gl.deleteBuffer(r.boneWeightBuffer);
+  if (r.indexBuffer) gl.deleteBuffer(r.indexBuffer);
+  if (r.wireframeIndexBuffer) gl.deleteBuffer(r.wireframeIndexBuffer);
 }
 
 function rebuildMeshIndex(host) {
@@ -613,7 +766,7 @@ export function destroyTexture(hostId, textureId) {
   host.textureResources.delete(textureId);
 }
 
-export function uploadTexture(hostId, textureId, width, height, rgbaBytesBase64) {
+function uploadTexture(hostId, textureId, width, height, rgbaBytesBase64) {
   const host = hosts.get(hostId);
   if (!host) return;
   const { gl } = host;
@@ -625,71 +778,207 @@ export function uploadTexture(hostId, textureId, width, height, rgbaBytesBase64)
     host.textureResources.set(textureId, resource);
   }
   const rgbaBytes = coerceRgbaPayload(host, rgbaBytesBase64, safeWidth, safeHeight, 'texture');
-  gl.bindTexture(gl.TEXTURE_2D, resource.texture);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  const canMipmap = isPowerOfTwo(safeWidth) && isPowerOfTwo(safeHeight);
+  bindTexture2DCached(host, 0, resource.texture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, canMipmap ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, canMipmap ? gl.REPEAT : gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
   gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, safeWidth, safeHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgbaBytes);
-  gl.bindTexture(gl.TEXTURE_2D, null);
+  if (canMipmap) gl.generateMipmap(gl.TEXTURE_2D);
+  bindTexture2DCached(host, 0, null);
+  resetTextureBindCache(host);
   resource.width = safeWidth;
   resource.height = safeHeight;
 }
 
-export function uploadMeshGeometry(hostId, meshId, geometryJson) {
+
+export function uploadTextureBytes(hostId, textureId, width, height, rgbaBytes) {
+  uploadTexture(hostId, textureId, width, height, rgbaBytes);
+}
+
+export function uploadMeshGeometryBytes(hostId, meshId, vertexCount, indexCount, positionBytes, normalBytes, texCoordBytes, tangentBytes, colorBytes, materialSlotBytes, boneIndexBytes, boneWeightBytes, indexBytes, indexElementSize, wireframeIndexBytes, wireframeIndexElementSize, hasTexCoords, hasTangents, hasColors, hasMaterialSlots, hasSkinWeights, vertexLayout) {
+  const positions = decodeFloat32Payload(positionBytes);
+  const normals = decodeFloat32Payload(normalBytes);
+  const texCoords = hasTexCoords ? decodeFloat32Payload(texCoordBytes) : new Float32Array(0);
+  const tangents = hasTangents ? decodeFloat32Payload(tangentBytes) : new Float32Array(0);
+  const colors0 = hasColors ? decodeFloat32Payload(colorBytes) : new Float32Array(0);
+  const materialSlots = hasMaterialSlots ? decodeFloat32Payload(materialSlotBytes) : new Float32Array(0);
+  const boneIndices = hasSkinWeights ? decodeFloat32Payload(boneIndexBytes) : new Float32Array(0);
+  const boneWeights = hasSkinWeights ? decodeFloat32Payload(boneWeightBytes) : new Float32Array(0);
+  const indices = decodeIndexPayload(indexBytes, indexElementSize);
+  const wireframeIndices = decodeIndexPayload(wireframeIndexBytes, wireframeIndexElementSize || 2);
+  uploadMeshGeometryTyped(hostId, meshId, vertexCount | 0, indexCount | 0, positions, normals, texCoords, tangents, colors0, materialSlots, boneIndices, boneWeights, indices, wireframeIndices, !!hasTexCoords, !!hasTangents, !!hasColors, !!hasMaterialSlots, !!hasSkinWeights, vertexLayout || 'PositionNormal');
+}
+
+function computeLocalBounds3(positions) {
+  if (!positions || positions.length < 3) return { center: [0, 0, 0], extents: [0, 0, 0], valid: false };
+  let minX = Number.POSITIVE_INFINITY, minY = Number.POSITIVE_INFINITY, minZ = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY, maxY = Number.NEGATIVE_INFINITY, maxZ = Number.NEGATIVE_INFINITY;
+  for (let i = 0; i + 2 < positions.length; i += 3) {
+    const x = positions[i] || 0, y = positions[i + 1] || 0, z = positions[i + 2] || 0;
+    if (x < minX) minX = x; if (x > maxX) maxX = x;
+    if (y < minY) minY = y; if (y > maxY) maxY = y;
+    if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+  }
+  if (!Number.isFinite(minX) || !Number.isFinite(maxX)) return { center: [0, 0, 0], extents: [0, 0, 0], valid: false };
+  return {
+    center: [(minX + maxX) * 0.5, (minY + maxY) * 0.5, (minZ + maxZ) * 0.5],
+    extents: [(maxX - minX) * 0.5, (maxY - minY) * 0.5, (maxZ - minZ) * 0.5],
+    valid: true
+  };
+}
+
+function uploadMeshGeometryTyped(hostId, meshId, vertexCount, indexCount, positions, normals, texCoords0, tangents, colors0, materialSlots, boneIndices, boneWeights, indices, wireframeIndices, hasTexCoords, hasTangents, hasColors, hasMaterialSlots, hasSkinWeights, vertexLayout) {
   const host = hosts.get(hostId);
   if (!host) return;
   const { gl } = host;
-  const geometry = JSON.parse(geometryJson);
-  const positions = geometry.positions;
-  const normals = geometry.normals || [];
-  const texCoords0 = geometry.texCoords0 || [];
-  const tangents = geometry.tangents || [];
-  const indices = geometry.indices;
-  const wireframeIndices = geometry.wireframeIndices || [];
-  const materialSlots = geometry.materialSlots || [];
   let resource = host.meshResources.get(meshId);
   if (!resource) {
-    resource = { vertexBuffer: gl.createBuffer(), normalBuffer: gl.createBuffer(), texCoordBuffer: gl.createBuffer(), tangentBuffer: gl.createBuffer(), materialSlotBuffer: gl.createBuffer(), indexBuffer: gl.createBuffer(), wireframeIndexBuffer: gl.createBuffer(), indexCount: 0, wireframeIndexCount: 0, indexType: gl.UNSIGNED_SHORT, meshId, meshIndex: host.meshResourceList.length };
+    resource = {
+      vertexBuffer: gl.createBuffer(),
+      normalBuffer: gl.createBuffer(),
+      texCoordBuffer: null,
+      tangentBuffer: null,
+      colorBuffer: null,
+      materialSlotBuffer: null,
+      boneIndexBuffer: null,
+      boneWeightBuffer: null,
+      indexBuffer: gl.createBuffer(),
+      wireframeIndexBuffer: null,
+      vao: null,
+      vaoExt: null,
+      indexCount: 0,
+      wireframeIndexCount: 0,
+      indexType: gl.UNSIGNED_SHORT,
+      hasTexCoords: false,
+      hasTangents: false,
+      hasColors: false,
+      hasMaterialSlots: false,
+      hasSkinWeights: false,
+      meshId,
+      meshIndex: host.meshResourceList.length
+    };
     host.meshResources.set(meshId, resource);
     host.meshIdToIndex.set(meshId, resource.meshIndex);
     host.meshResourceList.push(resource);
   }
-  gl.bindBuffer(gl.ARRAY_BUFFER, resource.vertexBuffer);
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
-  const vertexCount = positions.length / 3;
-  const normalData = normals.length === positions.length ? normals : createDefaultNormals(vertexCount);
-  gl.bindBuffer(gl.ARRAY_BUFFER, resource.normalBuffer);
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(normalData), gl.STATIC_DRAW);
-  const texCoordData = texCoords0.length === vertexCount * 2 ? texCoords0 : createDefaultTexCoords(vertexCount);
-  gl.bindBuffer(gl.ARRAY_BUFFER, resource.texCoordBuffer);
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(texCoordData), gl.STATIC_DRAW);
-  const tangentData = tangents.length === vertexCount * 4 ? tangents : createDefaultTangents(vertexCount);
-  gl.bindBuffer(gl.ARRAY_BUFFER, resource.tangentBuffer);
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(tangentData), gl.STATIC_DRAW);
-  const slotData = materialSlots.length === vertexCount ? materialSlots : createDefaultMaterialSlots(vertexCount);
-  gl.bindBuffer(gl.ARRAY_BUFFER, resource.materialSlotBuffer);
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(slotData), gl.STATIC_DRAW);
-  let maxIndex = 0;
-  for (let i = 0; i < indices.length; i++) if (indices[i] > maxIndex) maxIndex = indices[i];
-  let indexArray;
-  if (maxIndex > 65535) {
+
+  const safeVertexCount = Math.max(0, vertexCount | 0) || Math.max(0, (positions.length / 3) | 0);
+  const localBounds = computeLocalBounds3(positions);
+  resource.localCenter = localBounds.center;
+  resource.localExtents = localBounds.extents;
+  resource.localBoundsValid = localBounds.valid;
+  bindArrayBufferCached(host, resource.vertexBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+  const normalData = normals.length === safeVertexCount * 3 ? normals : createDefaultNormalsTyped(safeVertexCount);
+  bindArrayBufferCached(host, resource.normalBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, normalData, gl.STATIC_DRAW);
+
+  resource.hasTexCoords = !!hasTexCoords && texCoords0.length === safeVertexCount * 2;
+  if (resource.hasTexCoords) {
+    if (!resource.texCoordBuffer) resource.texCoordBuffer = gl.createBuffer();
+    bindArrayBufferCached(host, resource.texCoordBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, texCoords0, gl.STATIC_DRAW);
+  } else if (resource.texCoordBuffer) {
+    gl.deleteBuffer(resource.texCoordBuffer);
+    resource.texCoordBuffer = null;
+  }
+
+  resource.hasTangents = !!hasTangents && tangents.length === safeVertexCount * 4;
+  if (resource.hasTangents) {
+    if (!resource.tangentBuffer) resource.tangentBuffer = gl.createBuffer();
+    bindArrayBufferCached(host, resource.tangentBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, tangents, gl.STATIC_DRAW);
+  } else if (resource.tangentBuffer) {
+    gl.deleteBuffer(resource.tangentBuffer);
+    resource.tangentBuffer = null;
+  }
+
+  resource.hasColors = !!hasColors && colors0.length === safeVertexCount * 4;
+  if (resource.hasColors) {
+    if (!resource.colorBuffer) resource.colorBuffer = gl.createBuffer();
+    bindArrayBufferCached(host, resource.colorBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, colors0, gl.STATIC_DRAW);
+  } else if (resource.colorBuffer) {
+    gl.deleteBuffer(resource.colorBuffer);
+    resource.colorBuffer = null;
+  }
+
+  resource.hasMaterialSlots = !!hasMaterialSlots && materialSlots.length === safeVertexCount;
+  if (resource.hasMaterialSlots) {
+    if (!resource.materialSlotBuffer) resource.materialSlotBuffer = gl.createBuffer();
+    bindArrayBufferCached(host, resource.materialSlotBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, materialSlots, gl.STATIC_DRAW);
+  } else if (resource.materialSlotBuffer) {
+    gl.deleteBuffer(resource.materialSlotBuffer);
+    resource.materialSlotBuffer = null;
+  }
+
+  resource.hasSkinWeights = !!hasSkinWeights && boneIndices.length === safeVertexCount * 4 && boneWeights.length === safeVertexCount * 4;
+  if (resource.hasSkinWeights) {
+    if (!resource.boneIndexBuffer) resource.boneIndexBuffer = gl.createBuffer();
+    if (!resource.boneWeightBuffer) resource.boneWeightBuffer = gl.createBuffer();
+    bindArrayBufferCached(host, resource.boneIndexBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, boneIndices, gl.STATIC_DRAW);
+    bindArrayBufferCached(host, resource.boneWeightBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, boneWeights, gl.STATIC_DRAW);
+  } else {
+    if (resource.boneIndexBuffer) gl.deleteBuffer(resource.boneIndexBuffer);
+    if (resource.boneWeightBuffer) gl.deleteBuffer(resource.boneWeightBuffer);
+    resource.boneIndexBuffer = null;
+    resource.boneWeightBuffer = null;
+  }
+
+  if (indices instanceof Uint32Array) {
     if (!host.elementIndexUintExt) throw new Error('Mesh ' + meshId + ' requires 32-bit indices, but OES_element_index_uint is unavailable.');
-    indexArray = new Uint32Array(indices);
     resource.indexType = gl.UNSIGNED_INT;
   } else {
-    indexArray = new Uint16Array(indices);
     resource.indexType = gl.UNSIGNED_SHORT;
   }
-  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, resource.indexBuffer);
-  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indexArray, gl.STATIC_DRAW);
-  resource.indexCount = indices.length;
-  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, resource.wireframeIndexBuffer);
-  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(wireframeIndices.filter(i => i <= 65535)), gl.STATIC_DRAW);
-  resource.wireframeIndexCount = wireframeIndices.length;
-  gl.bindBuffer(gl.ARRAY_BUFFER, null);
-  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
+  bindElementArrayBufferCached(host, resource.indexBuffer);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+  resource.indexCount = Math.max(0, indexCount | 0) || indices.length;
+
+  if (wireframeIndices && wireframeIndices.length > 0) {
+    if (!resource.wireframeIndexBuffer) resource.wireframeIndexBuffer = gl.createBuffer();
+    const safeWireframe = wireframeIndices instanceof Uint16Array ? wireframeIndices : new Uint16Array(Array.from(wireframeIndices).filter(i => i <= 65535));
+    bindElementArrayBufferCached(host, resource.wireframeIndexBuffer);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, safeWireframe, gl.STATIC_DRAW);
+    resource.wireframeIndexCount = safeWireframe.length;
+  } else {
+    if (resource.wireframeIndexBuffer) gl.deleteBuffer(resource.wireframeIndexBuffer);
+    resource.wireframeIndexBuffer = null;
+    resource.wireframeIndexCount = 0;
+  }
+
+  rebuildMeshVao(host, resource);
+  bindArrayBufferCached(host, null);
+  bindElementArrayBufferCached(host, null);
+}
+
+function decodeIndexPayload(payload, elementSize) {
+  const bytes = toUint8Array(payload);
+  if (bytes.byteLength === 0) return new Uint16Array(0);
+  if ((elementSize | 0) === 4) {
+    if ((bytes.byteOffset & 3) === 0 && (bytes.byteLength & 3) === 0) return new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
+    const copy = new Uint8Array(bytes.byteLength); copy.set(bytes); return new Uint32Array(copy.buffer);
+  }
+  if ((bytes.byteOffset & 1) === 0 && (bytes.byteLength & 1) === 0) return new Uint16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
+  const copy = new Uint8Array(bytes.byteLength); copy.set(bytes); return new Uint16Array(copy.buffer);
+}
+
+function maxArrayValue(values) {
+  let max = 0;
+  for (let i = 0; i < values.length; i++) if (values[i] > max) max = values[i];
+  return max;
+}
+
+function createDefaultNormalsTyped(vertexCount) {
+  const normals = new Float32Array(Math.max(0, vertexCount) * 3);
+  for (let i = 0; i < normals.length; i += 3) normals[i + 2] = 1;
+  return normals;
 }
 
 function createDefaultNormals(vertexCount) {
@@ -763,6 +1052,11 @@ function expectedRgbaByteCount(width, height) {
   return w * h * 4;
 }
 
+function isPowerOfTwo(value) {
+  const v = value | 0;
+  return v > 0 && (v & (v - 1)) === 0;
+}
+
 function coerceRgbaPayload(host, payload, width, height, kind) {
   const expected = expectedRgbaByteCount(width, height);
   const source = typeof payload === 'string' ? decodeBase64Bytes(payload) : toUint8Array(payload);
@@ -814,12 +1108,28 @@ function getOrCreateRetainedBatch(host, batchId) {
       transformBuffer: gl.createBuffer(),
       stateBuffer: gl.createBuffer(),
       baseTransformData: new Float32Array(0),
+      baseStateData: new Float32Array(0),
+      visibleTransformData: new Float32Array(0),
+      visibleStateData: new Float32Array(0),
+      culledTransformBuffer: null,
+      culledStateBuffer: null,
       animatedTransformData: new Float32Array(0),
       animationFrameId: -1,
       animationActive: false,
       paletteTexture: null,
       paletteWidth: 1,
-      paletteHeight: 1
+      paletteHeight: 1,
+      normalMapStrength: 0,
+      baseColorTextureId: '',
+      normalTextureId: '',
+      metallicRoughnessTextureId: '',
+      emissiveTextureId: '',
+      metallic: 0,
+      roughness: 1,
+      alphaCutoff: 0,
+      transparent: false,
+      emissiveColor: [0, 0, 0, 0],
+      materialTextureKey: ''
     };
     host.retainedBatches.set(batchId, batch);
     host.retainedBatchIdToIndex.set(batchId, batch.batchIndex);
@@ -828,7 +1138,7 @@ function getOrCreateRetainedBatch(host, batchId) {
   return batch;
 }
 
-export function uploadRetainedBatchTransforms(hostId, batchId, meshId, lightingEnabled, usePalette, instanceCount, transformFloatsBase64) {
+function uploadRetainedBatchTransforms(hostId, batchId, meshId, lightingEnabled, usePalette, instanceCount, transformFloatsBase64) {
   const host = hosts.get(hostId);
   if (!host) return;
   const { gl } = host;
@@ -843,9 +1153,9 @@ export function uploadRetainedBatchTransforms(hostId, batchId, meshId, lightingE
   batch.animatedTransformData = new Float32Array(batch.baseTransformData.length);
   batch.animationFrameId = -1;
   batch.animationActive = false;
-  gl.bindBuffer(gl.ARRAY_BUFFER, batch.transformBuffer);
+  bindArrayBufferCached(host, batch.transformBuffer);
   gl.bufferData(gl.ARRAY_BUFFER, batch.baseTransformData, gl.DYNAMIC_DRAW);
-  gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  bindArrayBufferCached(host, null);
 }
 
 
@@ -854,7 +1164,7 @@ export function uploadRetainedBatchTransformsBytes(hostId, batchId, meshId, ligh
   uploadRetainedBatchTransforms(hostId, batchId, meshId, lightingEnabled, usePalette, instanceCount, transformBytes);
 }
 
-export function uploadRetainedBatchTransformsRange(hostId, batchId, startInstance, transformFloatsBase64) {
+function uploadRetainedBatchTransformsRange(hostId, batchId, startInstance, transformFloatsBase64) {
   const host = hosts.get(hostId);
   if (!host) return;
   const batch = host.retainedBatches.get(batchId);
@@ -867,35 +1177,37 @@ export function uploadRetainedBatchTransformsRange(hostId, batchId, startInstanc
   }
   const { gl } = host;
   if (!batch.animationActive) {
-    gl.bindBuffer(gl.ARRAY_BUFFER, batch.transformBuffer);
+    bindArrayBufferCached(host, batch.transformBuffer);
     gl.bufferSubData(gl.ARRAY_BUFFER, offsetFloats * 4, transforms);
-    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    bindArrayBufferCached(host, null);
   }
 }
 
-export function uploadRetainedBatchState(hostId, batchId, usePalette, paletteWidth, paletteHeight, stateFloatsBase64, paletteRgbaBase64) {
+function uploadRetainedBatchState(hostId, batchId, usePalette, paletteWidth, paletteHeight, stateFloatsBase64, paletteRgbaBase64) {
   const host = hosts.get(hostId);
   if (!host) return;
   const { gl } = host;
   const batch = getOrCreateRetainedBatch(host, batchId);
   batch.usePalette = !!usePalette;
   const states = decodeFloat32Payload(stateFloatsBase64);
-  gl.bindBuffer(gl.ARRAY_BUFFER, batch.stateBuffer);
-  gl.bufferData(gl.ARRAY_BUFFER, states, gl.DYNAMIC_DRAW);
-  gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  batch.baseStateData = new Float32Array(states);
+  bindArrayBufferCached(host, batch.stateBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, batch.baseStateData, gl.DYNAMIC_DRAW);
+  bindArrayBufferCached(host, null);
   if (batch.usePalette && hasNonEmptyPayload(paletteRgbaBase64)) {
     if (!batch.paletteTexture) batch.paletteTexture = gl.createTexture();
     batch.paletteWidth = Math.max(1, paletteWidth || 1);
     batch.paletteHeight = Math.max(1, paletteHeight || 1);
     const rgbaBytes = coerceRgbaPayload(host, paletteRgbaBase64, batch.paletteWidth, batch.paletteHeight, 'palette');
-    gl.bindTexture(gl.TEXTURE_2D, batch.paletteTexture);
+    bindTexture2DCached(host, 0, batch.paletteTexture);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, batch.paletteWidth, batch.paletteHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgbaBytes);
-    gl.bindTexture(gl.TEXTURE_2D, null);
+    bindTexture2DCached(host, 0, null);
+  resetTextureBindCache(host);
   }
 }
 
@@ -904,21 +1216,57 @@ export function uploadRetainedBatchStateBytes(hostId, batchId, usePalette, palet
   uploadRetainedBatchState(hostId, batchId, usePalette, paletteWidth, paletteHeight, stateBytes, paletteRgbaBytes);
 }
 
+export function uploadRetainedBatchMaterial(
+  hostId,
+  batchId,
+  normalMapStrength,
+  baseColorTextureId,
+  normalTextureId,
+  metallicRoughnessTextureId,
+  emissiveTextureId,
+  metallic,
+  roughness,
+  alphaCutoff,
+  transparent,
+  emissiveR,
+  emissiveG,
+  emissiveB,
+  emissiveA) {
+  const host = hosts.get(hostId);
+  if (!host) return;
+  const batch = getOrCreateRetainedBatch(host, batchId);
+  batch.normalMapStrength = normalMapStrength || 0;
+  batch.baseColorTextureId = baseColorTextureId || '';
+  batch.normalTextureId = normalTextureId || '';
+  batch.metallicRoughnessTextureId = metallicRoughnessTextureId || '';
+  batch.emissiveTextureId = emissiveTextureId || '';
+  batch.materialTextureKey = (batch.baseColorTextureId || '') + '|' + (batch.normalTextureId || '') + '|' + (batch.metallicRoughnessTextureId || '') + '|' + (batch.emissiveTextureId || '');
+  batch.metallic = metallic || 0;
+  batch.roughness = roughness || 1;
+  batch.alphaCutoff = alphaCutoff || 0;
+  batch.transparent = !!transparent;
+  batch.emissiveColor = [emissiveR || 0, emissiveG || 0, emissiveB || 0, emissiveA || 0];
+}
+
 export function uploadRetainedBatchTransformsRangeBytes(hostId, batchId, startInstance, transformBytes) {
   uploadRetainedBatchTransformsRange(hostId, batchId, startInstance, transformBytes);
 }
 
-export function uploadRetainedBatchStateRange(hostId, batchId, startInstance, stateFloatsBase64) {
+function uploadRetainedBatchStateRange(hostId, batchId, startInstance, stateFloatsBase64) {
   const host = hosts.get(hostId);
   if (!host) return;
   const batch = host.retainedBatches.get(batchId);
   if (!batch || !batch.stateBuffer) return;
   const states = decodeFloat32Payload(stateFloatsBase64);
   if (states.length === 0) return;
+  const offsetFloats = Math.max(0, startInstance | 0) * 4;
+  if (batch.baseStateData && batch.baseStateData.length >= offsetFloats + states.length) {
+    batch.baseStateData.set(states, offsetFloats);
+  }
   const { gl } = host;
-  gl.bindBuffer(gl.ARRAY_BUFFER, batch.stateBuffer);
-  gl.bufferSubData(gl.ARRAY_BUFFER, Math.max(0, startInstance | 0) * 16, states);
-  gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  bindArrayBufferCached(host, batch.stateBuffer);
+  gl.bufferSubData(gl.ARRAY_BUFFER, offsetFloats * 4, states);
+  bindArrayBufferCached(host, null);
 }
 
 
@@ -942,6 +1290,8 @@ export function destroyRetainedBatch(hostId, batchId) {
   const { gl } = host;
   gl.deleteBuffer(batch.transformBuffer);
   gl.deleteBuffer(batch.stateBuffer);
+  if (batch.culledTransformBuffer) gl.deleteBuffer(batch.culledTransformBuffer);
+  if (batch.culledStateBuffer) gl.deleteBuffer(batch.culledStateBuffer);
   if (batch.paletteTexture) gl.deleteTexture(batch.paletteTexture);
   removeRetainedBatchFromIndexTables(host, batch);
   host.retainedBatches.delete(batchId);
@@ -956,117 +1306,818 @@ export function clearRetainedBatches(hostId) {
 function drawSkybox(host, packet) {
   if (!packet.skyboxEnabled || !host.skyboxProgram) return;
   const { gl } = host;
-  gl.useProgram(host.skyboxProgram);
-  gl.disable(gl.DEPTH_TEST);
-  gl.depthMask(false);
-  gl.uniform3fv(host.skyboxTopColorLocation, new Float32Array(packet.skyboxTopColor || [0.28, 0.45, 0.72]));
-  gl.uniform3fv(host.skyboxHorizonColorLocation, new Float32Array(packet.skyboxHorizonColor || [0.62, 0.76, 0.94]));
-  gl.uniform3fv(host.skyboxBottomColorLocation, new Float32Array(packet.skyboxBottomColor || [0.82, 0.86, 0.90]));
-  gl.uniform1f(host.skyboxIntensityLocation, packet.skyboxIntensity || 1.0);
-  gl.uniform1i(host.skyboxModeLocation, packet.skyboxMode || 2);
-  gl.uniform3fv(host.skyboxCameraRightLocation, new Float32Array(packet.cameraRight || [1, 0, 0]));
-  gl.uniform3fv(host.skyboxCameraUpLocation, new Float32Array(packet.cameraUp || [0, 1, 0]));
-  gl.uniform3fv(host.skyboxCameraForwardLocation, new Float32Array(packet.cameraForward || [0, 0, -1]));
+  useProgramCached(host, host.skyboxProgram);
+  setDepthTestCached(host, false);
+  setDepthMaskCached(host, false);
+  uniform3fvFromArray(host, host.skyboxTopColorLocation, host.scratch3, packet.skyboxTopColor, [0.28, 0.45, 0.72]);
+  uniform3fvFromArray(host, host.skyboxHorizonColorLocation, host.scratch3, packet.skyboxHorizonColor, [0.62, 0.76, 0.94]);
+  uniform3fvFromArray(host, host.skyboxBottomColorLocation, host.scratch3, packet.skyboxBottomColor, [0.82, 0.86, 0.90]);
+  uniform1fCached(host, host.skyboxIntensityLocation, packet.skyboxIntensity || 1.0);
+  uniform1iCached(host, host.skyboxModeLocation, packet.skyboxMode || 2);
+  uniform3fvFromArray(host, host.skyboxCameraRightLocation, host.scratch3, packet.cameraRight, [1, 0, 0]);
+  uniform3fvFromArray(host, host.skyboxCameraUpLocation, host.scratch3, packet.cameraUp, [0, 1, 0]);
+  uniform3fvFromArray(host, host.skyboxCameraForwardLocation, host.scratch3, packet.cameraForward, [0, 0, -1]);
   bindTextureSlot(host, packet.skyboxTextureId || null, host.skyboxTextureLocation, host.skyboxTextureEnabledLocation, gl.TEXTURE0, 0);
   if ((packet.skyboxMode | 0) === 3) bindSkyboxCubemapTextures(host, packet.skyboxCubemapTextureIds || []);
-  else if (host.skyboxCubemapEnabledLocation !== null) gl.uniform1f(host.skyboxCubemapEnabledLocation, 0);
-  gl.bindBuffer(gl.ARRAY_BUFFER, host.skyboxVertexBuffer);
+  else uniform1fCached(host, host.skyboxCubemapEnabledLocation, 0);
+  bindArrayBufferCached(host, host.skyboxVertexBuffer);
   gl.enableVertexAttribArray(host.skyboxPositionLocation);
   gl.vertexAttribPointer(host.skyboxPositionLocation, 2, gl.FLOAT, false, 0, 0);
-  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, host.quadIndexBuffer);
+  bindElementArrayBufferCached(host, host.quadIndexBuffer);
   gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
-  gl.depthMask(true);
-  gl.enable(gl.DEPTH_TEST);
+  setDepthMaskCached(host, true);
+  setDepthTestCached(host, true);
 }
 
-export function renderScene(hostId, packetJson) {
+function copyToScratch(target, source, count) {
+  const src = source || [];
+  for (let i = 0; i < count; i++) target[i] = src[i] || 0;
+  return target;
+}
+
+function getUniformCache(gl) {
+  let cache = uniformCacheByContext.get(gl);
+  if (!cache) {
+    cache = new Map();
+    uniformCacheByContext.set(gl, cache);
+  }
+  return cache;
+}
+
+function uniform3fvFromArray(host, location, scratch, source, fallback) {
+  const { gl } = host;
+  if (location === null || location === undefined) return;
+  const src = source || fallback;
+  const x = src[0] || 0;
+  const y = src[1] || 0;
+  const z = src[2] || 0;
+  const cache = getUniformCache(gl);
+  const last = cache.get(location);
+  if (last && last.length === 3 && last[0] === x && last[1] === y && last[2] === z) return;
+  scratch[0] = x; scratch[1] = y; scratch[2] = z;
+  gl.uniform3fv(location, scratch);
+  if (host.glState) host.glState.uniformUpdates++;
+  if (last) { last[0] = x; last[1] = y; last[2] = z; }
+  else cache.set(location, [x, y, z]);
+}
+
+function uniform4fvFromArray(host, location, scratch, source, fallback) {
+  const { gl } = host;
+  if (location === null || location === undefined) return;
+  const src = source || fallback;
+  const x = src[0] || 0;
+  const y = src[1] || 0;
+  const z = src[2] || 0;
+  const w = src[3] || 0;
+  const cache = getUniformCache(gl);
+  const last = cache.get(location);
+  if (last && last.length === 4 && last[0] === x && last[1] === y && last[2] === z && last[3] === w) return;
+  scratch[0] = x; scratch[1] = y; scratch[2] = z; scratch[3] = w;
+  gl.uniform4fv(location, scratch);
+  if (host.glState) host.glState.uniformUpdates++;
+  if (last) { last[0] = x; last[1] = y; last[2] = z; last[3] = w; }
+  else cache.set(location, [x, y, z, w]);
+}
+
+export function isGpuSkinningSupported(hostId) {
+  const host = hosts.get(hostId);
+  if (!host) return false;
+  return !!host.gpuSkinningSupported;
+}
+
+export function uploadRetainedBatchSkinningBytes(hostId, batchId, enabled, boneCount, boneMatrixBytes) {
   const host = hosts.get(hostId);
   if (!host) return;
-  const packet = JSON.parse(packetJson);
+  const { gl } = host;
+  const batch = getOrCreateRetainedBatch(host, batchId);
+  if (!enabled || !host.gpuSkinningSupported || boneCount <= 0) {
+    batch.skinningEnabled = false;
+    batch.boneCount = 0;
+    return;
+  }
+
+  const matrices = decodeFloat32Payload(boneMatrixBytes);
+  const expected = (boneCount | 0) * 16;
+  if (matrices.length < expected) {
+    batch.skinningEnabled = false;
+    batch.boneCount = 0;
+    return;
+  }
+
+  if (!batch.boneTexture) batch.boneTexture = gl.createTexture();
+  bindTexture2DCached(host, 0, batch.boneTexture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  const upload = matrices.length === expected ? matrices : matrices.subarray(0, expected);
+  const internalFormat = host.isWebGl2 && gl.RGBA32F ? gl.RGBA32F : gl.RGBA;
+  gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, 4, boneCount | 0, 0, gl.RGBA, gl.FLOAT, upload);
+  bindTexture2DCached(host, 0, null);
+  resetTextureBindCache(host);
+  batch.skinningEnabled = true;
+  batch.boneCount = boneCount | 0;
+}
+
+const HIGH_SCALE_COMMAND_PREFIX = '__hs64:';
+
+function decodeHighScaleCommandLayerId(id) {
+  const text = String(id || '');
+  if (!text.startsWith(HIGH_SCALE_COMMAND_PREFIX)) return null;
+  const payload = text.substring(HIGH_SCALE_COMMAND_PREFIX.length);
+  if (!payload) return '';
+  try {
+    const binary = atob(payload);
+    try { return decodeURIComponent(escape(binary)); } catch (_) { return binary; }
+  } catch (_) {
+    return '';
+  }
+}
+
+function isHighScaleCommandRef(ref) {
+  return !!ref && ref.kind === 'highScaleLayer';
+}
+
+export function setRetainedDrawOrder(hostId, drawOrder) {
+  const host = hosts.get(hostId);
+  if (!host) return;
+  if (!drawOrder) { host.retainedDrawOrder = []; return; }
+  const lines = String(drawOrder).split('\n');
+  const refs = [];
+  for (const line of lines) {
+    if (!line) continue;
+    const sep = line.lastIndexOf('|');
+    const id = sep < 0 ? line : line.substring(0, sep);
+    const layerId = decodeHighScaleCommandLayerId(id);
+    if (layerId !== null) {
+      refs.push({ id, kind: 'highScaleLayer', layerId, transparent: false });
+    } else {
+      refs.push({ id, transparent: sep >= 0 && line.substring(sep + 1) === '1' });
+    }
+  }
+  host.retainedDrawOrder = refs;
+}
+
+export function setRetainedControlPlanesDirect(hostId, controlPlaneIds, count, planeBytes) {
+  const host = hosts.get(hostId);
+  if (!host) return;
+  const safeCount = Math.max(0, count | 0);
+  if (safeCount === 0) {
+    host.controlPlanes = [];
+    host.controlPlaneDrawList = [];
+    return;
+  }
+  const ids = controlPlaneIds ? String(controlPlaneIds).split('\n') : [];
+  const records = decodeFloat32Payload(planeBytes);
+  const planes = new Array(safeCount);
+  for (let i = 0; i < safeCount; i++) {
+    const id = ids[i] || ('control:' + i);
+    const offset = i * 20;
+    const source = new Float32Array(20);
+    if (records.length >= offset + 20) source.set(records.subarray(offset, offset + 20));
+    planes[i] = {
+      id,
+      textureId: id,
+      source,
+      alwaysFaceCamera: (source[0] || 0) > 0.5,
+      vertices: new Float32Array(20),
+      verticesDirty: true,
+      averageDepth: 0
+    };
+  }
+  host.controlPlanes = planes;
+  host.controlPlaneDrawList = planes.slice();
+}
+
+function ensureRetainedDirectPacket(host) {
+  let p = host.retainedDirectFramePacket;
+  if (!p || !p.__direct) {
+    p = {
+      __direct: true,
+      width: 1,
+      height: 1,
+      clearColor: new Float32Array(4),
+      viewProjection: new Float32Array(16),
+      cameraPosition: new Float32Array(3),
+      cameraRight: new Float32Array(3),
+      cameraUp: new Float32Array(3),
+      cameraForward: new Float32Array(3),
+      ambientLight: new Float32Array(3),
+      directionalLightDirection: new Float32Array(3),
+      directionalLightColor: new Float32Array(3),
+      pointLightPosition: new Float32Array(4),
+      pointLightColor: new Float32Array(4),
+      spotLightPosition: new Float32Array(4),
+      spotLightDirection: new Float32Array(4),
+      spotLightColor: new Float32Array(4),
+      spotLightCone: new Float32Array(4),
+      skyboxTopColor: new Float32Array(3),
+      skyboxHorizonColor: new Float32Array(3),
+      skyboxBottomColor: new Float32Array(3),
+      toneMappingParams: new Float32Array(4),
+      ssaoParams: new Float32Array(4),
+      batches: host.emptyBatches || [],
+      retainedBatches: host.retainedDrawOrder || [],
+      controlPlanes: host.controlPlanes || [],
+      liveMeshIds: host.emptyBatches || [],
+      liveTextureIds: host.emptyBatches || []
+    };
+    host.retainedDirectFramePacket = p;
+  }
+  return p;
+}
+
+function set3(dest, src, offset, x, y, z) {
+  dest[0] = src.length > offset ? (src[offset] || 0) : x;
+  dest[1] = src.length > offset + 1 ? (src[offset + 1] || 0) : y;
+  dest[2] = src.length > offset + 2 ? (src[offset + 2] || 0) : z;
+}
+
+function set4(dest, src, offset, x, y, z, w) {
+  dest[0] = src.length > offset ? (src[offset] || 0) : x;
+  dest[1] = src.length > offset + 1 ? (src[offset + 1] || 0) : y;
+  dest[2] = src.length > offset + 2 ? (src[offset + 2] || 0) : z;
+  dest[3] = src.length > offset + 3 ? (src[offset + 3] || 0) : w;
+}
+
+export function renderRetainedSceneFrameDirect(
+  hostId,
+  width,
+  height,
+  flags,
+  skyboxMode,
+  toneMappingMode,
+  skyboxTextureId,
+  skyboxCubemapIds,
+  viewProjectionBytes,
+  cameraBytes,
+  lightingBytes,
+  styleBytes) {
+  const host = hosts.get(hostId);
+  if (!host || host.contextLost) return;
+  const view = decodeFloat32Payload(viewProjectionBytes);
+  const camera = decodeFloat32Payload(cameraBytes);
+  const lighting = decodeFloat32Payload(lightingBytes);
+  const style = decodeFloat32Payload(styleBytes);
+  const packet = ensureRetainedDirectPacket(host);
+  packet.width = width || host.width || 1;
+  packet.height = height || host.height || 1;
+  packet.viewProjection.set(view.length >= 16 ? view.subarray(0, 16) : view);
+  set4(packet.clearColor, style, 0, 0, 0, 0, 1); if (packet.clearColor[3] === 0) packet.clearColor[3] = 1;
+  set3(packet.cameraPosition, camera, 0, 0, 0, 6);
+  set3(packet.cameraRight, camera, 3, 1, 0, 0);
+  set3(packet.cameraUp, camera, 6, 0, 1, 0);
+  set3(packet.cameraForward, camera, 9, 0, 0, -1);
+  set3(packet.ambientLight, lighting, 0, 0, 0, 0);
+  set3(packet.directionalLightDirection, lighting, 3, -0.35, -0.75, -0.55);
+  set3(packet.directionalLightColor, lighting, 6, 0, 0, 0);
+  set4(packet.pointLightPosition, lighting, 9, 0, 0, 0, 1);
+  set4(packet.pointLightColor, lighting, 13, 0, 0, 0, 0);
+  set4(packet.spotLightPosition, lighting, 17, 0, 0, 0, 1);
+  set4(packet.spotLightDirection, lighting, 21, 0, -1, 0, 0);
+  set4(packet.spotLightColor, lighting, 25, 0, 0, 0, 0);
+  set4(packet.spotLightCone, lighting, 29, 0.95, 0.85, 1, 0);
+  packet.skyboxEnabled = (flags & 1) !== 0;
+  packet.skyboxMode = skyboxMode || 0;
+  set3(packet.skyboxTopColor, style, 4, 0.28, 0.45, 0.72);
+  set3(packet.skyboxHorizonColor, style, 7, 0.62, 0.76, 0.94);
+  set3(packet.skyboxBottomColor, style, 10, 0.82, 0.86, 0.9);
+  packet.skyboxIntensity = style[13] || 1;
+  packet.skyboxTextureId = skyboxTextureId || null;
+  const cubeKey = skyboxCubemapIds || '';
+  if (host.retainedCubemapIdsKey !== cubeKey) {
+    host.retainedCubemapIdsKey = cubeKey;
+    host.retainedCubemapIds = cubeKey ? String(cubeKey).split('\n') : [];
+  }
+  packet.skyboxCubemapTextureIds = host.retainedCubemapIds;
+  packet.ssaoEnabled = (flags & 2) !== 0;
+  packet.hdrEnabled = (flags & 4) !== 0;
+  packet.showWireframeOverlay = (flags & 8) !== 0;
+  packet.showSilhouetteOverlay = (flags & 16) !== 0;
+  packet.toneMappingMode = toneMappingMode || 0;
+  packet.toneMappingParams[0] = style[14] || 1; packet.toneMappingParams[1] = style[15] || 2.2; packet.toneMappingParams[2] = 0; packet.toneMappingParams[3] = 0;
+  packet.ssaoParams[0] = style[16] || 0; packet.ssaoParams[1] = style[17] || 0.75; packet.ssaoParams[2] = style[18] || 0.025; packet.ssaoParams[3] = style[19] || 16;
+  packet.retainedBatches = host.retainedDrawOrder || packet.retainedBatches;
+  packet.controlPlanes = host.controlPlanes || packet.controlPlanes;
+  renderScenePacket(host, packet, false);
+}
+
+function nextBufferCapacity(byteCount) {
+  let capacity = 256;
+  const required = Math.max(0, byteCount | 0);
+  while (capacity < required) capacity <<= 1;
+  return capacity;
+}
+
+export function uploadRetainedParticleBatchBytes(hostId, batchId, meshId, lightingEnabled, cubeMode, instanceCount, particleFloatCount, transparent, particleBytes) {
+  const host = hosts.get(hostId);
+  if (!host) return;
+  const { gl } = host;
+  const batch = getOrCreateRetainedBatch(host, batchId);
+  batch.meshId = meshId;
+  batch.meshIndex = host.meshIdToIndex.has(meshId) ? host.meshIdToIndex.get(meshId) : -1;
+  batch.lightingEnabled = lightingEnabled || 0;
+  batch.instanceCount = instanceCount || 0;
+  batch.transparent = !!transparent;
+  batch.usePalette = false;
+  batch.particleMode = cubeMode ? 2 : 1;
+  batch.particleStride = cubeMode ? 20 : 8;
+  if (!batch.particleBuffer) batch.particleBuffer = gl.createBuffer();
+  const data = decodeFloat32Payload(particleBytes);
+  const floatCount = Math.max(0, particleFloatCount | 0);
+  const uploadData = floatCount > 0 && data.length > floatCount ? data.subarray(0, floatCount) : data;
+  bindArrayBufferCached(host, batch.particleBuffer);
+  const activeBytes = uploadData.byteLength || 0;
+  if (!batch.particleBufferCapacityBytes || batch.particleBufferCapacityBytes < activeBytes) {
+    batch.particleBufferCapacityBytes = nextBufferCapacity(activeBytes);
+    gl.bufferData(gl.ARRAY_BUFFER, batch.particleBufferCapacityBytes, gl.DYNAMIC_DRAW);
+  }
+  if (activeBytes > 0) gl.bufferSubData(gl.ARRAY_BUFFER, 0, uploadData);
+  bindArrayBufferCached(host, null);
+}
+
+export function consumeContextResetFlag(hostId) {
+  const host = hosts.get(hostId);
+  if (!host) return false;
+  const pending = !!host.contextResetPending;
+  host.contextResetPending = false;
+  return pending;
+}
+
+function applyFramePacket(packet, frame) {
+  packet.width = frame.width;
+  packet.height = frame.height;
+  packet.clearColor = frame.clearColor;
+  packet.viewProjection = frame.viewProjection;
+  packet.cameraPosition = frame.cameraPosition;
+  packet.cameraRight = frame.cameraRight;
+  packet.cameraUp = frame.cameraUp;
+  packet.cameraForward = frame.cameraForward;
+  packet.ambientLight = frame.ambientLight;
+  packet.directionalLightDirection = frame.directionalLightDirection;
+  packet.directionalLightColor = frame.directionalLightColor;
+  packet.pointLightPosition = frame.pointLightPosition;
+  packet.pointLightColor = frame.pointLightColor;
+  packet.spotLightPosition = frame.spotLightPosition;
+  packet.spotLightDirection = frame.spotLightDirection;
+  packet.spotLightColor = frame.spotLightColor;
+  packet.spotLightCone = frame.spotLightCone;
+  packet.skyboxEnabled = frame.skyboxEnabled;
+  packet.skyboxMode = frame.skyboxMode;
+  packet.skyboxTopColor = frame.skyboxTopColor;
+  packet.skyboxHorizonColor = frame.skyboxHorizonColor;
+  packet.skyboxBottomColor = frame.skyboxBottomColor;
+  packet.skyboxIntensity = frame.skyboxIntensity;
+  packet.skyboxTextureId = frame.skyboxTextureId;
+  packet.skyboxCubemapTextureIds = frame.skyboxCubemapTextureIds;
+  packet.directionalShadowEnabled = frame.directionalShadowEnabled;
+  packet.directionalShadowResolution = frame.directionalShadowResolution;
+  packet.directionalShadowStrength = frame.directionalShadowStrength;
+  packet.directionalShadowBias = frame.directionalShadowBias;
+  packet.directionalShadowReason = frame.directionalShadowReason;
+  packet.directionalShadowLightViewProjection = frame.directionalShadowLightViewProjection;
+  packet.renderPipelineMode = frame.renderPipelineMode;
+  packet.deferredRequested = frame.deferredRequested;
+  packet.ssaoEnabled = frame.ssaoEnabled;
+  packet.ssaoParams = frame.ssaoParams;
+  packet.hdrEnabled = frame.hdrEnabled;
+  packet.toneMappingMode = frame.toneMappingMode;
+  packet.toneMappingParams = frame.toneMappingParams;
+  packet.motionVectorMetadataEnabled = frame.motionVectorMetadataEnabled;
+  packet.showWireframeOverlay = frame.showWireframeOverlay;
+  packet.showSilhouetteOverlay = frame.showSilhouetteOverlay;
+}
+
+function renderScenePacket(host, packet, cleanupLiveResources) {
+  resetWebGlFrameCounters(host);
   const { gl } = host;
   const batches = packet.batches || [];
   const retainedRefs = packet.retainedBatches || [];
   host.showWireframeOverlay = !!packet.showWireframeOverlay;
   host.showSilhouetteOverlay = !!packet.showSilhouetteOverlay;
-  const viewProj = new Float32Array(packet.viewProjection);
-  const liveMeshIds = Array.isArray(packet.liveMeshIds) ? new Set(packet.liveMeshIds) : new Set(batches.map(batch => batch.id));
-  if (!Array.isArray(packet.liveMeshIds)) {
-    for (const ref of retainedRefs) { const rb = host.retainedBatches.get(ref.id); if (rb && rb.meshId) liveMeshIds.add(rb.meshId); }
+  const viewProj = copyToScratch(host.frameViewProjection, packet.viewProjection, 16);
+  if (cleanupLiveResources) {
+    const liveMeshIds = Array.isArray(packet.liveMeshIds) ? new Set(packet.liveMeshIds) : new Set(batches.map(batch => batch.id));
+    if (!Array.isArray(packet.liveMeshIds)) {
+      for (const ref of retainedRefs) { const rb = host.retainedBatches.get(ref.id); if (rb && rb.meshId) liveMeshIds.add(rb.meshId); }
+    }
+    let removedMeshResource = false;
+    for (const [id, resource] of Array.from(host.meshResources.entries())) {
+      if (!liveMeshIds.has(id)) {
+        disposeMeshResource(gl, resource);
+        host.meshResources.delete(id);
+        const index = host.meshResourceList.indexOf(resource);
+        if (index >= 0) host.meshResourceList.splice(index, 1);
+        removedMeshResource = true;
+      }
+    }
+    if (removedMeshResource) rebuildMeshIndex(host);
+    const liveControlIds = new Set(packet.controlPlanes.map(plane => plane.id));
+    const liveTextureIds = Array.isArray(packet.liveTextureIds) ? new Set(packet.liveTextureIds) : new Set(packet.controlPlanes.map(plane => plane.textureId));
+    for (const [id, buffer] of host.controlVertexBuffers.entries()) if (!liveControlIds.has(id)) { gl.deleteBuffer(buffer); host.controlVertexBuffers.delete(id); }
+    for (const [id, texture] of host.textureResources.entries()) if (!liveTextureIds.has(id)) { gl.deleteTexture(texture.texture); host.textureResources.delete(id); }
   }
-  for (const [id, resource] of host.meshResources.entries()) {
-    if (!liveMeshIds.has(id)) { gl.deleteBuffer(resource.vertexBuffer); gl.deleteBuffer(resource.normalBuffer); gl.deleteBuffer(resource.texCoordBuffer); gl.deleteBuffer(resource.tangentBuffer); gl.deleteBuffer(resource.materialSlotBuffer); gl.deleteBuffer(resource.indexBuffer); gl.deleteBuffer(resource.wireframeIndexBuffer); host.meshResources.delete(id); }
-  }
-  const liveControlIds = new Set(packet.controlPlanes.map(plane => plane.id));
-  const liveTextureIds = Array.isArray(packet.liveTextureIds) ? new Set(packet.liveTextureIds) : new Set(packet.controlPlanes.map(plane => plane.textureId));
-  for (const [id, buffer] of host.controlVertexBuffers.entries()) if (!liveControlIds.has(id)) { gl.deleteBuffer(buffer); host.controlVertexBuffers.delete(id); }
-  for (const [id, texture] of host.textureResources.entries()) if (!liveTextureIds.has(id)) { gl.deleteTexture(texture.texture); host.textureResources.delete(id); }
+
 
   gl.viewport(0, 0, host.width || 1, host.height || 1);
-  gl.enable(gl.DEPTH_TEST);
-  gl.depthFunc(gl.LEQUAL);
+  setDepthTestCached(host, true);
+  setDepthFuncCached(host, gl.LEQUAL);
   gl.clearColor(packet.clearColor[0], packet.clearColor[1], packet.clearColor[2], packet.clearColor[3]);
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
   drawSkybox(host, packet);
 
-  gl.disable(gl.BLEND);
-  gl.useProgram(host.meshProgram);
-  gl.uniform3fv(host.meshAmbientLightLocation, new Float32Array(packet.ambientLight || [0.28, 0.28, 0.28]));
-  gl.uniform3fv(host.meshDirectionalLightDirectionLocation, new Float32Array(packet.directionalLightDirection || [-0.35, -0.75, -0.55]));
-  gl.uniform3fv(host.meshDirectionalLightColorLocation, new Float32Array(packet.directionalLightColor || [0, 0, 0]));
-  gl.uniform4fv(host.meshPointLightPositionLocation, new Float32Array(packet.pointLightPosition || [0, 0, 0, 1]));
-  gl.uniform4fv(host.meshPointLightColorLocation, new Float32Array(packet.pointLightColor || [0, 0, 0, 0]));
-  gl.uniform4fv(host.meshSpotLightPositionLocation, new Float32Array(packet.spotLightPosition || [0, 0, 0, 1]));
-  gl.uniform4fv(host.meshSpotLightDirectionLocation, new Float32Array(packet.spotLightDirection || [0, -1, 0, 0]));
-  gl.uniform4fv(host.meshSpotLightColorLocation, new Float32Array(packet.spotLightColor || [0, 0, 0, 0]));
-  gl.uniform4fv(host.meshSpotLightConeLocation, new Float32Array(packet.spotLightCone || [0.95, 0.85, 1, 0]));
-  gl.uniform3fv(host.meshCameraPositionLocation, new Float32Array(packet.cameraPosition || [0, 0, 6]));
+  setBlendCached(host, false);
+  useProgramCached(host, host.meshProgram);
+  uniform3fvFromArray(host, host.meshAmbientLightLocation, host.scratch3, packet.ambientLight, [0.28, 0.28, 0.28]);
+  uniform3fvFromArray(host, host.meshDirectionalLightDirectionLocation, host.scratch3, packet.directionalLightDirection, [-0.35, -0.75, -0.55]);
+  uniform3fvFromArray(host, host.meshDirectionalLightColorLocation, host.scratch3, packet.directionalLightColor, [0, 0, 0]);
+  uniform4fvFromArray(host, host.meshPointLightPositionLocation, host.scratch4, packet.pointLightPosition, [0, 0, 0, 1]);
+  uniform4fvFromArray(host, host.meshPointLightColorLocation, host.scratch4, packet.pointLightColor, [0, 0, 0, 0]);
+  uniform4fvFromArray(host, host.meshSpotLightPositionLocation, host.scratch4, packet.spotLightPosition, [0, 0, 0, 1]);
+  uniform4fvFromArray(host, host.meshSpotLightDirectionLocation, host.scratch4, packet.spotLightDirection, [0, -1, 0, 0]);
+  uniform4fvFromArray(host, host.meshSpotLightColorLocation, host.scratch4, packet.spotLightColor, [0, 0, 0, 0]);
+  uniform4fvFromArray(host, host.meshSpotLightConeLocation, host.scratch4, packet.spotLightCone, [0.95, 0.85, 1, 0]);
+  uniform3fvFromArray(host, host.meshCameraPositionLocation, host.scratch3, packet.cameraPosition, [0, 0, 6]);
   if (host.meshPostProcessParamsLocation !== null) {
     const tone = packet.toneMappingParams || [1.0, 2.2, 0.0, 0.0];
     const mode = packet.toneMappingMode || 0;
-    gl.uniform4fv(host.meshPostProcessParamsLocation, new Float32Array([tone[0] || 1.0, tone[1] || 2.2, packet.hdrEnabled ? 1.0 : 0.0, mode]));
+    uniform4fCached(host, host.meshPostProcessParamsLocation, tone[0] || 1.0, tone[1] || 2.2, packet.hdrEnabled ? 1.0 : 0.0, mode);
   }
   if (host.meshSsaoParamsLocation !== null) {
     const ssao = packet.ssaoParams || [0.0, 0.75, 0.025, 16.0];
-    gl.uniform4fv(host.meshSsaoParamsLocation, new Float32Array([packet.ssaoEnabled ? 1.0 : 0.0, ssao[0] || 0.0, ssao[1] || 0.75, ssao[2] || 0.025]));
+    uniform4fCached(host, host.meshSsaoParamsLocation, packet.ssaoEnabled ? 1.0 : 0.0, ssao[0] || 0.0, ssao[1] || 0.75, ssao[2] || 0.025);
   }
-  gl.uniformMatrix4fv(host.meshViewProjLocation, false, viewProj);
+  uniformMatrix4fvCached(host, host.meshViewProjLocation, viewProj);
+  if (host.meshCameraRightUniformLocation !== null) uniform3fvFromArray(host, host.meshCameraRightUniformLocation, host.scratch3, packet.cameraRight, [1, 0, 0]);
+  if (host.meshCameraUpUniformLocation !== null) uniform3fvFromArray(host, host.meshCameraUpUniformLocation, host.scratch3, packet.cameraUp, [0, 1, 0]);
+  uniform1fCached(host, host.meshParticleModeLocation, 0);
   setClientAnimationUniforms(host, false, 0, 0);
 
-  for (const batch of batches) drawMeshBatch(host, batch);
-  for (const ref of retainedRefs) drawRetainedBatch(host, ref.id);
+  const hasHighScale = host.highScaleFramePacket && host.highScaleLayers && host.highScaleLayers.size > 0;
+  if (hasHighScale) beginHighScaleCommandFrame(host);
+
+  for (const batch of batches) if (!batch.transparent) drawMeshBatch(host, batch);
+  for (const ref of retainedRefs) if (!ref || !ref.transparent) drawRetainedCommandRef(host, ref, packet, viewProj);
+  for (const batch of batches) if (batch.transparent) drawMeshBatch(host, batch);
+  for (const ref of retainedRefs) if (ref && ref.transparent) drawRetainedCommandRef(host, ref, packet, viewProj);
+  if (hasHighScale) publishHighScaleCommandMetrics(host);
   drawControlPlanes(host, packet, viewProj);
 
-  gl.bindBuffer(gl.ARRAY_BUFFER, null);
-  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
-  gl.bindTexture(gl.TEXTURE_2D, null);
-  gl.useProgram(null);
+  bindVertexArrayCached(host, null);
+  bindArrayBufferCached(host, null);
+  bindElementArrayBufferCached(host, null);
+  bindTexture2DCached(host, 0, null);
+  resetTextureBindCache(host);
+  useProgramCached(host, null);
+}
+
+function beginHighScaleCommandFrame(host) {
+  host.frameId = (host.frameId || 0) + 1;
+  host.animationUploadBytes = 0;
+  host.animationUploadBatches = 0;
+  const metrics = host.highScaleCommandMetricsScratch || (host.highScaleCommandMetricsScratch = new Float64Array(20));
+  metrics.fill(0);
+  host.highScaleCommandMetricsUsed = false;
+}
+
+function accumulateHighScaleCommandMetrics(host, metrics) {
+  if (!metrics) return;
+  const aggregate = host.highScaleCommandMetricsScratch || (host.highScaleCommandMetricsScratch = new Float64Array(20));
+  for (let i = 0; i <= 14; i++) aggregate[i] += metrics[i] || 0;
+  aggregate[15] = Math.max(aggregate[15] || 0, metrics[15] || 0);
+  aggregate[18] = metrics[18] || 0;
+  aggregate[19] = metrics[19] || 0;
+  host.highScaleCommandMetricsUsed = true;
+}
+
+function publishHighScaleCommandMetrics(host) {
+  if (!host.highScaleCommandMetricsUsed) return;
+  const metrics = host.highScaleCommandMetricsScratch;
+  metrics[16] = host.animationUploadBatches || 0;
+  metrics[17] = host.animationUploadBytes || 0;
+  metrics[18] = host.texturePayloadErrors || 0;
+  metrics[19] = host.palettePayloadErrors || 0;
+  host.lastHighScaleMetrics = metrics;
+}
+
+function drawRetainedCommandRef(host, ref, packet, viewProj) {
+  if (!ref) return;
+  if (isHighScaleCommandRef(ref)) {
+    if (host.highScaleFramePacket && host.highScaleLayers && host.highScaleLayers.size > 0) {
+      const metrics = drawHighScaleRuntime(host, host.highScaleFramePacket, false, 0, false, ref.layerId, false);
+      accumulateHighScaleCommandMetrics(host, metrics);
+      restoreMeshGlobalsAfterHighScale(host, packet, viewProj);
+    }
+    return;
+  }
+
+  drawRetainedBatch(host, ref.id || '');
+}
+
+function restoreMeshGlobalsAfterHighScale(host, packet, viewProj) {
+  const { gl } = host;
+  useProgramCached(host, host.meshProgram);
+  uniformMatrix4fvCached(host, host.meshViewProjLocation, viewProj);
+  uniform3fvFromArray(host, host.meshCameraPositionLocation, host.scratch3, packet.cameraPosition, [0, 0, 6]);
+  if (host.meshCameraRightUniformLocation !== null) uniform3fvFromArray(host, host.meshCameraRightUniformLocation, host.scratch3, packet.cameraRight, [1, 0, 0]);
+  if (host.meshCameraUpUniformLocation !== null) uniform3fvFromArray(host, host.meshCameraUpUniformLocation, host.scratch3, packet.cameraUp, [0, 1, 0]);
+  uniform1fCached(host, host.meshParticleModeLocation, 0);
+  setClientAnimationUniforms(host, false, 0, 0);
 }
 
 
-function bindMeshGeometry(host, resource) {
+
+function useProgramCached(host, program) {
   const { gl } = host;
-  gl.bindBuffer(gl.ARRAY_BUFFER, resource.normalBuffer);
+  if (!host.glState) return gl.useProgram(program);
+  if (host.glState.program !== program) {
+    gl.useProgram(program);
+    host.glState.program = program;
+    host.glState.stateChanges++;
+  }
+}
+
+function bindArrayBufferCached(host, buffer) {
+  const { gl } = host;
+  if (!host.glState) return gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+  if (host.glState.arrayBuffer !== buffer) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    host.glState.arrayBuffer = buffer;
+    host.glState.bufferBinds++;
+  }
+}
+
+function bindElementArrayBufferCached(host, buffer) {
+  const { gl } = host;
+  if (!host.glState) return gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buffer);
+  if (host.glState.elementArrayBuffer !== buffer) {
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buffer);
+    host.glState.elementArrayBuffer = buffer;
+    host.glState.bufferBinds++;
+  }
+}
+
+function setBlendCached(host, enabled) {
+  const { gl } = host;
+  if (!host.glState || host.glState.blend !== enabled) {
+    if (enabled) gl.enable(gl.BLEND); else gl.disable(gl.BLEND);
+    if (host.glState) { host.glState.blend = enabled; host.glState.stateChanges++; }
+  }
+}
+
+function setDepthTestCached(host, enabled) {
+  const { gl } = host;
+  if (!host.glState || host.glState.depthTest !== enabled) {
+    if (enabled) gl.enable(gl.DEPTH_TEST); else gl.disable(gl.DEPTH_TEST);
+    if (host.glState) { host.glState.depthTest = enabled; host.glState.stateChanges++; }
+  }
+}
+
+function setDepthMaskCached(host, enabled) {
+  const { gl } = host;
+  if (!host.glState || host.glState.depthMask !== enabled) {
+    gl.depthMask(!!enabled);
+    if (host.glState) { host.glState.depthMask = !!enabled; host.glState.stateChanges++; }
+  }
+}
+
+function setBlendFuncCached(host, src, dst) {
+  const { gl } = host;
+  if (!host.glState || host.glState.blendSrc !== src || host.glState.blendDst !== dst) {
+    gl.blendFunc(src, dst);
+    if (host.glState) { host.glState.blendSrc = src; host.glState.blendDst = dst; host.glState.stateChanges++; }
+  }
+}
+
+function setDepthFuncCached(host, func) {
+  const { gl } = host;
+  if (!host.glState || host.glState.depthFunc !== func) {
+    gl.depthFunc(func);
+    if (host.glState) { host.glState.depthFunc = func; host.glState.stateChanges++; }
+  }
+}
+
+function uniform1fCached(host, location, value) {
+  if (location === null || location === undefined) return;
+  const { gl } = host;
+  const key = location;
+  const cache = getUniformCache(gl);
+  const last = cache.get(key);
+  const v = Number(value || 0);
+  if (last === v) return;
+  gl.uniform1f(location, v);
+  cache.set(key, v);
+  if (host.glState) host.glState.uniformUpdates++;
+}
+
+function uniform1iCached(host, location, value) {
+  if (location === null || location === undefined) return;
+  const { gl } = host;
+  const key = location;
+  const cache = getUniformCache(gl);
+  const v = value | 0;
+  const last = cache.get(key);
+  if (last === v) return;
+  gl.uniform1i(location, v);
+  cache.set(key, v);
+  if (host.glState) host.glState.uniformUpdates++;
+}
+
+function uniform2fCached(host, location, x, y) {
+  if (location === null || location === undefined) return;
+  const { gl } = host;
+  const cache = getUniformCache(gl);
+  const last = cache.get(location);
+  const a = Number(x || 0), b = Number(y || 0);
+  if (last && last.length === 2 && last[0] === a && last[1] === b) return;
+  gl.uniform2f(location, a, b);
+  if (last) { last[0] = a; last[1] = b; } else cache.set(location, [a, b]);
+  if (host.glState) host.glState.uniformUpdates++;
+}
+
+function uniform4fCached(host, location, x, y, z, w) {
+  if (location === null || location === undefined) return;
+  const { gl } = host;
+  const cache = getUniformCache(gl);
+  const last = cache.get(location);
+  const a = Number(x || 0), b = Number(y || 0), c = Number(z || 0), d = Number(w || 0);
+  if (last && last.length === 4 && last[0] === a && last[1] === b && last[2] === c && last[3] === d) return;
+  gl.uniform4f(location, a, b, c, d);
+  if (last) { last[0] = a; last[1] = b; last[2] = c; last[3] = d; } else cache.set(location, [a, b, c, d]);
+  if (host.glState) host.glState.uniformUpdates++;
+}
+
+function uniformMatrix4fvCached(host, location, value) {
+  if (location === null || location === undefined) return;
+  const { gl } = host;
+  const cache = getUniformCache(gl);
+  let last = cache.get(location);
+  let same = !!last && last.length === 16;
+  if (same) {
+    for (let i = 0; i < 16; i++) { if (last[i] !== value[i]) { same = false; break; } }
+  }
+  if (same) return;
+  gl.uniformMatrix4fv(location, false, value);
+  if (!last || last.length !== 16) { last = new Float32Array(16); cache.set(location, last); }
+  last.set(value);
+  if (host.glState) host.glState.uniformUpdates++;
+}
+
+function bindVertexArrayCached(host, vao) {
+  const { gl } = host;
+  if (!host.glState) {
+    if (gl.bindVertexArray) gl.bindVertexArray(vao);
+    else if (host.vaoExt) host.vaoExt.bindVertexArrayOES(vao);
+    return;
+  }
+  if (host.glState.vao === vao) return;
+  if (gl.bindVertexArray) gl.bindVertexArray(vao);
+  else if (host.vaoExt) host.vaoExt.bindVertexArrayOES(vao);
+  else return;
+  host.glState.vao = vao;
+  host.glState.arrayBuffer = null;
+  host.glState.elementArrayBuffer = null;
+  host.glState.vaoBinds++;
+}
+
+function resetGlStateCache(host) {
+  if (!host || !host.glState) return;
+  host.glState.activeTextureUnit = -1;
+  host.glState.texture2D.fill(null);
+  host.glState.program = null;
+  host.glState.arrayBuffer = null;
+  host.glState.elementArrayBuffer = null;
+  host.glState.vao = null;
+  host.glState.blend = null;
+  host.glState.depthTest = null;
+  host.glState.depthMask = null;
+  host.glState.blendSrc = null;
+  host.glState.blendDst = null;
+  host.glState.depthFunc = null;
+  host.glState.materialKey = '';
+}
+
+function resetWebGlFrameCounters(host) {
+  if (!host || !host.glState) return;
+  host.glState.stateChanges = 0;
+  host.glState.uniformUpdates = 0;
+  host.glState.textureBinds = 0;
+  host.glState.bufferBinds = 0;
+  host.glState.vaoBinds = 0;
+  host.retainedOrdinaryCulledInstances = 0;
+}
+
+function createMeshVaoObject(host) {
+  const { gl } = host;
+  if (gl.createVertexArray) return { vao: gl.createVertexArray(), ext: null };
+  if (host.vaoExt && host.vaoExt.createVertexArrayOES) return { vao: host.vaoExt.createVertexArrayOES(), ext: host.vaoExt };
+  return { vao: null, ext: null };
+}
+
+function bindMeshVaoRaw(host, vao) {
+  const { gl } = host;
+  if (gl.bindVertexArray) gl.bindVertexArray(vao);
+  else if (host.vaoExt) host.vaoExt.bindVertexArrayOES(vao);
+}
+
+function rebuildMeshVao(host, resource) {
+  const { gl } = host;
+  if (resource.vao) {
+    if (gl.deleteVertexArray) gl.deleteVertexArray(resource.vao);
+    else if (resource.vaoExt && resource.vaoExt.deleteVertexArrayOES) resource.vaoExt.deleteVertexArrayOES(resource.vao);
+    resource.vao = null;
+    resource.vaoExt = null;
+  }
+  const created = createMeshVaoObject(host);
+  if (!created.vao) return;
+  resource.vao = created.vao;
+  resource.vaoExt = created.ext;
+  bindMeshVaoRaw(host, resource.vao);
+  resetGlStateCache(host);
+  bindMeshGeometryFallback(host, resource);
+  bindMeshVaoRaw(host, null);
+  resetGlStateCache(host);
+}
+
+function bindMeshGeometry(host, resource) {
+  if (resource && resource.vao) {
+    bindVertexArrayCached(host, resource.vao);
+    return;
+  }
+  bindVertexArrayCached(host, null);
+  bindMeshGeometryFallback(host, resource);
+}
+
+function bindMeshGeometryFallback(host, resource) {
+  const { gl } = host;
+  bindArrayBufferCached(host, resource.normalBuffer);
   gl.enableVertexAttribArray(host.meshNormalLocation);
   gl.vertexAttribPointer(host.meshNormalLocation, 3, gl.FLOAT, false, 0, 0);
-  gl.bindBuffer(gl.ARRAY_BUFFER, resource.vertexBuffer);
+  bindArrayBufferCached(host, resource.vertexBuffer);
   gl.enableVertexAttribArray(host.meshPositionLocation);
   gl.vertexAttribPointer(host.meshPositionLocation, 3, gl.FLOAT, false, 0, 0);
   if (host.meshTexCoordLocation >= 0) {
-    gl.bindBuffer(gl.ARRAY_BUFFER, resource.texCoordBuffer);
-    gl.enableVertexAttribArray(host.meshTexCoordLocation);
-    gl.vertexAttribPointer(host.meshTexCoordLocation, 2, gl.FLOAT, false, 0, 0);
+    if (resource.hasTexCoords && resource.texCoordBuffer) {
+      bindArrayBufferCached(host, resource.texCoordBuffer);
+      gl.enableVertexAttribArray(host.meshTexCoordLocation);
+      gl.vertexAttribPointer(host.meshTexCoordLocation, 2, gl.FLOAT, false, 0, 0);
+    } else {
+      gl.disableVertexAttribArray(host.meshTexCoordLocation);
+      gl.vertexAttrib2f(host.meshTexCoordLocation, 0, 0);
+    }
   }
   if (host.meshTangentLocation >= 0) {
-    gl.bindBuffer(gl.ARRAY_BUFFER, resource.tangentBuffer);
-    gl.enableVertexAttribArray(host.meshTangentLocation);
-    gl.vertexAttribPointer(host.meshTangentLocation, 4, gl.FLOAT, false, 0, 0);
+    if (resource.hasTangents && resource.tangentBuffer) {
+      bindArrayBufferCached(host, resource.tangentBuffer);
+      gl.enableVertexAttribArray(host.meshTangentLocation);
+      gl.vertexAttribPointer(host.meshTangentLocation, 4, gl.FLOAT, false, 0, 0);
+    } else {
+      gl.disableVertexAttribArray(host.meshTangentLocation);
+      gl.vertexAttrib4f(host.meshTangentLocation, 1, 0, 0, 1);
+    }
+  }
+  if (host.meshVertexColorLocation >= 0) {
+    if (resource.hasColors && resource.colorBuffer) {
+      bindArrayBufferCached(host, resource.colorBuffer);
+      gl.enableVertexAttribArray(host.meshVertexColorLocation);
+      gl.vertexAttribPointer(host.meshVertexColorLocation, 4, gl.FLOAT, false, 0, 0);
+    } else {
+      gl.disableVertexAttribArray(host.meshVertexColorLocation);
+      gl.vertexAttrib4f(host.meshVertexColorLocation, 1, 1, 1, 1);
+    }
   }
   if (host.meshMaterialSlotLocation >= 0) {
-    gl.bindBuffer(gl.ARRAY_BUFFER, resource.materialSlotBuffer);
-    gl.enableVertexAttribArray(host.meshMaterialSlotLocation);
-    gl.vertexAttribPointer(host.meshMaterialSlotLocation, 1, gl.FLOAT, false, 0, 0);
+    if (resource.hasMaterialSlots && resource.materialSlotBuffer) {
+      bindArrayBufferCached(host, resource.materialSlotBuffer);
+      gl.enableVertexAttribArray(host.meshMaterialSlotLocation);
+      gl.vertexAttribPointer(host.meshMaterialSlotLocation, 1, gl.FLOAT, false, 0, 0);
+    } else {
+      gl.disableVertexAttribArray(host.meshMaterialSlotLocation);
+      gl.vertexAttrib1f(host.meshMaterialSlotLocation, 0);
+    }
   }
-  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, resource.indexBuffer);
+  if (host.meshBoneIndicesLocation >= 0) {
+    if (resource.hasSkinWeights && resource.boneIndexBuffer) {
+      bindArrayBufferCached(host, resource.boneIndexBuffer);
+      gl.enableVertexAttribArray(host.meshBoneIndicesLocation);
+      gl.vertexAttribPointer(host.meshBoneIndicesLocation, 4, gl.FLOAT, false, 0, 0);
+    } else {
+      gl.disableVertexAttribArray(host.meshBoneIndicesLocation);
+      gl.vertexAttrib4f(host.meshBoneIndicesLocation, 0, 0, 0, 0);
+    }
+  }
+  if (host.meshBoneWeightsLocation >= 0) {
+    if (resource.hasSkinWeights && resource.boneWeightBuffer) {
+      bindArrayBufferCached(host, resource.boneWeightBuffer);
+      gl.enableVertexAttribArray(host.meshBoneWeightsLocation);
+      gl.vertexAttribPointer(host.meshBoneWeightsLocation, 4, gl.FLOAT, false, 0, 0);
+    } else {
+      gl.disableVertexAttribArray(host.meshBoneWeightsLocation);
+      gl.vertexAttrib4f(host.meshBoneWeightsLocation, 0, 0, 0, 0);
+    }
+  }
+  bindElementArrayBufferCached(host, resource.indexBuffer);
 }
 
 function prepareRetainedBatchTransformForFrame(host, batch, animationEnabled, time, amplitude) {
@@ -1083,9 +2134,9 @@ function prepareRetainedBatchTransformForFrame(host, batch, animationEnabled, ti
 
   if (batch.animationActive && batch.baseTransformData && batch.baseTransformData.length > 0) {
     const { gl } = host;
-    gl.bindBuffer(gl.ARRAY_BUFFER, batch.transformBuffer);
+    bindArrayBufferCached(host, batch.transformBuffer);
     gl.bufferSubData(gl.ARRAY_BUFFER, 0, batch.baseTransformData);
-    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    bindArrayBufferCached(host, null);
     batch.animationFrameId = host.frameId;
     batch.animationActive = false;
     host.animationUploadBatches = (host.animationUploadBatches || 0) + 1;
@@ -1094,6 +2145,88 @@ function prepareRetainedBatchTransformForFrame(host, batch, animationEnabled, ti
   }
 
   return 0;
+}
+
+function worldAabbFromInstanceTransform(transformData, offset, localCenter, localExtents, outCenter, outExtents) {
+  const cx = localCenter[0] || 0, cy = localCenter[1] || 0, cz = localCenter[2] || 0;
+  const ex = localExtents[0] || 0, ey = localExtents[1] || 0, ez = localExtents[2] || 0;
+  const m11 = transformData[offset],      m12 = transformData[offset + 1],  m13 = transformData[offset + 2];
+  const m21 = transformData[offset + 4],  m22 = transformData[offset + 5],  m23 = transformData[offset + 6];
+  const m31 = transformData[offset + 8],  m32 = transformData[offset + 9],  m33 = transformData[offset + 10];
+  const m41 = transformData[offset + 12], m42 = transformData[offset + 13], m43 = transformData[offset + 14];
+  outCenter[0] = m11 * cx + m21 * cy + m31 * cz + m41;
+  outCenter[1] = m12 * cx + m22 * cy + m32 * cz + m42;
+  outCenter[2] = m13 * cx + m23 * cy + m33 * cz + m43;
+  outExtents[0] = Math.abs(m11) * ex + Math.abs(m21) * ey + Math.abs(m31) * ez;
+  outExtents[1] = Math.abs(m12) * ex + Math.abs(m22) * ey + Math.abs(m32) * ez;
+  outExtents[2] = Math.abs(m13) * ex + Math.abs(m23) * ey + Math.abs(m33) * ez;
+}
+
+function ensureFloatCapacity(current, required) {
+  if (current && current.length >= required) return current;
+  let next = 16;
+  while (next < required) next <<= 1;
+  return new Float32Array(next);
+}
+
+function prepareVisibleRetainedBatch(host, batch, resource) {
+  if (!batch || batch.particleMode || (batch.batchId && String(batch.batchId).startsWith('hs:')) || !resource || !resource.localBoundsValid || !batch.baseTransformData || batch.instanceCount <= 0) {
+    return { count: batch ? batch.instanceCount || 0 : 0, transformBuffer: batch ? batch.transformBuffer : null, stateBuffer: batch ? batch.stateBuffer : null };
+  }
+  const transforms = batch.baseTransformData;
+  const states = batch.baseStateData;
+  const count = Math.min(batch.instanceCount | 0, Math.floor(transforms.length / 16));
+  if (count <= 0) return { count: 0, transformBuffer: batch.transformBuffer, stateBuffer: batch.stateBuffer };
+  const viewProj = host.frameViewProjection;
+  const center = host.retainedCullCenter || (host.retainedCullCenter = [0, 0, 0]);
+  const extents = host.retainedCullExtents || (host.retainedCullExtents = [0, 0, 0]);
+  let visible = 0;
+  let compacted = false;
+  for (let i = 0; i < count; i++) {
+    worldAabbFromInstanceTransform(transforms, i * 16, resource.localCenter, resource.localExtents, center, extents);
+    if (!aabbIntersectsFrustum(viewProj, center, extents)) continue;
+    if (visible !== i) {
+      batch.visibleTransformData = ensureFloatCapacity(batch.visibleTransformData, (visible + 1) * 16);
+      if (!compacted && visible > 0) {
+        batch.visibleTransformData.set(transforms.subarray(0, visible * 16), 0);
+        if (states && states.length >= visible * 4) {
+          batch.visibleStateData = ensureFloatCapacity(batch.visibleStateData, visible * 4);
+          batch.visibleStateData.set(states.subarray(0, visible * 4), 0);
+        }
+      }
+      compacted = true;
+      batch.visibleTransformData.set(transforms.subarray(i * 16, i * 16 + 16), visible * 16);
+      if (states && states.length >= (i + 1) * 4) {
+        batch.visibleStateData = ensureFloatCapacity(batch.visibleStateData, (visible + 1) * 4);
+        batch.visibleStateData.set(states.subarray(i * 4, i * 4 + 4), visible * 4);
+      }
+    }
+    visible++;
+  }
+  if (visible === count) {
+    return { count, transformBuffer: batch.transformBuffer, stateBuffer: batch.stateBuffer };
+  }
+  const culled = count - visible;
+  if (count < retainedOrdinaryCullMinInstances || culled / Math.max(1, count) < retainedOrdinaryCullMinCulledRatio) {
+    host.retainedOrdinaryCullBypassInstances = (host.retainedOrdinaryCullBypassInstances || 0) + culled;
+    return { count, transformBuffer: batch.transformBuffer, stateBuffer: batch.stateBuffer };
+  }
+  if (visible <= 0) {
+    host.retainedOrdinaryCulledInstances = (host.retainedOrdinaryCulledInstances || 0) + count;
+    return { count: 0, transformBuffer: batch.transformBuffer, stateBuffer: batch.stateBuffer };
+  }
+  const gl = host.gl;
+  if (!batch.culledTransformBuffer) batch.culledTransformBuffer = gl.createBuffer();
+  if (!batch.culledStateBuffer) batch.culledStateBuffer = gl.createBuffer();
+  if (batch.visibleTransformData.length < visible * 16) batch.visibleTransformData = ensureFloatCapacity(batch.visibleTransformData, visible * 16);
+  if (states && states.length >= count * 4 && batch.visibleStateData.length < visible * 4) batch.visibleStateData = ensureFloatCapacity(batch.visibleStateData, visible * 4);
+  bindArrayBufferCached(host, batch.culledTransformBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, batch.visibleTransformData.subarray(0, visible * 16), gl.DYNAMIC_DRAW);
+  bindArrayBufferCached(host, batch.culledStateBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, batch.visibleStateData.subarray(0, visible * 4), gl.DYNAMIC_DRAW);
+  bindArrayBufferCached(host, null);
+  host.retainedOrdinaryCulledInstances = (host.retainedOrdinaryCulledInstances || 0) + (count - visible);
+  return { count: visible, transformBuffer: batch.culledTransformBuffer, stateBuffer: batch.culledStateBuffer };
 }
 
 function drawRetainedBatch(host, batchId) {
@@ -1107,37 +2240,76 @@ function drawRetainedBatchObject(host, batch) {
   if (!batch || batch.instanceCount <= 0 || !host.instancing) return;
   const resource = batch.meshIndex >= 0 ? host.meshResourceList[batch.meshIndex] : host.meshResources.get(batch.meshId);
   if (!resource || resource.indexCount === 0) return;
+  const visible = prepareVisibleRetainedBatch(host, batch, resource);
+  if (visible.count <= 0) return;
   bindMeshGeometry(host, resource);
-  gl.uniform1f(host.meshLightingEnabledLocation, batch.lightingEnabled || 0);
-  if (host.meshNormalMapStrengthLocation !== null) gl.uniform1f(host.meshNormalMapStrengthLocation, batch.normalMapStrength || 0);
-  gl.uniform1f(host.meshUsePaletteLocation, 0);
-  if (host.meshBaseColorTextureEnabledLocation !== null) gl.uniform1f(host.meshBaseColorTextureEnabledLocation, 0);
-  if (host.meshNormalTextureEnabledLocation !== null) gl.uniform1f(host.meshNormalTextureEnabledLocation, 0);
-  if (host.meshMetallicRoughnessTextureEnabledLocation !== null) gl.uniform1f(host.meshMetallicRoughnessTextureEnabledLocation, 0);
-  if (host.meshEmissiveTextureEnabledLocation !== null) gl.uniform1f(host.meshEmissiveTextureEnabledLocation, 0);
-  if (host.meshMaterialParamsLocation !== null) gl.uniform4f(host.meshMaterialParamsLocation, 0, 1, 0, 0);
-  if (host.meshAlphaParamsLocation !== null) gl.uniform4f(host.meshAlphaParamsLocation, 0, 0, 0, 0);
-  if (host.meshEmissiveColorLocation !== null) gl.uniform4f(host.meshEmissiveColorLocation, 0, 0, 0, 0);
-  gl.uniform1f(host.meshUseInstancingLocation, 1);
-  gl.uniform1f(host.meshUsePaletteLocation, batch.usePalette ? 1 : 0);
-  if (batch.usePalette && batch.paletteTexture) {
-    gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, batch.paletteTexture);
-    gl.uniform1i(host.meshPaletteLocation, 1);
-    gl.uniform2f(host.meshPaletteSizeLocation, batch.paletteWidth || 1, batch.paletteHeight || 1);
-    gl.activeTexture(gl.TEXTURE0);
+  if (batch.transparent && !host.forceAlphaDitherOpaque) {
+    setBlendCached(host, true);
+    setBlendFuncCached(host, gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    setDepthMaskCached(host, false);
+  } else {
+    setBlendCached(host, false);
+    setDepthMaskCached(host, true);
   }
-  gl.bindBuffer(gl.ARRAY_BUFFER, batch.transformBuffer);
-  setInstanceAttributeWithStride(host, host.meshInstanceModel0Location, 4, 0, 64);
-  setInstanceAttributeWithStride(host, host.meshInstanceModel1Location, 4, 16, 64);
-  setInstanceAttributeWithStride(host, host.meshInstanceModel2Location, 4, 32, 64);
-  setInstanceAttributeWithStride(host, host.meshInstanceModel3Location, 4, 48, 64);
-  gl.bindBuffer(gl.ARRAY_BUFFER, batch.stateBuffer);
-  setInstanceAttributeWithStride(host, host.meshInstanceColorLocation, 4, 0, 16);
-  host.instancing.drawElementsInstancedANGLE(gl.TRIANGLES, resource.indexCount, resource.indexType, 0, batch.instanceCount);
-  drawWireframeOverlayForCurrentBatch(host, resource, batch.instanceCount, true);
+  uniform1fCached(host, host.meshLightingEnabledLocation, batch.lightingEnabled || 0);
+  uniform1fCached(host, host.meshNormalMapStrengthLocation, batch.normalMapStrength || 0);
+  uniform1fCached(host, host.meshUsePaletteLocation, 0);
+  bindMaterialTextures(host, batch);
+  uniform4fCached(host, host.meshMaterialParamsLocation, batch.metallic || 0, batch.roughness || 1, 0, 0);
+  uniform4fCached(host, host.meshAlphaParamsLocation, batch.alphaCutoff || 0, (batch.transparent && !host.forceAlphaDitherOpaque) ? 1 : 0, 0, 0);
+  const em = batch.emissiveColor || [0, 0, 0, 0];
+  uniform4fCached(host, host.meshEmissiveColorLocation, em[0] || 0, em[1] || 0, em[2] || 0, em[3] || 0);
+  uniform1fCached(host, host.meshUseInstancingLocation, 1);
+  uniform1fCached(host, host.meshUsePaletteLocation, batch.usePalette ? 1 : 0);
+  if (host.meshSkinningEnabledLocation !== null) {
+    const skinActive = batch.skinningEnabled && batch.boneTexture && resource.hasSkinWeights;
+    uniform1fCached(host, host.meshSkinningEnabledLocation, skinActive ? 1 : 0);
+    if (skinActive) {
+      bindTexture2DCached(host, 6, batch.boneTexture);
+      uniform1iCached(host, host.meshBoneTextureLocation, 6);
+      uniform1fCached(host, host.meshBoneTextureHeightLocation, batch.boneCount || 1);
+      activateTextureUnitCached(host, 0);
+    }
+  }
+  if (batch.usePalette && batch.paletteTexture) {
+    bindTexture2DCached(host, 1, batch.paletteTexture);
+    uniform1iCached(host, host.meshPaletteLocation, 1);
+    uniform2fCached(host, host.meshPaletteSizeLocation, batch.paletteWidth || 1, batch.paletteHeight || 1);
+    activateTextureUnitCached(host, 0);
+  }
+  if (batch.particleMode && batch.particleBuffer) {
+    uniform1fCached(host, host.meshParticleModeLocation, batch.particleMode);
+    bindArrayBufferCached(host, batch.particleBuffer);
+    if (batch.particleMode > 1.5) {
+      setInstanceAttributeWithStride(host, host.meshInstanceModel0Location, 4, 0, 80);
+      setInstanceAttributeWithStride(host, host.meshInstanceModel1Location, 4, 16, 80);
+      setInstanceAttributeWithStride(host, host.meshInstanceModel2Location, 4, 32, 80);
+      setInstanceAttributeWithStride(host, host.meshInstanceModel3Location, 4, 48, 80);
+      setInstanceAttributeWithStride(host, host.meshInstanceColorLocation, 4, 64, 80);
+    } else {
+      setInstanceAttributeWithStride(host, host.meshInstanceModel0Location, 4, 0, 32);
+      setInstanceAttributeWithStride(host, host.meshInstanceColorLocation, 4, 16, 32);
+      if (host.meshInstanceModel1Location >= 0) { gl.disableVertexAttribArray(host.meshInstanceModel1Location); gl.vertexAttrib4f(host.meshInstanceModel1Location, 0, 0, 0, 0); }
+      if (host.meshInstanceModel2Location >= 0) { gl.disableVertexAttribArray(host.meshInstanceModel2Location); gl.vertexAttrib4f(host.meshInstanceModel2Location, 0, 0, 0, 0); }
+      if (host.meshInstanceModel3Location >= 0) { gl.disableVertexAttribArray(host.meshInstanceModel3Location); gl.vertexAttrib4f(host.meshInstanceModel3Location, 0, 0, 0, 1); }
+    }
+  } else {
+    uniform1fCached(host, host.meshParticleModeLocation, 0);
+    bindArrayBufferCached(host, visible.transformBuffer);
+    setInstanceAttributeWithStride(host, host.meshInstanceModel0Location, 4, 0, 64);
+    setInstanceAttributeWithStride(host, host.meshInstanceModel1Location, 4, 16, 64);
+    setInstanceAttributeWithStride(host, host.meshInstanceModel2Location, 4, 32, 64);
+    setInstanceAttributeWithStride(host, host.meshInstanceModel3Location, 4, 48, 64);
+    bindArrayBufferCached(host, visible.stateBuffer);
+    setInstanceAttributeWithStride(host, host.meshInstanceColorLocation, 4, 0, 16);
+  }
+  host.instancing.drawElementsInstancedANGLE(gl.TRIANGLES, resource.indexCount, resource.indexType, 0, visible.count);
+  uniform1fCached(host, host.meshParticleModeLocation, 0);
+  uniform1fCached(host, host.meshSkinningEnabledLocation, 0);
+  drawWireframeOverlayForCurrentBatch(host, resource, visible.count, true);
   resetInstanceDivisors(host);
-  gl.uniform1f(host.meshUsePaletteLocation, 0);
+  setDepthMaskCached(host, true);
+  uniform1fCached(host, host.meshUsePaletteLocation, 0);
 }
 
 function drawRetainedBatchByIndex(host, batchIndex) {
@@ -1162,70 +2334,141 @@ function resolveLodIndex(layer, cameraPosition, cx, cy, cz) {
   return layer.enableBillboardFallback ? 3 : 2;
 }
 
-function aabbIntersectsClip(viewProj, c, e) {
-  let anyInside = false;
-  const sx = [-1, 1];
-  const sy = [-1, 1];
-  const sz = [-1, 1];
-  for (let ix = 0; ix < 2; ix++) for (let iy = 0; iy < 2; iy++) for (let iz = 0; iz < 2; iz++) {
-    const x = c[0] + e[0] * sx[ix];
-    const y = c[1] + e[1] * sy[iy];
-    const z = c[2] + e[2] * sz[iz];
-    const cx = viewProj[0] * x + viewProj[4] * y + viewProj[8] * z + viewProj[12];
-    const cy = viewProj[1] * x + viewProj[5] * y + viewProj[9] * z + viewProj[13];
-    const cz = viewProj[2] * x + viewProj[6] * y + viewProj[10] * z + viewProj[14];
-    const cw = viewProj[3] * x + viewProj[7] * y + viewProj[11] * z + viewProj[15];
-    if (cw > 0 && cx >= -cw && cx <= cw && cy >= -cw && cy <= cw && cz >= -cw && cz <= cw) {
-      anyInside = true;
-      break;
-    }
+function aabbIntersectsFrustum(viewProj, c, e) {
+  // Conservative plane-vs-AABB test. The old corner-inside test culled large
+  // chunks whenever the frustum crossed the box without containing a corner,
+  // which made high-scale racks disappear at specific camera angles.
+  const m = viewProj;
+  const planes = [
+    [m[3] + m[0],  m[7] + m[4],  m[11] + m[8],  m[15] + m[12]], // left
+    [m[3] - m[0],  m[7] - m[4],  m[11] - m[8],  m[15] - m[12]], // right
+    [m[3] + m[1],  m[7] + m[5],  m[11] + m[9],  m[15] + m[13]], // bottom
+    [m[3] - m[1],  m[7] - m[5],  m[11] - m[9],  m[15] - m[13]], // top
+    [m[3] - m[2],  m[7] - m[6],  m[11] - m[10], m[15] - m[14]]  // far
+  ];
+
+  for (let i = 0; i < planes.length; i++) {
+    const p = planes[i];
+    const r = Math.abs(p[0]) * e[0] + Math.abs(p[1]) * e[1] + Math.abs(p[2]) * e[2];
+    const distance = p[0] * c[0] + p[1] * c[1] + p[2] * c[2] + p[3];
+    if (distance + r < 0) return false;
   }
-  return anyInside;
+
+  return true;
 }
 
-function parseHighScaleSnapshot(host, snapshot) {
-  const layer = {
-    id: snapshot.layerId || '',
-    version: snapshot.version || 0,
-    visible: snapshot.visible !== false,
-    detailedDistance: snapshot.detailedDistance || 24,
-    simplifiedDistance: snapshot.simplifiedDistance || 96,
-    proxyDistance: snapshot.proxyDistance || 320,
-    drawDistance: snapshot.drawDistance || 5000,
-    enableBillboardFallback: !!snapshot.enableBillboardFallback,
-    chunks: []
-  };
-  const chunks = snapshot.chunks || [];
-  for (const c of chunks) {
-    const chunk = {
-      id: c.id || '',
-      center: [c.cx || 0, c.cy || 0, c.cz || 0],
-      extents: [c.ex || 0, c.ey || 0, c.ez || 0],
-      instanceCount: c.instanceCount || 0,
-      batchesByLod: [[], [], [], []]
+
+const retainedOrdinaryCullMinInstances = 32;
+const retainedOrdinaryCullMinCulledRatio = 0.15;
+
+const highScaleSnapshotTextDecoder = typeof TextDecoder !== 'undefined' ? new TextDecoder('utf-8') : null;
+
+function readSnapshotInt32(view, bytes, cursor) {
+  if (cursor.offset + 4 > bytes.byteLength) { cursor.failed = true; return 0; }
+  const value = view.getInt32(cursor.offset, true);
+  cursor.offset += 4;
+  return value;
+}
+
+function readSnapshotFloat32(view, bytes, cursor) {
+  if (cursor.offset + 4 > bytes.byteLength) { cursor.failed = true; return 0; }
+  const value = view.getFloat32(cursor.offset, true);
+  cursor.offset += 4;
+  return value;
+}
+
+function readSnapshotString(view, bytes, cursor) {
+  const length = readSnapshotInt32(view, bytes, cursor);
+  if (cursor.failed) return '';
+  if (length < 0 || cursor.offset + length > bytes.byteLength) {
+    cursor.failed = true;
+    cursor.offset = bytes.byteLength;
+    return '';
+  }
+  if (length === 0) return '';
+  const end = cursor.offset + length;
+  const slice = bytes.subarray(cursor.offset, end);
+  cursor.offset = end;
+  if (highScaleSnapshotTextDecoder) return highScaleSnapshotTextDecoder.decode(slice);
+  let text = '';
+  for (let i = 0; i < slice.length; i++) text += String.fromCharCode(slice[i]);
+  try { return decodeURIComponent(escape(text)); } catch (_) { return text; }
+}
+
+function parseHighScaleSnapshotBytes(host, payload) {
+  try {
+    const bytes = typeof payload === 'string' ? decodeBase64Bytes(payload) : toUint8Array(payload);
+    if (bytes.byteLength < 44) return null;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const cursor = { offset: 0, failed: false };
+    const magic = readSnapshotInt32(view, bytes, cursor);
+    const version = readSnapshotInt32(view, bytes, cursor);
+    if (cursor.failed || magic !== 0x314C5348 || version !== 1) return null;
+    const layerId = readSnapshotString(view, bytes, cursor);
+    const structuralVersion = readSnapshotInt32(view, bytes, cursor);
+    const visible = readSnapshotInt32(view, bytes, cursor) !== 0;
+    const detailedDistance = readSnapshotFloat32(view, bytes, cursor);
+    const simplifiedDistance = readSnapshotFloat32(view, bytes, cursor);
+    const proxyDistance = readSnapshotFloat32(view, bytes, cursor);
+    const drawDistance = readSnapshotFloat32(view, bytes, cursor);
+    const enableBillboardFallback = readSnapshotInt32(view, bytes, cursor) !== 0;
+    const chunkCount = Math.max(0, readSnapshotInt32(view, bytes, cursor));
+    if (cursor.failed) return null;
+    const layer = {
+      id: layerId,
+      version: structuralVersion,
+      visible,
+      detailedDistance: detailedDistance || 24,
+      simplifiedDistance: simplifiedDistance || 96,
+      proxyDistance: proxyDistance || 320,
+      drawDistance: drawDistance || 5000,
+      enableBillboardFallback,
+      chunks: []
     };
-    const src = c.batchesByLod || [];
-    for (let lod = 0; lod < 4; lod++) {
-      const ids = src[lod] || [];
-      for (let i = 0; i < ids.length; i++) {
-        const idx = host.retainedBatchIdToIndex.get(ids[i]);
-        if (idx !== undefined) chunk.batchesByLod[lod].push(idx);
+
+    for (let ci = 0; ci < chunkCount; ci++) {
+      const id = readSnapshotString(view, bytes, cursor);
+      const cx = readSnapshotFloat32(view, bytes, cursor);
+      const cy = readSnapshotFloat32(view, bytes, cursor);
+      const cz = readSnapshotFloat32(view, bytes, cursor);
+      const ex = readSnapshotFloat32(view, bytes, cursor);
+      const ey = readSnapshotFloat32(view, bytes, cursor);
+      const ez = readSnapshotFloat32(view, bytes, cursor);
+      const instanceCount = readSnapshotInt32(view, bytes, cursor);
+      if (cursor.failed) return null;
+      const chunk = {
+        id,
+        center: [cx || 0, cy || 0, cz || 0],
+        extents: [ex || 0, ey || 0, ez || 0],
+        instanceCount: instanceCount || 0,
+        batchesByLod: [[], [], [], []]
+      };
+      for (let lod = 0; lod < 4; lod++) {
+        const count = Math.max(0, readSnapshotInt32(view, bytes, cursor));
+        if (cursor.failed) return null;
+        for (let i = 0; i < count; i++) {
+          const batchId = readSnapshotString(view, bytes, cursor);
+          if (cursor.failed) return null;
+          const idx = host.retainedBatchIdToIndex.get(batchId);
+          if (idx !== undefined) chunk.batchesByLod[lod].push(idx);
+        }
       }
+      layer.chunks.push(chunk);
     }
-    layer.chunks.push(chunk);
+    return cursor.failed ? null : layer;
+  } catch (_) {
+    return null;
   }
-  return layer;
 }
 
-export function createHighScaleLayer(hostId, layerId, snapshotJson) {
-  uploadHighScaleLayerSnapshot(hostId, layerId, snapshotJson);
-}
-
-export function uploadHighScaleLayerSnapshot(hostId, layerId, snapshotJson) {
+export function uploadHighScaleLayerSnapshotBytes(hostId, layerId, snapshotBytes) {
   const host = hosts.get(hostId);
   if (!host) return;
-  const snapshot = typeof snapshotJson === 'string' ? JSON.parse(snapshotJson) : snapshotJson;
-  const layer = parseHighScaleSnapshot(host, snapshot || {});
+  const layer = parseHighScaleSnapshotBytes(host, snapshotBytes);
+  if (!layer) {
+    if (layerId) host.highScaleLayers.delete(layerId);
+    return;
+  }
   host.highScaleLayers.set(layerId || layer.id, layer);
 }
 
@@ -1236,61 +2479,143 @@ export function destroyHighScaleLayer(hostId, layerId) {
   host.highScaleLayers.delete(layerId);
 }
 
-export function applyHighScaleTelemetryPatch(hostId, layerId, patchJson) {
-  // Patch data is applied by typed range entrypoints. This hook is intentionally kept as
-  // the high-level v57 patch ingress for future single-call patch streams and metrics.
-  const host = hosts.get(hostId);
-  if (!host || !host.highScaleLayers.has(layerId)) return '0,0,0,0';
-  return '0,0,0,0';
+function ensureHighScaleDirectPacket(host) {
+  let p = host.highScaleFramePacket;
+  if (!p || !p.__direct) {
+    p = {
+      __direct: true,
+      viewProjection: new Float32Array(16),
+      clearColor: new Float32Array(4),
+      cameraPosition: new Float32Array(3),
+      cameraRight: new Float32Array(3),
+      cameraUp: new Float32Array(3),
+      cameraForward: new Float32Array(3),
+      ambientLight: new Float32Array(3),
+      directionalLightDirection: new Float32Array(3),
+      directionalLightColor: new Float32Array(3),
+      pointLightPosition: new Float32Array(4),
+      pointLightColor: new Float32Array(4),
+      spotLightPosition: new Float32Array(4),
+      spotLightDirection: new Float32Array(4),
+      spotLightColor: new Float32Array(4),
+      spotLightCone: new Float32Array(4),
+      skyboxTopColor: new Float32Array(3),
+      skyboxHorizonColor: new Float32Array(3),
+      skyboxBottomColor: new Float32Array(3),
+      toneMappingParams: new Float32Array(4),
+      ssaoParams: new Float32Array(4)
+    };
+    host.highScaleFramePacket = p;
+  }
+  return p;
 }
 
-export function renderHighScaleFrame(hostId, frameJson) {
+function copy3(dest, src, offset) { dest[0] = src[offset] || 0; dest[1] = src[offset + 1] || 0; dest[2] = src[offset + 2] || 0; }
+function copy4(dest, src, offset) { dest[0] = src[offset] || 0; dest[1] = src[offset + 1] || 0; dest[2] = src[offset + 2] || 0; dest[3] = src[offset + 3] || 0; }
+
+export function syncHighScaleFrameDirect(hostId, width, height, flags, skyboxMode, shadowResolution, shadowReason, viewProjectionBytes, cameraBytes, lightingBytes, styleBytes) {
   const host = hosts.get(hostId);
-  if (!host) return '';
-  const packet = typeof frameJson === 'string' ? JSON.parse(frameJson) : frameJson;
+  if (!host) return;
+  const view = decodeFloat32Payload(viewProjectionBytes);
+  const camera = decodeFloat32Payload(cameraBytes);
+  const lighting = decodeFloat32Payload(lightingBytes);
+  const style = decodeFloat32Payload(styleBytes);
+  const p = ensureHighScaleDirectPacket(host);
+  p.width = width || host.width || 1;
+  p.height = height || host.height || 1;
+  p.viewProjection.set(view.length >= 16 ? view.subarray(0, 16) : view);
+  copy4(p.clearColor, style, 0); if (p.clearColor[3] === 0) p.clearColor[3] = 1;
+  copy3(p.cameraPosition, camera, 0);
+  copy3(p.cameraRight, camera, 3); if (p.cameraRight[0] === 0 && p.cameraRight[1] === 0 && p.cameraRight[2] === 0) p.cameraRight[0] = 1;
+  copy3(p.cameraUp, camera, 6); if (p.cameraUp[0] === 0 && p.cameraUp[1] === 0 && p.cameraUp[2] === 0) p.cameraUp[1] = 1;
+  copy3(p.cameraForward, camera, 9);
+  copy3(p.ambientLight, lighting, 0);
+  copy3(p.directionalLightDirection, lighting, 3);
+  copy3(p.directionalLightColor, lighting, 6);
+  copy4(p.pointLightPosition, lighting, 9);
+  copy4(p.pointLightColor, lighting, 13);
+  copy4(p.spotLightPosition, lighting, 17);
+  copy4(p.spotLightDirection, lighting, 21);
+  copy4(p.spotLightColor, lighting, 25);
+  copy4(p.spotLightCone, lighting, 29);
+  p.skyboxEnabled = (flags & 1) !== 0;
+  p.skyboxMode = skyboxMode || 0;
+  copy3(p.skyboxTopColor, style, 4);
+  copy3(p.skyboxHorizonColor, style, 7);
+  copy3(p.skyboxBottomColor, style, 10);
+  p.skyboxIntensity = style[13] || 1;
+  p.toneMappingParams[0] = style[14] || 1; p.toneMappingParams[1] = style[15] || 2.2; p.toneMappingParams[2] = 0; p.toneMappingParams[3] = 0;
+  p.ssaoParams[0] = style[16] || 0; p.ssaoParams[1] = style[17] || 0.75; p.ssaoParams[2] = style[18] || 0.025; p.ssaoParams[3] = style[19] || 16;
+  p.clientAnimationEnabled = (flags & 2) !== 0;
+  p.clientAnimationTime = style[20] || 0;
+  p.clientAnimationAmplitude = style[21] || 0;
+  p.directionalShadowEnabled = (flags & 4) !== 0;
+  p.directionalShadowResolution = shadowResolution || 0;
+  p.directionalShadowStrength = style[22] || 0;
+  p.directionalShadowBias = style[23] || 0;
+  p.directionalShadowReason = shadowReason || '';
+  p.ssaoEnabled = (flags & 8) !== 0;
+  p.hdrEnabled = (flags & 16) !== 0;
+}
+
+export function getLastHighScaleMetric(hostId, index) {
+  const host = hosts.get(hostId);
+  const metrics = host && host.lastHighScaleMetrics;
+  if (!metrics) return 0;
+  const i = index | 0;
+  return i >= 0 && i < metrics.length ? metrics[i] || 0 : 0;
+}
+
+function drawHighScaleRuntime(host, packet, clearFrame, passMode = 0, recordMetrics = true, layerFilterId = null, advanceFrame = true) {
+  if (!host || !packet) return '';
   const { gl } = host;
-  host.frameId = (host.frameId || 0) + 1;
-  host.animationUploadBytes = 0;
-  host.animationUploadBatches = 0;
+  if (advanceFrame) {
+    host.frameId = (host.frameId || 0) + 1;
+    host.animationUploadBytes = 0;
+    host.animationUploadBatches = 0;
+  }
   const t0 = performance.now();
   const viewProj = host.frameViewProjection;
   const viewProjSource = packet.viewProjection || [];
   for (let i = 0; i < 16; i++) viewProj[i] = viewProjSource[i] || 0;
   const camera = packet.cameraPosition || [0, 0, 0];
-  gl.viewport(0, 0, host.width || 1, host.height || 1);
-  gl.enable(gl.DEPTH_TEST);
-  gl.depthFunc(gl.LEQUAL);
-  const clear = packet.clearColor || [0, 0, 0, 1];
-  gl.clearColor(clear[0], clear[1], clear[2], clear[3]);
-  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-  drawSkybox(host, packet);
-  gl.disable(gl.BLEND);
-  gl.useProgram(host.meshProgram);
-  gl.uniform3fv(host.meshAmbientLightLocation, new Float32Array(packet.ambientLight || [0.28, 0.28, 0.28]));
-  gl.uniform3fv(host.meshDirectionalLightDirectionLocation, new Float32Array(packet.directionalLightDirection || [-0.35, -0.75, -0.55]));
-  gl.uniform3fv(host.meshDirectionalLightColorLocation, new Float32Array(packet.directionalLightColor || [0, 0, 0]));
-  gl.uniform4fv(host.meshPointLightPositionLocation, new Float32Array(packet.pointLightPosition || [0, 0, 0, 1]));
-  gl.uniform4fv(host.meshPointLightColorLocation, new Float32Array(packet.pointLightColor || [0, 0, 0, 0]));
-  gl.uniform4fv(host.meshSpotLightPositionLocation, new Float32Array(packet.spotLightPosition || [0, 0, 0, 1]));
-  gl.uniform4fv(host.meshSpotLightDirectionLocation, new Float32Array(packet.spotLightDirection || [0, -1, 0, 0]));
-  gl.uniform4fv(host.meshSpotLightColorLocation, new Float32Array(packet.spotLightColor || [0, 0, 0, 0]));
-  gl.uniform4fv(host.meshSpotLightConeLocation, new Float32Array(packet.spotLightCone || [0.95, 0.85, 1, 0]));
-  gl.uniform3fv(host.meshCameraPositionLocation, new Float32Array(packet.cameraPosition || [0, 0, 6]));
+  if (clearFrame) {
+    gl.viewport(0, 0, host.width || 1, host.height || 1);
+    setDepthTestCached(host, true);
+    setDepthFuncCached(host, gl.LEQUAL);
+    const clear = packet.clearColor || [0, 0, 0, 1];
+    gl.clearColor(clear[0], clear[1], clear[2], clear[3]);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    drawSkybox(host, packet);
+  }
+  setBlendCached(host, false);
+  useProgramCached(host, host.meshProgram);
+  uniform3fvFromArray(host, host.meshAmbientLightLocation, host.scratch3, packet.ambientLight, [0.28, 0.28, 0.28]);
+  uniform3fvFromArray(host, host.meshDirectionalLightDirectionLocation, host.scratch3, packet.directionalLightDirection, [-0.35, -0.75, -0.55]);
+  uniform3fvFromArray(host, host.meshDirectionalLightColorLocation, host.scratch3, packet.directionalLightColor, [0, 0, 0]);
+  uniform4fvFromArray(host, host.meshPointLightPositionLocation, host.scratch4, packet.pointLightPosition, [0, 0, 0, 1]);
+  uniform4fvFromArray(host, host.meshPointLightColorLocation, host.scratch4, packet.pointLightColor, [0, 0, 0, 0]);
+  uniform4fvFromArray(host, host.meshSpotLightPositionLocation, host.scratch4, packet.spotLightPosition, [0, 0, 0, 1]);
+  uniform4fvFromArray(host, host.meshSpotLightDirectionLocation, host.scratch4, packet.spotLightDirection, [0, -1, 0, 0]);
+  uniform4fvFromArray(host, host.meshSpotLightColorLocation, host.scratch4, packet.spotLightColor, [0, 0, 0, 0]);
+  uniform4fvFromArray(host, host.meshSpotLightConeLocation, host.scratch4, packet.spotLightCone, [0.95, 0.85, 1, 0]);
+  uniform3fvFromArray(host, host.meshCameraPositionLocation, host.scratch3, packet.cameraPosition, [0, 0, 6]);
+  if (host.meshCameraRightUniformLocation !== null) uniform3fvFromArray(host, host.meshCameraRightUniformLocation, host.scratch3, packet.cameraRight, [1, 0, 0]);
+  if (host.meshCameraUpUniformLocation !== null) uniform3fvFromArray(host, host.meshCameraUpUniformLocation, host.scratch3, packet.cameraUp, [0, 1, 0]);
   if (host.meshPostProcessParamsLocation !== null) {
     const tone = packet.toneMappingParams || [1.0, 2.2, 0.0, 0.0];
     const mode = packet.toneMappingMode || 0;
-    gl.uniform4fv(host.meshPostProcessParamsLocation, new Float32Array([tone[0] || 1.0, tone[1] || 2.2, packet.hdrEnabled ? 1.0 : 0.0, mode]));
+    uniform4fCached(host, host.meshPostProcessParamsLocation, tone[0] || 1.0, tone[1] || 2.2, packet.hdrEnabled ? 1.0 : 0.0, mode);
   }
   if (host.meshSsaoParamsLocation !== null) {
     const ssao = packet.ssaoParams || [0.0, 0.75, 0.025, 16.0];
-    gl.uniform4fv(host.meshSsaoParamsLocation, new Float32Array([packet.ssaoEnabled ? 1.0 : 0.0, ssao[0] || 0.0, ssao[1] || 0.75, ssao[2] || 0.025]));
+    uniform4fCached(host, host.meshSsaoParamsLocation, packet.ssaoEnabled ? 1.0 : 0.0, ssao[0] || 0.0, ssao[1] || 0.75, ssao[2] || 0.025);
   }
-  gl.uniformMatrix4fv(host.meshViewProjLocation, false, viewProj);
+  uniformMatrix4fvCached(host, host.meshViewProjLocation, viewProj);
+  uniform1fCached(host, host.meshParticleModeLocation, 0);
   const clientAnimationEnabled = !!packet.clientAnimationEnabled;
   const clientAnimationTime = Number(packet.clientAnimationTime || 0);
   const clientAnimationAmplitude = Number(packet.clientAnimationAmplitude || 0);
-  // v60: keep animation entirely on the GPU. No C#/WASM transform diffs and no
-  // per-frame JS bufferSubData for transform matrices.
   setClientAnimationUniforms(host, clientAnimationEnabled, clientAnimationTime, clientAnimationAmplitude);
 
   let visibleChunks = 0;
@@ -1304,11 +2629,13 @@ export function renderHighScaleFrame(hostId, frameJson) {
   const tCull0 = performance.now();
   const drawBatchIndices = host.highScaleDrawList;
   let drawBatchCount = 0;
+  const layerFilter = layerFilterId === null || layerFilterId === undefined ? null : String(layerFilterId);
   for (const layer of host.highScaleLayers.values()) {
+    if (layerFilter !== null && layer.id !== layerFilter) continue;
     if (!layer.visible) continue;
     totalChunks += layer.chunks.length;
     for (const chunk of layer.chunks) {
-      if (!aabbIntersectsClip(viewProj, chunk.center, chunk.extents)) { culled += chunk.instanceCount; continue; }
+      if (!aabbIntersectsFrustum(viewProj, chunk.center, chunk.extents)) { culled += chunk.instanceCount; continue; }
       const lod = resolveLodIndex(layer, camera, chunk.center[0], chunk.center[1], chunk.center[2]);
       if (lod === 4) { lodC += chunk.instanceCount; culled += chunk.instanceCount; continue; }
       visibleChunks++;
@@ -1322,63 +2649,119 @@ export function renderHighScaleFrame(hostId, frameJson) {
   }
   const tCull1 = performance.now();
   const tDraw0 = performance.now();
-  for (let i = 0; i < drawBatchCount; i++) {
-    const batch = host.retainedBatchList[drawBatchIndices[i] | 0];
-    if (!batch) continue;
-    const resource = batch.meshIndex >= 0 ? host.meshResourceList[batch.meshIndex] : host.meshResources.get(batch.meshId);
-    if (!resource) continue;
-    prepareRetainedBatchTransformForFrame(host, batch, clientAnimationEnabled, clientAnimationTime, clientAnimationAmplitude);
-    drawRetainedBatchByIndex(host, drawBatchIndices[i]);
-    drawCalls++;
-    batches++;
-    partInstances += batch.instanceCount || 0;
-    triangles += ((resource.indexCount || 0) / 3) * (batch.instanceCount || 0);
+  const previousForceAlphaDitherOpaque = !!host.forceAlphaDitherOpaque;
+  host.forceAlphaDitherOpaque = true;
+  try {
+    for (let i = 0; i < drawBatchCount; i++) {
+      const batchIndex = drawBatchIndices[i] | 0;
+      const batch = host.retainedBatchList[batchIndex];
+      if (!batch) continue;
+      const resource = batch.meshIndex >= 0 ? host.meshResourceList[batch.meshIndex] : host.meshResources.get(batch.meshId);
+      if (!resource) continue;
+      if (passMode === 1 && batch.transparent) continue;
+      if (passMode === 2 && !batch.transparent) continue;
+      prepareRetainedBatchTransformForFrame(host, batch, clientAnimationEnabled, clientAnimationTime, clientAnimationAmplitude);
+      drawRetainedBatchByIndex(host, batchIndex);
+      drawCalls++;
+      batches++;
+      partInstances += batch.instanceCount || 0;
+      triangles += ((resource.indexCount || 0) / 3) * (batch.instanceCount || 0);
+    }
+  } finally {
+    host.forceAlphaDitherOpaque = previousForceAlphaDitherOpaque;
   }
   const tDraw1 = performance.now();
-  gl.bindBuffer(gl.ARRAY_BUFFER, null);
-  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
-  gl.bindTexture(gl.TEXTURE_2D, null);
-  gl.useProgram(null);
-  return [
-    visibleChunks, totalChunks, culled, lodD, lodS, lodP, lodB, lodC,
-    drawCalls, batches, Math.round(triangles), partInstances,
-    (tCull1 - tCull0).toFixed(3), (tDraw1 - tDraw0).toFixed(3), (performance.now() - t0).toFixed(3), host.isWebGl2 ? 2 : 1,
-    host.animationUploadBatches || 0, host.animationUploadBytes || 0, host.texturePayloadErrors || 0, host.palettePayloadErrors || 0
-  ].join(',');
+  if (clearFrame) {
+    bindArrayBufferCached(host, null);
+    bindElementArrayBufferCached(host, null);
+    bindTexture2DCached(host, 0, null);
+    resetTextureBindCache(host);
+    useProgramCached(host, null);
+  }
+  const metrics = host.highScaleMetricsScratch || (host.highScaleMetricsScratch = new Float64Array(20));
+  metrics[0] = visibleChunks; metrics[1] = totalChunks; metrics[2] = culled; metrics[3] = lodD; metrics[4] = lodS; metrics[5] = lodP; metrics[6] = lodB; metrics[7] = lodC;
+  metrics[8] = drawCalls; metrics[9] = batches; metrics[10] = Math.round(triangles); metrics[11] = partInstances;
+  metrics[12] = tCull1 - tCull0; metrics[13] = tDraw1 - tDraw0; metrics[14] = performance.now() - t0; metrics[15] = host.isWebGl2 ? 2 : 1;
+  metrics[16] = host.animationUploadBatches || 0; metrics[17] = host.animationUploadBytes || 0; metrics[18] = host.texturePayloadErrors || 0; metrics[19] = host.palettePayloadErrors || 0;
+  if (recordMetrics) host.lastHighScaleMetrics = metrics;
+  return metrics;
 }
 
-
 function setClientAnimationUniforms(host, enabled, time, amplitude) {
+  uniform1fCached(host, host.meshClientAnimationEnabledLocation, enabled ? 1 : 0);
+  uniform1fCached(host, host.meshClientAnimationTimeLocation, time || 0);
+  uniform1fCached(host, host.meshClientAnimationAmplitudeLocation, enabled ? Math.max(0, amplitude || 0) : 0);
+}
+
+function activateTextureUnitCached(host, textureUnitIndex) {
   const { gl } = host;
-  if (host.meshClientAnimationEnabledLocation) gl.uniform1f(host.meshClientAnimationEnabledLocation, enabled ? 1 : 0);
-  if (host.meshClientAnimationTimeLocation) gl.uniform1f(host.meshClientAnimationTimeLocation, time || 0);
-  if (host.meshClientAnimationAmplitudeLocation) gl.uniform1f(host.meshClientAnimationAmplitudeLocation, enabled ? Math.max(0, amplitude || 0) : 0);
+  if (!host.glState) host.glState = { activeTextureUnit: -1, texture2D: new Array(16).fill(null) };
+  if (host.glState.activeTextureUnit !== textureUnitIndex) {
+    gl.activeTexture(gl.TEXTURE0 + textureUnitIndex);
+    host.glState.activeTextureUnit = textureUnitIndex;
+  }
+}
+
+function bindTexture2DCached(host, textureUnitIndex, texture) {
+  const { gl } = host;
+  activateTextureUnitCached(host, textureUnitIndex);
+  if (host.glState.texture2D[textureUnitIndex] !== texture) {
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    host.glState.texture2D[textureUnitIndex] = texture;
+    host.glState.textureBinds++;
+  }
+}
+
+function resetTextureBindCache(host) {
+  if (!host || !host.glState) return;
+  host.glState.activeTextureUnit = -1;
+  host.glState.texture2D.fill(null);
+  host.glState.materialKey = '';
 }
 
 function bindTextureSlot(host, textureId, samplerLocation, enabledLocation, textureUnit, textureUnitIndex) {
   const { gl } = host;
   if (enabledLocation === null || samplerLocation === null || !textureId) {
-    if (enabledLocation !== null) gl.uniform1f(enabledLocation, 0);
+    uniform1fCached(host, enabledLocation, 0);
     return;
   }
   const textureResource = host.textureResources.get(textureId);
   if (!textureResource) {
-    gl.uniform1f(enabledLocation, 0);
+    uniform1fCached(host, enabledLocation, 0);
     return;
   }
-  gl.activeTexture(textureUnit);
-  gl.bindTexture(gl.TEXTURE_2D, textureResource.texture);
-  gl.uniform1i(samplerLocation, textureUnitIndex);
-  gl.uniform1f(enabledLocation, 1);
-  gl.activeTexture(gl.TEXTURE0);
+  bindTexture2DCached(host, textureUnitIndex, textureResource.texture);
+  uniform1iCached(host, samplerLocation, textureUnitIndex);
+  uniform1fCached(host, enabledLocation, 1);
+  activateTextureUnitCached(host, 0);
+}
+
+function ensureMaterialTextureKey(batch) {
+  const base = batch.baseColorTextureId || '';
+  const normal = batch.normalTextureId || '';
+  const mr = batch.metallicRoughnessTextureId || '';
+  const emissive = batch.emissiveTextureId || '';
+  if (batch._materialTextureKeyBase !== base ||
+      batch._materialTextureKeyNormal !== normal ||
+      batch._materialTextureKeyMr !== mr ||
+      batch._materialTextureKeyEmissive !== emissive) {
+    batch._materialTextureKeyBase = base;
+    batch._materialTextureKeyNormal = normal;
+    batch._materialTextureKeyMr = mr;
+    batch._materialTextureKeyEmissive = emissive;
+    batch.materialTextureKey = base + '|' + normal + '|' + mr + '|' + emissive;
+  }
+  return batch.materialTextureKey || '';
 }
 
 function bindMaterialTextures(host, batch) {
-  const { gl } = host;
-  bindTextureSlot(host, batch.baseColorTextureId || null, host.meshBaseColorTextureLocation, host.meshBaseColorTextureEnabledLocation, gl.TEXTURE2, 2);
-  bindTextureSlot(host, batch.normalTextureId || null, host.meshNormalTextureLocation, host.meshNormalTextureEnabledLocation, gl.TEXTURE3, 3);
-  bindTextureSlot(host, batch.metallicRoughnessTextureId || null, host.meshMetallicRoughnessTextureLocation, host.meshMetallicRoughnessTextureEnabledLocation, gl.TEXTURE4, 4);
-  bindTextureSlot(host, batch.emissiveTextureId || null, host.meshEmissiveTextureLocation, host.meshEmissiveTextureEnabledLocation, gl.TEXTURE5, 5);
+  const key = batch.materialTextureKey === undefined ? ensureMaterialTextureKey(batch) : batch.materialTextureKey;
+  if (host.glState && host.glState.materialKey === key) return;
+  bindTextureSlot(host, batch.baseColorTextureId || null, host.meshBaseColorTextureLocation, host.meshBaseColorTextureEnabledLocation, null, 2);
+  bindTextureSlot(host, batch.normalTextureId || null, host.meshNormalTextureLocation, host.meshNormalTextureEnabledLocation, null, 3);
+  bindTextureSlot(host, batch.metallicRoughnessTextureId || null, host.meshMetallicRoughnessTextureLocation, host.meshMetallicRoughnessTextureEnabledLocation, null, 4);
+  bindTextureSlot(host, batch.emissiveTextureId || null, host.meshEmissiveTextureLocation, host.meshEmissiveTextureEnabledLocation, null, 5);
+  if (host.glState) host.glState.materialKey = key;
 }
 
 
@@ -1391,68 +2774,82 @@ function bindSkyboxCubemapTextures(host, ids) {
     const id = complete ? ids[i] : null;
     const res = id ? host.textureResources.get(id) : null;
     if (!res || locations[i] === null) { complete = false; continue; }
-    gl.activeTexture(units[i]);
-    gl.bindTexture(gl.TEXTURE_2D, res.texture);
-    gl.uniform1i(locations[i], i);
+    bindTexture2DCached(host, i, res.texture);
+    uniform1iCached(host, locations[i], i);
   }
-  if (host.skyboxCubemapEnabledLocation !== null) gl.uniform1f(host.skyboxCubemapEnabledLocation, complete ? 1 : 0);
-  gl.activeTexture(gl.TEXTURE0);
+  uniform1fCached(host, host.skyboxCubemapEnabledLocation, complete ? 1 : 0);
+  activateTextureUnitCached(host, 0);
 }
 
 function drawMeshBatch(host, batch) {
   const { gl } = host;
   const resource = host.meshResources.get(batch.id);
   if (!resource || resource.indexCount === 0 || !batch.instanceData || batch.instanceCount <= 0) return;
+  const transparent = !!batch.transparent;
+  if (transparent) {
+    setBlendCached(host, true);
+    setBlendFuncCached(host, gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    setDepthMaskCached(host, false);
+  } else {
+    setBlendCached(host, false);
+    setDepthMaskCached(host, true);
+  }
   bindMeshGeometry(host, resource);
-  gl.uniform1f(host.meshLightingEnabledLocation, batch.lightingEnabled || 0);
-  if (host.meshNormalMapStrengthLocation !== null) gl.uniform1f(host.meshNormalMapStrengthLocation, batch.normalMapStrength || 0);
-  if (host.meshMaterialParamsLocation !== null) gl.uniform4f(host.meshMaterialParamsLocation, batch.metallic || 0, batch.roughness === undefined ? 1 : batch.roughness, 0, 0);
-  if (host.meshAlphaParamsLocation !== null) gl.uniform4f(host.meshAlphaParamsLocation, batch.alphaCutoff || 0, 0, 0, 0);
+  uniform1fCached(host, host.meshLightingEnabledLocation, batch.lightingEnabled || 0);
+  uniform1fCached(host, host.meshNormalMapStrengthLocation, batch.normalMapStrength || 0);
+  uniform4fCached(host, host.meshMaterialParamsLocation, batch.metallic || 0, batch.roughness === undefined ? 1 : batch.roughness, 0, 0);
+  uniform4fCached(host, host.meshAlphaParamsLocation, batch.alphaCutoff || 0, 0, 0, 0);
   if (host.meshEmissiveColorLocation !== null) {
     const em = batch.emissiveColor || [0, 0, 0, 0];
-    gl.uniform4f(host.meshEmissiveColorLocation, em[0] || 0, em[1] || 0, em[2] || 0, em[3] || 0);
+    uniform4fCached(host, host.meshEmissiveColorLocation, em[0] || 0, em[1] || 0, em[2] || 0, em[3] || 0);
   }
-  gl.uniform1f(host.meshUsePaletteLocation, 0);
+  uniform1fCached(host, host.meshUsePaletteLocation, 0);
   bindMaterialTextures(host, batch);
 
   if (host.instancing) {
     const buffer = getOrCreateInstanceBuffer(host, batch.id + '|l:' + (batch.lightingEnabled || 0));
-    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(batch.instanceData), gl.DYNAMIC_DRAW);
+    bindArrayBufferCached(host, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, batch.instanceData instanceof Float32Array ? batch.instanceData : new Float32Array(batch.instanceData), gl.DYNAMIC_DRAW);
     setInstanceAttribute(host, host.meshInstanceModel0Location, 4, 0);
     setInstanceAttribute(host, host.meshInstanceModel1Location, 4, 16);
     setInstanceAttribute(host, host.meshInstanceModel2Location, 4, 32);
     setInstanceAttribute(host, host.meshInstanceModel3Location, 4, 48);
     setInstanceAttribute(host, host.meshInstanceColorLocation, 4, 64);
-    gl.uniform1f(host.meshUseInstancingLocation, 1);
+    uniform1fCached(host, host.meshUseInstancingLocation, 1);
     host.instancing.drawElementsInstancedANGLE(gl.TRIANGLES, resource.indexCount, resource.indexType, 0, batch.instanceCount);
-    drawWireframeOverlayForCurrentBatch(host, resource, batch.instanceCount, true);
+    drawWireframeOverlayForCurrentBatch(host, resource, visible.count, true);
     resetInstanceDivisors(host);
   } else {
-    gl.uniform1f(host.meshUseInstancingLocation, 0);
+    uniform1fCached(host, host.meshUseInstancingLocation, 0);
     const data = batch.instanceData;
     for (let i = 0; i < batch.instanceCount; i++) {
       const o = i * 20;
-      gl.uniformMatrix4fv(host.meshModelLocation, false, new Float32Array(data.slice(o, o + 16)));
-      gl.uniform4fv(host.meshColorLocation, new Float32Array(data.slice(o + 16, o + 20)));
+      for (let j = 0; j < 16; j++) host.scratch16[j] = data[o + j] || 0;
+      uniformMatrix4fvCached(host, host.meshModelLocation, host.scratch16);
+      host.scratch4[0] = data[o + 16] || 0; host.scratch4[1] = data[o + 17] || 0; host.scratch4[2] = data[o + 18] || 0; host.scratch4[3] = data[o + 19] || 0;
+      uniform4fvFromArray(host, host.meshColorLocation, host.scratch4, host.scratch4, [1, 1, 1, 1]);
       gl.drawElements(gl.TRIANGLES, resource.indexCount, resource.indexType, 0);
       drawWireframeOverlayForCurrentBatch(host, resource, 1, false);
     }
+  }
+  if (transparent) {
+    setDepthMaskCached(host, true);
+    setBlendCached(host, false);
   }
 }
 
 function drawWireframeOverlayForCurrentBatch(host, resource, instanceCount, instanced) {
   if (!host.showWireframeOverlay || !resource || resource.wireframeIndexCount <= 0) return;
   const { gl } = host;
-  gl.uniform1f(host.meshLightingEnabledLocation, 0);
-  if (host.meshNormalMapStrengthLocation !== null) gl.uniform1f(host.meshNormalMapStrengthLocation, 0);
-  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, resource.wireframeIndexBuffer);
+  uniform1fCached(host, host.meshLightingEnabledLocation, 0);
+  uniform1fCached(host, host.meshNormalMapStrengthLocation, 0);
+  bindElementArrayBufferCached(host, resource.wireframeIndexBuffer);
   if (instanced && host.instancing) {
     host.instancing.drawElementsInstancedANGLE(gl.LINES, resource.wireframeIndexCount, gl.UNSIGNED_SHORT, 0, instanceCount);
   } else {
     gl.drawElements(gl.LINES, resource.wireframeIndexCount, gl.UNSIGNED_SHORT, 0);
   }
-  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, resource.indexBuffer);
+  bindElementArrayBufferCached(host, resource.indexBuffer);
 }
 
 function setInstanceAttribute(host, location, size, offset) {
@@ -1475,59 +2872,188 @@ function resetInstanceDivisors(host) {
   }
 }
 
+function compareControlPlaneDepth(a, b) { return (b.averageDepth || 0) - (a.averageDepth || 0); }
+
+function writeControlVertex(out, index, x, y, z, u, v) {
+  const o = index * 5;
+  out[o + 0] = x; out[o + 1] = y; out[o + 2] = z; out[o + 3] = u; out[o + 4] = v;
+}
+
+function normalize3Into(out, x, y, z, fx, fy, fz) {
+  const len = Math.hypot(x, y, z);
+  if (len <= 0.000001) { out[0] = fx; out[1] = fy; out[2] = fz; return out; }
+  const inv = 1 / len;
+  out[0] = x * inv; out[1] = y * inv; out[2] = z * inv;
+  return out;
+}
+
+function updateControlPlaneForFrame(host, plane, packet, viewProj) {
+  const src = plane.source;
+  const out = plane.vertices;
+  const billboard = (src[0] || 0) > 0.5;
+  if (billboard) {
+    const cx = src[1] || 0, cy = src[2] || 0, cz = src[3] || 0;
+    const ex = Math.max(src[4] || 0, 0.0001);
+    const ey = Math.max(src[5] || 0, 0.0001);
+    const roll = src[6] || 0;
+    const cp = packet.cameraPosition || [0, 0, 0];
+    const cup = packet.cameraUp || [0, 1, 0];
+    const scratchA = host.scratch3;
+    const scratchB = host.controlScratch3 || (host.controlScratch3 = new Float32Array(3));
+    const scratchC = host.controlScratch3b || (host.controlScratch3b = new Float32Array(3));
+    normalize3Into(scratchA, (cp[0] || 0) - cx, (cp[1] || 0) - cy, (cp[2] || 0) - cz, 0, 0, 1);
+    normalize3Into(scratchB, cup[0] || 0, cup[1] || 1, cup[2] || 0, 0, 1, 0);
+    // right = normalize(cross(up, frontToCamera))
+    normalize3Into(
+      scratchC,
+      scratchB[1] * scratchA[2] - scratchB[2] * scratchA[1],
+      scratchB[2] * scratchA[0] - scratchB[0] * scratchA[2],
+      scratchB[0] * scratchA[1] - scratchB[1] * scratchA[0],
+      1, 0, 0);
+    // up = normalize(cross(frontToCamera, right))
+    normalize3Into(
+      scratchB,
+      scratchA[1] * scratchC[2] - scratchA[2] * scratchC[1],
+      scratchA[2] * scratchC[0] - scratchA[0] * scratchC[2],
+      scratchA[0] * scratchC[1] - scratchA[1] * scratchC[0],
+      0, 1, 0);
+    if (Math.abs(roll) > 0.0001) {
+      const cos = Math.cos(roll), sin = Math.sin(roll);
+      const rx = scratchC[0] * cos + scratchB[0] * sin;
+      const ry = scratchC[1] * cos + scratchB[1] * sin;
+      const rz = scratchC[2] * cos + scratchB[2] * sin;
+      const ux = -scratchC[0] * sin + scratchB[0] * cos;
+      const uy = -scratchC[1] * sin + scratchB[1] * cos;
+      const uz = -scratchC[2] * sin + scratchB[2] * cos;
+      scratchC[0] = rx; scratchC[1] = ry; scratchC[2] = rz;
+      scratchB[0] = ux; scratchB[1] = uy; scratchB[2] = uz;
+    }
+    const rx = scratchC[0] * ex, ry = scratchC[1] * ex, rz = scratchC[2] * ex;
+    const ux = scratchB[0] * ey, uy = scratchB[1] * ey, uz = scratchB[2] * ey;
+    writeControlVertex(out, 0, cx - rx + ux, cy - ry + uy, cz - rz + uz, 0, 0);
+    writeControlVertex(out, 1, cx + rx + ux, cy + ry + uy, cz + rz + uz, 1, 0);
+    writeControlVertex(out, 2, cx + rx - ux, cy + ry - uy, cz + rz - uz, 1, 1);
+    writeControlVertex(out, 3, cx - rx - ux, cy - ry - uy, cz - rz - uz, 0, 1);
+  } else {
+    writeControlVertex(out, 0, src[8] || 0, src[9] || 0, src[10] || 0, 0, 0);
+    writeControlVertex(out, 1, src[11] || 0, src[12] || 0, src[13] || 0, 1, 0);
+    writeControlVertex(out, 2, src[14] || 0, src[15] || 0, src[16] || 0, 1, 1);
+    writeControlVertex(out, 3, src[17] || 0, src[18] || 0, src[19] || 0, 0, 1);
+  }
+  let depth = 0;
+  for (let i = 0; i < 4; i++) {
+    const o = i * 5;
+    const x = out[o], y = out[o + 1], z = out[o + 2];
+    const clipZ = x * viewProj[2] + y * viewProj[6] + z * viewProj[10] + viewProj[14];
+    const clipW = x * viewProj[3] + y * viewProj[7] + z * viewProj[11] + viewProj[15];
+    depth += Math.abs(clipW) > 0.000001 ? clipZ / clipW : clipZ;
+  }
+  plane.averageDepth = depth * 0.25;
+}
+
 function drawControlPlanes(host, packet, viewProj) {
   const { gl } = host;
-  if (!packet.controlPlanes || packet.controlPlanes.length === 0) return;
-  gl.enable(gl.BLEND);
-  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-  gl.depthMask(false);
-  gl.useProgram(host.texturedProgram);
-  gl.uniformMatrix4fv(host.texturedViewProjLocation, false, viewProj);
-  gl.activeTexture(gl.TEXTURE0);
-  gl.uniform1i(host.texturedSamplerLocation, 0);
-  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, host.quadIndexBuffer);
-  for (const plane of packet.controlPlanes) {
+  const planes = packet.controlPlanes || host.controlPlanes || [];
+  if (!planes || planes.length === 0) return;
+  const drawList = host.controlPlaneDrawList || planes;
+  for (let i = 0; i < planes.length; i++) {
+    updateControlPlaneForFrame(host, planes[i], packet, viewProj);
+    drawList[i] = planes[i];
+  }
+  drawList.length = planes.length;
+  drawList.sort(compareControlPlaneDepth);
+  setBlendCached(host, true);
+  setBlendFuncCached(host, gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  setDepthMaskCached(host, false);
+  useProgramCached(host, host.texturedProgram);
+  uniformMatrix4fvCached(host, host.texturedViewProjLocation, viewProj);
+  activateTextureUnitCached(host, 0);
+  uniform1iCached(host, host.texturedSamplerLocation, 0);
+  bindElementArrayBufferCached(host, host.quadIndexBuffer);
+  for (let i = 0; i < drawList.length; i++) {
+    const plane = drawList[i];
     const textureResource = host.textureResources.get(plane.textureId);
     if (!textureResource) continue;
     const vertexBuffer = getOrCreateControlBuffer(host, plane.id);
-    gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(plane.vertices), gl.DYNAMIC_DRAW);
+    bindArrayBufferCached(host, vertexBuffer);
+    if (!plane.gpuBufferInitialized) {
+      gl.bufferData(gl.ARRAY_BUFFER, plane.vertices.byteLength, gl.DYNAMIC_DRAW);
+      plane.gpuBufferInitialized = true;
+      plane.verticesDirty = true;
+    }
+    if (plane.alwaysFaceCamera || plane.verticesDirty) {
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, plane.vertices);
+      plane.verticesDirty = false;
+    }
     gl.enableVertexAttribArray(host.texturedPositionLocation);
     gl.vertexAttribPointer(host.texturedPositionLocation, 3, gl.FLOAT, false, 20, 0);
     gl.enableVertexAttribArray(host.texturedUvLocation);
     gl.vertexAttribPointer(host.texturedUvLocation, 2, gl.FLOAT, false, 20, 12);
-    gl.bindTexture(gl.TEXTURE_2D, textureResource.texture);
+    bindTexture2DCached(host, 0, textureResource.texture);
     gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
   }
-  gl.depthMask(true);
-  gl.disable(gl.BLEND);
+  setDepthMaskCached(host, true);
+  setBlendCached(host, false);
+}
+
+export function getWebGlStateMetric(hostId, index) {
+  const host = hosts.get(hostId);
+  const s = host && host.glState;
+  if (!s) return 0;
+  switch (index | 0) {
+    case 0: return s.stateChanges || 0;
+    case 1: return s.uniformUpdates || 0;
+    case 2: return s.textureBinds || 0;
+    case 3: return s.bufferBinds || 0;
+    case 4: return s.vaoBinds || 0;
+    default: return 0;
+  }
 }
 
 export function updateMetrics(hostId, text, visible) {
   const host = hosts.get(hostId);
   if (!host) return;
   const element = host.metricsElement;
-  if (!visible || !text) { element.style.display = 'none'; element.textContent = ''; return; }
-  element.textContent = text;
-  element.style.display = 'block';
+  const show = !!visible && !!text;
+  if (!show) {
+    if (host.lastMetricsVisible) element.style.display = 'none';
+    if (host.lastMetricsText) element.textContent = '';
+    host.lastMetricsVisible = false;
+    host.lastMetricsText = '';
+    return;
+  }
+  if (host.lastMetricsText !== text) {
+    element.textContent = text;
+    host.lastMetricsText = text;
+  }
+  if (!host.lastMetricsVisible) {
+    element.style.display = 'block';
+    host.lastMetricsVisible = true;
+  }
   const canvasLeft = parseFloat(host.canvas.style.left || '0') || 0;
   const canvasTop = parseFloat(host.canvas.style.top || '0') || 0;
   const canvasWidth = parseFloat(host.canvas.style.width || '0') || 0;
-  element.style.left = `${canvasLeft + canvasWidth - element.offsetWidth - 8}px`;
+  // Avoid layout reads such as offsetWidth in the render hot path. The overlay is debug-only;
+  // a fixed approximate width is sufficient and does not force reflow.
+  const approximateWidth = Math.min(360, Math.max(140, (text.length > 0 ? Math.min(text.length, 46) * 7 : 160)));
+  element.style.left = `${canvasLeft + canvasWidth - approximateWidth - 8}px`;
   element.style.top = `${canvasTop + 8}px`;
 }
 
 export function updateCenterCursor(hostId, visible) {
   const host = hosts.get(hostId);
   if (!host) return;
-  host.centerCursorVisible = !!visible;
+  const show = !!visible;
+  host.centerCursorVisible = show;
+  if (host.lastCenterCursorVisible === show && !show) return;
   const canvasLeft = parseFloat(host.canvas.style.left || '0') || 0;
   const canvasTop = parseFloat(host.canvas.style.top || '0') || 0;
   const canvasWidth = parseFloat(host.canvas.style.width || '0') || 0;
   const canvasHeight = parseFloat(host.canvas.style.height || '0') || 0;
   host.centerCursorElement.style.left = `${canvasLeft + canvasWidth * 0.5 - 12}px`;
   host.centerCursorElement.style.top = `${canvasTop + canvasHeight * 0.5 - 12}px`;
-  host.centerCursorElement.style.display = visible ? 'block' : 'none';
+  host.centerCursorElement.style.display = show ? 'block' : 'none';
+  host.lastCenterCursorVisible = show;
 }
 
 export function requestPointerLock(hostId) {
@@ -1549,12 +3075,18 @@ export function isPointerLockActive(hostId) {
   return !!host && document.pointerLockElement === host.canvas;
 }
 
-export function consumePointerDelta(hostId) {
+export function consumePointerDeltaX(hostId) {
   const host = hosts.get(hostId);
-  if (!host) return '0,0';
-  const x = host.pointerDeltaX || 0;
+  if (!host) return 0;
+  return host.pointerDeltaX || 0;
+}
+
+export function consumePointerDeltaY(hostId) {
+  const host = hosts.get(hostId);
+  if (!host) return 0;
   const y = host.pointerDeltaY || 0;
   host.pointerDeltaX = 0;
   host.pointerDeltaY = 0;
-  return `${x},${y}`;
+  return y;
 }
+

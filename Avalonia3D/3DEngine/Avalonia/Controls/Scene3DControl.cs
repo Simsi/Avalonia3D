@@ -142,18 +142,35 @@ public sealed class Scene3DControl : Border
         Child = _root;
 
         _scene = new Scene3D();
-        InteractionManager = new SceneInteractionManager(_scene, RequestRender, GetViewportSize);
-        InteractionManager.ObjectClicked += OnObjectClicked;
-        InteractionManager.SelectionChanged += OnSelectionChanged;
-        Adapters = new Avalonia3DAdapterRegistry(_scene);
+
         _controlAdapters = new Dictionary<ControlPlane3D, ControlPlaneRuntimeAdapter>();
         _creatingControlAdapters = new HashSet<ControlPlane3D>();
         _pressedKeys = new HashSet<Key>();
+
         _navigationTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
         _navigationTimer.Tick += OnNavigationTimerTick;
 
         _continuousRenderTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
-        _continuousRenderTimer.Tick += (_, _) => RequestPresenterRenderOnly();
+        _continuousRenderTimer.Tick += (_, _) => SafeDispatcherTick(RequestPresenterRenderOnly, "continuous render");
+
+        _snapshotFallbackTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(750)
+        };
+        _snapshotFallbackTimer.Tick += (sender, args) => SafeDispatcherTick(() => OnSnapshotFallbackTimerTick(sender, args), "snapshot fallback");
+
+        if (OperatingSystem.IsBrowser())
+        {
+            _scene.Performance.MaxLiveControlSnapshotsPerFrame = 1;
+            LiveControlSnapshotFps = 12d;
+            TargetFps = 60d;
+            UnlockedMaxFps = 60d;
+        }
+
+        InteractionManager = new SceneInteractionManager(_scene, RequestRender, GetViewportSize);
+        InteractionManager.ObjectClicked += OnObjectClicked;
+        InteractionManager.SelectionChanged += OnSelectionChanged;
+        Adapters = new Avalonia3DAdapterRegistry(_scene);
         _lastFrameAllocatedBytes = GC.GetTotalAllocatedBytes(false);
         _lastAllocationWindowBytes = _lastFrameAllocatedBytes;
         _lastAllocationWindowTicks = Stopwatch.GetTimestamp();
@@ -171,13 +188,20 @@ public sealed class Scene3DControl : Border
         UpdateContinuousRenderTimerState();
         UpdateRuntimeOptionsFromControl();
 
-        _snapshotFallbackTimer = new DispatcherTimer
-        {
-            Interval = TimeSpan.FromMilliseconds(750)
-        };
-        _snapshotFallbackTimer.Tick += OnSnapshotFallbackTimerTick;
-
         SubscribeToScene(_scene);
+    }
+
+    private static void SafeDispatcherTick(Action action, string name)
+    {
+        try
+        {
+            action();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"3DEngine Scene3DControl dispatcher tick failed ({name}): {ex}");
+            Debug.WriteLine($"3DEngine Scene3DControl dispatcher tick failed ({name}): " + ex);
+        }
     }
 
     public event EventHandler<ScenePointerEventArgs>? ObjectClicked;
@@ -350,7 +374,8 @@ public sealed class Scene3DControl : Border
         var plane = new ControlPlane3D(control)
         {
             Width = ToWorldUnits(control.Width, 320d),
-            Height = ToWorldUnits(control.Height, 180d)
+            Height = ToWorldUnits(control.Height, 180d),
+            RenderScale = OperatingSystem.IsBrowser() ? 1.25d : 2d
         };
 
         plane.Collider = new PlaneCollider3D { Size = new Vector2(plane.Width, plane.Height), LocalNormal = Vector3.UnitZ };
@@ -905,40 +930,43 @@ public sealed class Scene3DControl : Border
     private void UpdateRuntimeStats(RenderStats stats)
     {
         var now = Stopwatch.GetTimestamp();
-        var allocated = GC.GetTotalAllocatedBytes(false);
-        var frameAllocated = allocated - _lastFrameAllocatedBytes;
-        if (frameAllocated < 0) frameAllocated = 0;
-        _lastFrameAllocatedBytes = allocated;
-
-        if (_lastAllocationWindowTicks == 0)
+        if (ShowPerformanceMetrics)
         {
-            _lastAllocationWindowTicks = now;
-            _lastAllocationWindowBytes = allocated;
+            var allocated = GC.GetTotalAllocatedBytes(false);
+            var frameAllocated = allocated - _lastFrameAllocatedBytes;
+            if (frameAllocated < 0) frameAllocated = 0;
+            _lastFrameAllocatedBytes = allocated;
+
+            if (_lastAllocationWindowTicks == 0)
+            {
+                _lastAllocationWindowTicks = now;
+                _lastAllocationWindowBytes = allocated;
+            }
+
+            var allocElapsed = (now - _lastAllocationWindowTicks) * 1000d / Stopwatch.Frequency;
+            if (allocElapsed >= 250d)
+            {
+                var allocDelta = allocated - _lastAllocationWindowBytes;
+                _lastAllocatedMegabytesPerSecond = allocDelta <= 0 ? 0d : (allocDelta / (1024d * 1024d)) / (allocElapsed / 1000d);
+                _lastAllocationWindowBytes = allocated;
+                _lastAllocationWindowTicks = now;
+            }
+
+            var gen0 = GC.CollectionCount(0);
+            var gen1 = GC.CollectionCount(1);
+            var gen2 = GC.CollectionCount(2);
+            stats.Gen0Collections = gen0 - _lastGen0Count;
+            stats.Gen1Collections = gen1 - _lastGen1Count;
+            stats.Gen2Collections = gen2 - _lastGen2Count;
+            _lastGen0Count = gen0;
+            _lastGen1Count = gen1;
+            _lastGen2Count = gen2;
+
+            stats.AllocatedBytesPerFrame = frameAllocated;
+            stats.AllocatedMegabytesPerSecond = _lastAllocatedMegabytesPerSecond;
+            stats.ManagedAllocatedBytes = allocated;
+            stats.ManagedHeapBytes = GC.GetTotalMemory(false);
         }
-
-        var allocElapsed = (now - _lastAllocationWindowTicks) * 1000d / Stopwatch.Frequency;
-        if (allocElapsed >= 250d)
-        {
-            var allocDelta = allocated - _lastAllocationWindowBytes;
-            _lastAllocatedMegabytesPerSecond = allocDelta <= 0 ? 0d : (allocDelta / (1024d * 1024d)) / (allocElapsed / 1000d);
-            _lastAllocationWindowBytes = allocated;
-            _lastAllocationWindowTicks = now;
-        }
-
-        var gen0 = GC.CollectionCount(0);
-        var gen1 = GC.CollectionCount(1);
-        var gen2 = GC.CollectionCount(2);
-        stats.Gen0Collections = gen0 - _lastGen0Count;
-        stats.Gen1Collections = gen1 - _lastGen1Count;
-        stats.Gen2Collections = gen2 - _lastGen2Count;
-        _lastGen0Count = gen0;
-        _lastGen1Count = gen1;
-        _lastGen2Count = gen2;
-
-        stats.AllocatedBytesPerFrame = frameAllocated;
-        stats.AllocatedMegabytesPerSecond = _lastAllocatedMegabytesPerSecond;
-        stats.ManagedAllocatedBytes = allocated;
-        stats.ManagedHeapBytes = GC.GetTotalMemory(false);
         stats.FrameTotalMilliseconds = stats.BackendMilliseconds;
         if (_lastFrameRenderedTicks != 0)
         {
@@ -971,70 +999,85 @@ public sealed class Scene3DControl : Border
             return;
         }
 
-        var statsForRuntime = e.Stats ?? new RenderStats();
-        UpdateRuntimeStats(statsForRuntime);
-        FrameRendered?.Invoke(this, e);
-        if (ContinuousRendering && !FpsLockEnabled)
+        try
         {
-            RequestUnlockedFrameSoon();
-        }
+            var statsForRuntime = e.Stats ?? new RenderStats();
+            UpdateRuntimeStats(statsForRuntime);
+            try
+            {
+                FrameRendered?.Invoke(this, e);
+            }
+            catch (Exception subscriberEx)
+            {
+                Debug.WriteLine("3DEngine Scene3DControl FrameRendered subscriber failed: " + subscriberEx);
+            }
 
-        if (!ShowPerformanceMetrics)
-        {
-            return;
-        }
+            if (ContinuousRendering && !FpsLockEnabled)
+            {
+                RequestUnlockedFrameSoon();
+            }
 
-        _performanceFrameCount++;
-        _performanceFrameMillisecondsLast = e.FrameMilliseconds;
-        _performanceFrameMillisecondsTotal += e.FrameMilliseconds;
+            if (!ShowPerformanceMetrics)
+            {
+                return;
+            }
 
-        if (_performanceWindowStartTicks == 0)
-        {
+            _performanceFrameCount++;
+            _performanceFrameMillisecondsLast = e.FrameMilliseconds;
+            _performanceFrameMillisecondsTotal += e.FrameMilliseconds;
+
+            if (_performanceWindowStartTicks == 0)
+            {
+                _performanceWindowStartTicks = Stopwatch.GetTimestamp();
+                return;
+            }
+
+            var elapsedMilliseconds = (Stopwatch.GetTimestamp() - _performanceWindowStartTicks) * 1000d / Stopwatch.Frequency;
+            if (elapsedMilliseconds < PerformanceMetricsUpdateIntervalMilliseconds)
+            {
+                return;
+            }
+
+            var fps = _performanceFrameCount * 1000d / elapsedMilliseconds;
+            var averageFrameMilliseconds = _performanceFrameMillisecondsTotal / System.Math.Max(_performanceFrameCount, 1);
+            var stats = statsForRuntime;
+
+            // FrameRendered may be raised while Avalonia is inside a render pass.
+            // Updating TextBlock.Text there invalidates the visual tree during render.
+            // Apply the text later through the dispatcher instead.
+            _pendingPerformanceMetricsText =
+                $"FPS: {fps:0.0}\n" +
+                $"Frame: {_performanceFrameMillisecondsLast:0.00} ms | Avg: {averageFrameMilliseconds:0.00} ms\n" +
+                $"Backend: {e.Backend}\n" +
+                $"Objects: {stats.ObjectCount} | Renderables: {stats.RenderableCount} | Pickables: {stats.PickableCount} | Colliders: {stats.ColliderCount}\n" +
+                $"HighScale: {stats.HighScaleInstanceCount} | Chunks: {stats.VisibleChunkCount}/{stats.TotalChunkCount} | Culled: {stats.CulledObjectCount}\n" +
+                $"LOD D/S/P/B/C: {stats.LodDetailedCount}/{stats.LodSimplifiedCount}/{stats.LodProxyCount}/{stats.LodBillboardCount}/{stats.LodCulledCount} | PartInst: {stats.HighScaleVisiblePartInstanceCount}\n" +
+                $"Draw: {stats.DrawCallCount} | Batches: {stats.InstancedBatchCount} | Tris: {stats.TriangleCount}\n" +
+                $"Pipeline: mode={stats.RenderPipelineMode} deferred {OnOff(stats.DeferredActive)}/{OnOff(stats.DeferredRequested)} | GBuffer={OnOff(stats.GBufferActive)} targets={stats.GBufferTargetCount} | HDR={OnOff(stats.HdrActive)} tone={stats.ToneMappingMode} exp={stats.ToneMappingExposure:0.00} gamma={stats.ToneMappingGamma:0.00}\n" +
+                $"SSAO: {OnOff(stats.SsaoActive)}/{OnOff(stats.SsaoRequested)} samples={stats.SsaoSampleCount} | Passes={stats.RenderPassCount} | MotionVec={OnOff(stats.MotionVectorsActive)}/{OnOff(stats.MotionVectorsRequested)} | Reason={stats.RenderPipelineReason}\n" +
+                $"Particles: {stats.ParticleCount} in {stats.ParticleSystemCount} systems | ParticleVB: {stats.ParticleMeshUploadBytes / 1024d:0.0} KB | InstancedMesh: {stats.InstancedMeshInstanceCount} in {stats.InstancedMeshLayerCount} layers | Throughput retained/fallback: {stats.RetainedThroughputDrawCount}/{stats.ThroughputFallbackDrawCount}\n" +
+                $"Models: imported={stats.ImportedModelCount} skinned={stats.SkinnedModelCount} animated={stats.AnimatedModelCount} | Skin matrices={stats.SkinMatrixCount} prim={stats.SkinnedPrimitiveCount} payload={stats.SkinningVertexPayloadBytes / 1024d:0.0} KB | GPUSkin={OnOff(stats.GpuSkinningActive)}/{OnOff(stats.GpuSkinningRequested)} {stats.SkinningFallbackReason}\n" +
+                $"Lights D/P/S: {stats.DirectionalLightCount}/{stats.PointLightCount}/{stats.SpotLightCount} | Skybox: {(stats.SkyboxEnabled ? "on" : "off")} mode={stats.SkyboxMode} | Shadows: {(stats.DirectionalShadowEnabled ? "on" : "off")} {stats.ShadowMapResolution}px casters={stats.ShadowCasterCount} maps={stats.ShadowMapCount} {stats.ShadowMapMilliseconds:0.00} ms\n" +
+                $"TransformUpload: {stats.InstanceUploadBytes / (1024d * 1024d):0.00} MB | StateUpload: {stats.StateUploadBytes / 1024d:0.0} KB | TexUpload: {stats.TextureUploadBytes / (1024d * 1024d):0.00} MB\n" +
+                $"MeshUpload: {stats.MeshUploadBytes / 1024d:0.0} KB | V/I: {stats.VertexBufferUploadBytes / 1024d:0.0}/{stats.IndexBufferUploadBytes / 1024d:0.0} KB | Tangent: {stats.TangentUploadBytes / 1024d:0.0} KB | WireIdx: {stats.WireframeIndexUploadBytes / 1024d:0.0} KB\n" +
+                $"Surface: tangentMeshes={stats.TangentSpaceMeshCount} normalMapped={stats.NormalMappedMeshCount} wire/sil={stats.WireframeOverlayDrawCalls}/{stats.SilhouetteOverlayDrawCalls} | Geom: {stats.RenderGeometryCount} | VB/IB: {stats.VertexBufferUploadCount}/{stats.IndexBufferUploadCount} | PacketBytes: {stats.PacketBytes / 1024d:0.0} KB\n" +
+                $"Packet: {stats.PacketBuildMilliseconds:0.00} ms | Ser: {stats.SerializationMilliseconds:0.00} ms | Upload: {stats.UploadMilliseconds:0.00} ms | Backend: {stats.BackendMilliseconds:0.00} ms\n" +
+                $"WebGLv{stats.WebGlVersion} ClientHS: {(stats.WebGlClientHighScaleRuntime ? "on" : "off")} | GPUAnim: {(stats.WebGlClientGpuTransformAnimation ? "on" : "off")} | JS Cull: {stats.JsCullMilliseconds:0.00} ms | JS Draw: {stats.JsDrawMilliseconds:0.00} ms | JS Frame: {stats.JsFrameMilliseconds:0.00} ms | JS Batches: {stats.JsDrawBatchCount}\n" +
+                $"JSPatch T/S: {stats.JsTransformPatchRanges}/{stats.JsStatePatchRanges} ranges | {stats.JsTransformPatchBytes / 1024d:0.0}/{stats.JsStatePatchBytes / 1024d:0.0} KB | JSAnim: {stats.JsAnimationUploadBatches} batches/{stats.JsAnimationUploadBytes / 1024d:0.0} KB | TexErr: {stats.JsTexturePayloadErrors}/{stats.JsPalettePayloadErrors} | Patch: {stats.JsPatchMilliseconds:0.00} ms\n" +
+                $"Pick: {stats.PickingMilliseconds:0.00} ms | Phys: {stats.PhysicsMilliseconds:0.00} ms | Live: {stats.LiveSnapshotMilliseconds:0.00} ms\n" +
+                $"Alloc: {stats.AllocatedMegabytesPerSecond:0.00} MB/s | FrameAlloc: {stats.AllocatedBytesPerFrame / 1024d:0.0} KB | GC: {stats.Gen0Collections}/{stats.Gen1Collections}/{stats.Gen2Collections} | Heap: {stats.ManagedHeapBytes / (1024d * 1024d):0.0} MB\n" +
+                $"FPSLock: {(stats.FpsLocked ? "on" : "off")} {stats.TargetFps:0} | Interp: {(stats.FrameInterpolationEnabled ? "on" : "off")} a={stats.InterpolationAlpha:0.00} | Adaptive: {(stats.AdaptivePerformanceEnabled ? "on" : "off")} q={stats.AdaptiveQualityScale:0.00} | Delay: {stats.RenderScheduleDelayMilliseconds:0.00} ms\n" +
+                $"MeshCache: {stats.MeshCacheCount} | Registry: {stats.RegistryVersion}";
+            SchedulePerformanceMetricsTextUpdate();
+
+            _performanceFrameCount = 0;
+            _performanceFrameMillisecondsTotal = 0d;
             _performanceWindowStartTicks = Stopwatch.GetTimestamp();
-            return;
         }
-
-        var elapsedMilliseconds = (Stopwatch.GetTimestamp() - _performanceWindowStartTicks) * 1000d / Stopwatch.Frequency;
-        if (elapsedMilliseconds < PerformanceMetricsUpdateIntervalMilliseconds)
+        catch (Exception ex)
         {
-            return;
+            Debug.WriteLine("3DEngine Scene3DControl frame callback failed: " + ex);
         }
-
-        var fps = _performanceFrameCount * 1000d / elapsedMilliseconds;
-        var averageFrameMilliseconds = _performanceFrameMillisecondsTotal / System.Math.Max(_performanceFrameCount, 1);
-        var stats = statsForRuntime;
-
-        // FrameRendered may be raised while Avalonia is inside a render pass.
-        // Updating TextBlock.Text there invalidates the visual tree during render.
-        // Apply the text later through the dispatcher instead.
-        _pendingPerformanceMetricsText =
-            $"FPS: {fps:0.0}\n" +
-            $"Frame: {_performanceFrameMillisecondsLast:0.00} ms | Avg: {averageFrameMilliseconds:0.00} ms\n" +
-            $"Backend: {e.Backend}\n" +
-            $"Objects: {stats.ObjectCount} | Renderables: {stats.RenderableCount} | Pickables: {stats.PickableCount} | Colliders: {stats.ColliderCount}\n" +
-            $"HighScale: {stats.HighScaleInstanceCount} | Chunks: {stats.VisibleChunkCount}/{stats.TotalChunkCount} | Culled: {stats.CulledObjectCount}\n" +
-            $"LOD D/S/P/B/C: {stats.LodDetailedCount}/{stats.LodSimplifiedCount}/{stats.LodProxyCount}/{stats.LodBillboardCount}/{stats.LodCulledCount} | PartInst: {stats.HighScaleVisiblePartInstanceCount}\n" +
-            $"Draw: {stats.DrawCallCount} | Batches: {stats.InstancedBatchCount} | Tris: {stats.TriangleCount}\n" +
-            $"Pipeline: mode={stats.RenderPipelineMode} deferred {OnOff(stats.DeferredActive)}/{OnOff(stats.DeferredRequested)} | GBuffer={OnOff(stats.GBufferActive)} targets={stats.GBufferTargetCount} | HDR={OnOff(stats.HdrActive)} tone={stats.ToneMappingMode} exp={stats.ToneMappingExposure:0.00} gamma={stats.ToneMappingGamma:0.00}\n" +
-            $"SSAO: {OnOff(stats.SsaoActive)}/{OnOff(stats.SsaoRequested)} samples={stats.SsaoSampleCount} | Passes={stats.RenderPassCount} | MotionVec={OnOff(stats.MotionVectorsActive)}/{OnOff(stats.MotionVectorsRequested)} | Reason={stats.RenderPipelineReason}\n" +
-            $"Particles: {stats.ParticleCount} in {stats.ParticleSystemCount} systems | ParticleVB: {stats.ParticleMeshUploadBytes / 1024d:0.0} KB | InstancedMesh: {stats.InstancedMeshInstanceCount} in {stats.InstancedMeshLayerCount} layers | Throughput retained/fallback: {stats.RetainedThroughputDrawCount}/{stats.ThroughputFallbackDrawCount}\n" +
-            $"Models: imported={stats.ImportedModelCount} skinned={stats.SkinnedModelCount} animated={stats.AnimatedModelCount} | Skin matrices={stats.SkinMatrixCount} prim={stats.SkinnedPrimitiveCount} payload={stats.SkinningVertexPayloadBytes / 1024d:0.0} KB | GPUSkin={OnOff(stats.GpuSkinningActive)}/{OnOff(stats.GpuSkinningRequested)} {stats.SkinningFallbackReason}\n" +
-            $"Lights D/P/S: {stats.DirectionalLightCount}/{stats.PointLightCount}/{stats.SpotLightCount} | Skybox: {(stats.SkyboxEnabled ? "on" : "off")} mode={stats.SkyboxMode} | Shadows: {(stats.DirectionalShadowEnabled ? "on" : "off")} {stats.ShadowMapResolution}px casters={stats.ShadowCasterCount} maps={stats.ShadowMapCount} {stats.ShadowMapMilliseconds:0.00} ms\n" +
-            $"TransformUpload: {stats.InstanceUploadBytes / (1024d * 1024d):0.00} MB | StateUpload: {stats.StateUploadBytes / 1024d:0.0} KB | TexUpload: {stats.TextureUploadBytes / (1024d * 1024d):0.00} MB\n" +
-            $"MeshUpload: {stats.MeshUploadBytes / 1024d:0.0} KB | V/I: {stats.VertexBufferUploadBytes / 1024d:0.0}/{stats.IndexBufferUploadBytes / 1024d:0.0} KB | Tangent: {stats.TangentUploadBytes / 1024d:0.0} KB | WireIdx: {stats.WireframeIndexUploadBytes / 1024d:0.0} KB\n" +
-            $"Surface: tangentMeshes={stats.TangentSpaceMeshCount} normalMapped={stats.NormalMappedMeshCount} wire/sil={stats.WireframeOverlayDrawCalls}/{stats.SilhouetteOverlayDrawCalls} | Geom: {stats.RenderGeometryCount} | VB/IB: {stats.VertexBufferUploadCount}/{stats.IndexBufferUploadCount} | PacketBytes: {stats.PacketBytes / 1024d:0.0} KB\n" +
-            $"Packet: {stats.PacketBuildMilliseconds:0.00} ms | Ser: {stats.SerializationMilliseconds:0.00} ms | Upload: {stats.UploadMilliseconds:0.00} ms | Backend: {stats.BackendMilliseconds:0.00} ms\n" +
-            $"WebGLv{stats.WebGlVersion} ClientHS: {(stats.WebGlClientHighScaleRuntime ? "on" : "off")} | GPUAnim: {(stats.WebGlClientGpuTransformAnimation ? "on" : "off")} | JS Cull: {stats.JsCullMilliseconds:0.00} ms | JS Draw: {stats.JsDrawMilliseconds:0.00} ms | JS Frame: {stats.JsFrameMilliseconds:0.00} ms | JS Batches: {stats.JsDrawBatchCount}\n" +
-            $"JSPatch T/S: {stats.JsTransformPatchRanges}/{stats.JsStatePatchRanges} ranges | {stats.JsTransformPatchBytes / 1024d:0.0}/{stats.JsStatePatchBytes / 1024d:0.0} KB | JSAnim: {stats.JsAnimationUploadBatches} batches/{stats.JsAnimationUploadBytes / 1024d:0.0} KB | TexErr: {stats.JsTexturePayloadErrors}/{stats.JsPalettePayloadErrors} | Patch: {stats.JsPatchMilliseconds:0.00} ms\n" +
-            $"Pick: {stats.PickingMilliseconds:0.00} ms | Phys: {stats.PhysicsMilliseconds:0.00} ms | Live: {stats.LiveSnapshotMilliseconds:0.00} ms\n" +
-            $"Alloc: {stats.AllocatedMegabytesPerSecond:0.00} MB/s | FrameAlloc: {stats.AllocatedBytesPerFrame / 1024d:0.0} KB | GC: {stats.Gen0Collections}/{stats.Gen1Collections}/{stats.Gen2Collections} | Heap: {stats.ManagedHeapBytes / (1024d * 1024d):0.0} MB\n" +
-            $"FPSLock: {(stats.FpsLocked ? "on" : "off")} {stats.TargetFps:0} | Interp: {(stats.FrameInterpolationEnabled ? "on" : "off")} a={stats.InterpolationAlpha:0.00} | Adaptive: {(stats.AdaptivePerformanceEnabled ? "on" : "off")} q={stats.AdaptiveQualityScale:0.00} | Delay: {stats.RenderScheduleDelayMilliseconds:0.00} ms\n" +
-            $"MeshCache: {stats.MeshCacheCount} | Registry: {stats.RegistryVersion}";
-        SchedulePerformanceMetricsTextUpdate();
-
-        _performanceFrameCount = 0;
-        _performanceFrameMillisecondsTotal = 0d;
-        _performanceWindowStartTicks = Stopwatch.GetTimestamp();
     }
 
     private void SchedulePerformanceMetricsTextUpdate()
@@ -1065,6 +1108,7 @@ public sealed class Scene3DControl : Border
 
     private void UpdatePerformanceMetricsVisibility()
     {
+        Scene.Debug.ShowPerformanceMetrics = ShowPerformanceMetrics;
         _performanceMetricsHost.IsVisible = ShowPerformanceMetrics;
         if (!ShowPerformanceMetrics)
         {
@@ -1756,7 +1800,13 @@ public sealed class Scene3DControl : Border
     {
         var now = DateTime.UtcNow;
         var refreshed = 0;
-        var budget = System.Math.Max(1, Scene.Performance.MaxLiveControlSnapshotsPerFrame);
+        var budget = OperatingSystem.IsBrowser()
+            ? System.Math.Clamp(Scene.Performance.MaxLiveControlSnapshotsPerFrame, 0, 1)
+            : System.Math.Max(1, Scene.Performance.MaxLiveControlSnapshotsPerFrame);
+        if (budget <= 0)
+        {
+            return;
+        }
         foreach (var adapter in _controlAdapters.Values)
         {
             if (refreshed >= budget)
@@ -1789,7 +1839,7 @@ public sealed class Scene3DControl : Border
 
     private TimeSpan GetSnapshotMinInterval()
     {
-        var fps = System.Math.Clamp(LiveControlSnapshotFps, 1d, 120d);
+        var fps = System.Math.Clamp(LiveControlSnapshotFps, 1d, OperatingSystem.IsBrowser() ? 15d : 120d);
         return TimeSpan.FromSeconds(1d / fps);
     }
 

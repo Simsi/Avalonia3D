@@ -3,7 +3,6 @@ using System.Numerics;
 using ThreeDEngine.Core.Environment;
 using ThreeDEngine.Core.Lighting;
 using ThreeDEngine.Core.Rendering.Shadows;
-using ThreeDEngine.Core.Rendering.Pipeline;
 using ThreeDEngine.Core.Scene;
 
 namespace ThreeDEngine.Core.Rendering;
@@ -18,13 +17,13 @@ public static class SceneRenderPacketBuilder
         viewportSize.X = System.MathF.Max(viewportSize.X, 1f);
         viewportSize.Y = System.MathF.Max(viewportSize.Y, 1f);
 
-        var aspect = viewportSize.X / viewportSize.Y;
-        var view = scene.Camera.GetViewMatrix();
-        var projection = scene.Camera.GetProjectionMatrix(aspect);
+        var frame = SceneRenderFrameContext3D.Build(scene, viewportSize.X, viewportSize.Y, BackendKind.WebGlBrowser);
+        var view = frame.View;
+        var projection = frame.Projection;
 
         var objects = new List<RenderObjectPacket>();
 
-        foreach (var obj in scene.Registry.Renderables)
+        foreach (var obj in frame.Snapshot.Renderables)
         {
             if (obj is ThreeDEngine.Core.Particles.ParticleSystem3D particles)
             {
@@ -91,9 +90,9 @@ public static class SceneRenderPacketBuilder
         }
 
         var light = SceneLightingResolver3D.Resolve(scene);
-        var shadow = DirectionalShadowResolver3D.Resolve(scene);
+        var shadow = DirectionalShadowResolver3D.Resolve(scene, frame.Snapshot);
         var skybox = scene.Environment.Skybox;
-        var pipeline = RenderPipelinePlanner3D.Plan(scene, BackendKind.WebGlBrowser);
+        var pipeline = frame.Pipeline;
         return new SceneRenderPacket
         {
             Width = viewportSize.X,

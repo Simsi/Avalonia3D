@@ -1,5 +1,6 @@
 using System;
 using System.Numerics;
+using ThreeDEngine.Core.Collision;
 using ThreeDEngine.Core.Geometry;
 using ThreeDEngine.Core.Materials;
 using ThreeDEngine.Core.Scene;
@@ -14,6 +15,8 @@ public sealed class ModelPart3D : Object3D
     private Mesh3D? _deformedMesh;
     private readonly ModelMaterialAsset3D _assetMaterial;
     private int _deformedMeshFrame;
+    private Bounds3D _conservativeSkinnedLocalBounds = Bounds3D.Empty;
+    private int _conservativeSkinnedBoundsVersion = -1;
 
     internal ModelPart3D(ImportedModel3D model, ModelNode3D node, MeshAsset3D meshAsset, MeshPrimitiveAsset3D primitive, ModelMaterialAsset3D material, int primitiveIndex)
     {
@@ -39,6 +42,14 @@ public sealed class ModelPart3D : Object3D
     public int PrimitiveIndex { get; }
     public SkinAsset3D? Skin { get; }
     public Matrix4x4[] CurrentSkinMatrices { get; private set; } = Array.Empty<Matrix4x4>();
+
+    /// <summary>
+    /// Final per-bone matrices for GPU skinning in this ModelPart local space. These are the
+    /// same matrices used by the CPU skinning path after applying the inverse node transform;
+    /// renderers can therefore skin bind-pose vertices and then use GetLocalMatrix() normally.
+    /// </summary>
+    public Matrix4x4[] CurrentGpuSkinMatrices { get; private set; } = Array.Empty<Matrix4x4>();
+    public int SkinningVersion { get; private set; }
     public bool IsSkinned => Skin is not null && Primitive.HasSkinWeights;
     public ModelSkinningDiagnostics3D SkinningDiagnostics { get; private set; } = ModelSkinningDiagnostics3D.None;
     public string ModelElementPath => $"{Node.Path}/mesh[{MeshAsset.Index}]/primitive[{PrimitiveIndex}]";
@@ -48,17 +59,23 @@ public sealed class ModelPart3D : Object3D
         _nodeTransform = pose.GetNodeWorldTransform(Node.Index, Node.WorldTransform);
         UpdateInverseNodeTransform();
         CurrentSkinMatrices = Skin is not null ? pose.GetSkinMatrices(Skin.Index) : Array.Empty<Matrix4x4>();
+        CurrentGpuSkinMatrices = IsSkinned && CurrentSkinMatrices.Length > 0
+            ? BuildGpuSkinMatrices(CurrentSkinMatrices)
+            : Array.Empty<Matrix4x4>();
 
         if (IsSkinned && CurrentSkinMatrices.Length > 0)
         {
-            _deformedMeshFrame++;
-            _deformedMesh = BuildCpuSkinnedMesh();
-            MarkGeometryDirty(nameof(CurrentSkinMatrices));
+            SkinningVersion++;
+            _deformedMesh = null;
+            InvalidateWorldCacheRecursive();
+            RaiseChanged(SceneChangeKind.Transform);
         }
         else
         {
+            CurrentGpuSkinMatrices = Array.Empty<Matrix4x4>();
             _deformedMesh = null;
             InvalidateWorldCacheRecursive();
+            RaiseChanged(SceneChangeKind.Transform);
         }
     }
 
@@ -69,6 +86,50 @@ public sealed class ModelPart3D : Object3D
     public override Matrix4x4 GetLocalMatrix() => _nodeTransform * Transform.LocalMatrix;
 
     protected override Mesh3D BuildMesh() => _deformedMesh ?? _baseMesh;
+
+    public Mesh3D GetCpuSkinnedFallbackMesh()
+    {
+        if (!IsSkinned || CurrentSkinMatrices.Length == 0) return _baseMesh;
+        if (_deformedMesh is null || _deformedMeshFrame != SkinningVersion)
+        {
+            _deformedMesh = BuildCpuSkinnedMesh();
+            _deformedMeshFrame = SkinningVersion;
+        }
+
+        return _deformedMesh;
+    }
+
+    public override Bounds3D GetWorldBounds()
+    {
+        if (!IsSkinned || CurrentSkinMatrices.Length == 0) return base.GetWorldBounds();
+        var bounds = _baseMesh.LocalBounds;
+        if (!bounds.IsValid) return Bounds3D.Empty;
+
+        return GetConservativeSkinnedLocalBounds(bounds).Transform(GetModelMatrix());
+    }
+
+    private Bounds3D GetConservativeSkinnedLocalBounds(Bounds3D bindBounds)
+    {
+        if (_conservativeSkinnedBoundsVersion == SkinningVersion && _conservativeSkinnedLocalBounds.IsValid)
+        {
+            return _conservativeSkinnedLocalBounds;
+        }
+
+        var result = bindBounds;
+        var matrices = CurrentGpuSkinMatrices.Length > 0 ? CurrentGpuSkinMatrices : CurrentSkinMatrices;
+        for (var i = 0; i < matrices.Length; i++)
+        {
+            result = result.Encapsulate(bindBounds.Transform(matrices[i]));
+        }
+
+        // Pad by a small fraction so bounds stay conservative under blended bone weights and
+        // floating-point differences between CPU picking and GPU skinning paths.
+        var size = result.Size;
+        var pad = MathF.Max(0.025f, MathF.Max(size.X, MathF.Max(size.Y, size.Z)) * 0.05f);
+        _conservativeSkinnedLocalBounds = new Bounds3D(result.Min - new Vector3(pad), result.Max + new Vector3(pad));
+        _conservativeSkinnedBoundsVersion = SkinningVersion;
+        return _conservativeSkinnedLocalBounds;
+    }
 
     private void UpdateInverseNodeTransform()
     {
@@ -124,15 +185,32 @@ public sealed class ModelPart3D : Object3D
         }
 
         SkinningDiagnostics = ModelSkinningDiagnostics3D.None;
-        // Keep the resource key stable across animation frames. Render backends can then
-        // update existing dynamic buffers instead of allocating a new GPU resource per frame.
+        // Keep the resource key stable across animation frames. Render backends can update
+        // existing dynamic buffers instead of allocating a new GPU resource per frame.
         var dynamicResourceKey = $"{_baseMesh.ResourceKey}:cpu-skin:{Model.Id}:{Node.Index}:{PrimitiveIndex}";
         return new Mesh3D(
             deformedPositions,
             deformedNormals,
             Primitive.Indices,
             dynamicResourceKey,
-            texCoords0: Primitive.TexCoords0);
+            materialSlots: _baseMesh.MaterialSlots,
+            materialSlotBaseColors: _baseMesh.MaterialSlotBaseColors,
+            texCoords0: Primitive.TexCoords0,
+            vertexColors0: _baseMesh.VertexColors0,
+            tangents: _baseMesh.Tangents);
+    }
+
+    private Matrix4x4[] BuildGpuSkinMatrices(Matrix4x4[] source)
+    {
+        if (source.Length == 0) return Array.Empty<Matrix4x4>();
+        var result = new Matrix4x4[source.Length];
+        for (var i = 0; i < source.Length; i++)
+        {
+            // Match the CPU skinning path: skin vertices into this ModelPart's local space.
+            result[i] = source[i] * _inverseNodeTransform;
+        }
+
+        return result;
     }
 
     private static Vector3[] CreateFallbackNormals(int count)
@@ -142,6 +220,7 @@ public sealed class ModelPart3D : Object3D
         for (var i = 0; i < normals.Length; i++) normals[i] = Vector3.UnitY;
         return normals;
     }
+
     private static SkinningPlausibility EvaluateDeformationPlausibility(Vector3[] source, Vector3[] deformed)
     {
         if (source.Length == 0 || source.Length != deformed.Length)
@@ -186,11 +265,11 @@ public sealed class ModelPart3D : Object3D
         if (weight <= 0.000001f) return;
         var boneIndex = (int)MathF.Round(boneIndexValue);
         if ((uint)boneIndex >= (uint)CurrentSkinMatrices.Length) return;
+
         // CurrentSkinMatrices already contains inverseBind * jointGlobal in the engine's
         // row-vector convention. Apply the inverse mesh-node transform last so skinned
         // vertices stay in this ModelPart's local space; GetLocalMatrix() then places the
-        // part in the scene. The previous order inverted this chain and could explode
-        // rigged meshes into large spikes.
+        // part in the scene.
         var matrix = CurrentSkinMatrices[boneIndex] * _inverseNodeTransform;
         positionAccumulator += Vector3.Transform(position, matrix) * weight;
         normalAccumulator += Vector3.TransformNormal(normal, matrix) * weight;
