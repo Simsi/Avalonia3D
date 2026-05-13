@@ -1,5 +1,5 @@
 using System;
-using System.Globalization;
+using System.Runtime.CompilerServices;
 using ThreeDEngine.Core.Materials;
 using ThreeDEngine.Core.Primitives;
 
@@ -7,7 +7,9 @@ namespace ThreeDEngine.Core.Rendering;
 
 public readonly struct MaterialBinding3D : IEquatable<MaterialBinding3D>
 {
-    public MaterialBinding3D(Material3D material)
+    private static readonly ConditionalWeakTable<Material3D, CacheEntry> Cache = new();
+
+    private MaterialBinding3D(Material3D material)
     {
         material ??= Material3D.Default;
         BaseColor = material.EffectiveColor;
@@ -41,7 +43,21 @@ public readonly struct MaterialBinding3D : IEquatable<MaterialBinding3D>
         EmissiveTextureData = material.EmissiveTextureData;
         EmissiveTextureMimeType = material.EmissiveTextureMimeType;
         EmissiveTextureVersion = material.EmissiveTextureVersion;
-        Key = BuildKey(this);
+
+        // Assign the identity fields before passing this readonly struct to helpers. The values
+        // are immediately replaced, but the explicit initialization avoids definite-assignment
+        // ambiguity on stricter compilers.
+        KeyHash = 0UL;
+        BatchKeyHash = 0UL;
+        Key = string.Empty;
+        BatchKey = string.Empty;
+
+        var keyHash = ComputeSignatureHash(this, includeBaseColor: true);
+        var batchKeyHash = ComputeSignatureHash(this, includeBaseColor: false);
+        KeyHash = keyHash;
+        BatchKeyHash = batchKeyHash;
+        Key = RenderId3D.FormatStableHash(keyHash, "mat:");
+        BatchKey = RenderId3D.FormatStableHash(batchKeyHash, "matb:");
     }
 
     public ColorRgba BaseColor { get; }
@@ -80,22 +96,138 @@ public readonly struct MaterialBinding3D : IEquatable<MaterialBinding3D>
     public int EmissiveTextureVersion { get; }
     public bool HasEmissiveTexture => !string.IsNullOrWhiteSpace(EmissiveTextureKey) && EmissiveTextureData is { Length: > 0 };
     public string Key { get; }
+    public ulong KeyHash { get; }
+    /// <summary>
+    /// GPU retained batching key. Base color and opacity are intentionally excluded because
+    /// WebGL/OpenGL retained paths stream color as per-instance state; color-only changes should
+    /// not destroy and recreate retained batches.
+    /// </summary>
+    public string BatchKey { get; }
+    public ulong BatchKeyHash { get; }
     public RendererResourceKey ResourceKey => RendererResourceKey.Material(Key);
 
-    public static MaterialBinding3D FromMaterial(Material3D material) => new(material);
+    public static MaterialBinding3D FromMaterial(Material3D material)
+    {
+        material ??= Material3D.Default;
+        var entry = Cache.GetValue(material, static _ => new CacheEntry());
+        var version = material.Version;
+        if (entry.TryGet(version, out var cached))
+        {
+            return cached;
+        }
+
+        var created = new MaterialBinding3D(material);
+        entry.Set(version, created);
+        return created;
+    }
 
     public bool Equals(MaterialBinding3D other)
-        => Key == other.Key;
+        => KeyHash == other.KeyHash && string.Equals(Key, other.Key, StringComparison.Ordinal);
 
     public override bool Equals(object? obj) => obj is MaterialBinding3D other && Equals(other);
 
-    public override int GetHashCode() => StringComparer.Ordinal.GetHashCode(Key);
+    public override int GetHashCode() => KeyHash.GetHashCode();
 
-    private static string BuildKey(MaterialBinding3D m)
-        => "rgba(" + F(m.BaseColor.R) + "," + F(m.BaseColor.G) + "," + F(m.BaseColor.B) + "," + F(m.BaseColor.A) + ")|spec=" + F(m.SpecularColor.R) + "," + F(m.SpecularColor.G) + "," + F(m.SpecularColor.B) + "|" + m.Lighting + "|" + m.Surface + "|" + m.CullMode + "|a=" + F(m.AmbientStrength) + "|d=" + F(m.DiffuseStrength) + "|s=" + F(m.SpecularStrength) + "|sh=" + F(m.Shininess) + "|m=" + F(m.Metallic) + "|r=" + F(m.Roughness) + "|cut=" + F(m.AlphaCutoff) + "|ds=" + m.DoubleSided + "|em=" + F(m.EmissiveColor.R) + "," + F(m.EmissiveColor.G) + "," + F(m.EmissiveColor.B) + "," + F(m.EmissiveColor.A) + TextureKey("base", m.BaseColorTextureKey, m.BaseColorTextureVersion) + TextureKey("normal", m.NormalMapTextureKey, m.NormalMapTextureVersion) + "|ns=" + F(m.NormalMapStrength) + TextureKey("mr", m.MetallicRoughnessTextureKey, m.MetallicRoughnessTextureVersion) + TextureKey("emissive", m.EmissiveTextureKey, m.EmissiveTextureVersion);
+    private static ulong ComputeSignatureHash(MaterialBinding3D m, bool includeBaseColor)
+    {
+        unchecked
+        {
+            var hash = RenderId3D.FnvOffsetBasis;
+            hash = HashInt(hash, includeBaseColor ? 1 : 0);
+            if (includeBaseColor)
+            {
+                hash = HashColor(hash, m.BaseColor);
+            }
 
-    private static string TextureKey(string role, string? key, int version)
-        => "|" + role + "=" + (key ?? string.Empty) + "@" + version.ToString(CultureInfo.InvariantCulture);
+            hash = HashColor(hash, m.SpecularColor);
+            hash = HashInt(hash, (int)m.Lighting);
+            hash = HashInt(hash, (int)m.Surface);
+            hash = HashInt(hash, (int)m.CullMode);
+            hash = HashFloat4(hash, m.AmbientStrength);
+            hash = HashFloat4(hash, m.DiffuseStrength);
+            hash = HashFloat4(hash, m.SpecularStrength);
+            hash = HashFloat4(hash, m.Shininess);
+            hash = HashFloat4(hash, m.Metallic);
+            hash = HashFloat4(hash, m.Roughness);
+            hash = HashFloat4(hash, m.AlphaCutoff);
+            hash = HashInt(hash, m.DoubleSided ? 1 : 0);
+            hash = HashColor(hash, m.EmissiveColor);
+            hash = HashTexture(hash, m.BaseColorTextureKey, m.BaseColorTextureVersion);
+            hash = HashTexture(hash, m.NormalMapTextureKey, m.NormalMapTextureVersion);
+            hash = HashFloat4(hash, m.NormalMapStrength);
+            hash = HashTexture(hash, m.MetallicRoughnessTextureKey, m.MetallicRoughnessTextureVersion);
+            hash = HashTexture(hash, m.EmissiveTextureKey, m.EmissiveTextureVersion);
+            return hash == 0UL ? 1UL : hash;
+        }
+    }
 
-    private static string F(float value) => MathF.Round(value, 4).ToString("0.####", CultureInfo.InvariantCulture);
+    private static ulong HashTexture(ulong hash, string? key, int version)
+    {
+        hash = HashString(hash, key ?? string.Empty);
+        return HashInt(hash, version);
+    }
+
+    private static ulong HashColor(ulong hash, ColorRgba color)
+    {
+        hash = HashFloat4(hash, color.R);
+        hash = HashFloat4(hash, color.G);
+        hash = HashFloat4(hash, color.B);
+        return HashFloat4(hash, color.A);
+    }
+
+    private static ulong HashFloat4(ulong hash, float value)
+        => HashInt(hash, (int)MathF.Round(value * 10000f));
+
+    private static ulong HashString(ulong hash, string value)
+    {
+        unchecked
+        {
+            for (var i = 0; i < value.Length; i++)
+            {
+                hash ^= value[i];
+                hash *= RenderId3D.FnvPrime;
+            }
+            return hash;
+        }
+    }
+
+    private static ulong HashInt(ulong hash, int value)
+    {
+        unchecked
+        {
+            hash ^= (byte)value;
+            hash *= RenderId3D.FnvPrime;
+            hash ^= (byte)(value >> 8);
+            hash *= RenderId3D.FnvPrime;
+            hash ^= (byte)(value >> 16);
+            hash *= RenderId3D.FnvPrime;
+            hash ^= (byte)(value >> 24);
+            hash *= RenderId3D.FnvPrime;
+            return hash;
+        }
+    }
+
+    private sealed class CacheEntry
+    {
+        private int _version = int.MinValue;
+        private MaterialBinding3D _binding;
+
+        public bool TryGet(int version, out MaterialBinding3D binding)
+        {
+            if (_version == version)
+            {
+                binding = _binding;
+                return true;
+            }
+
+            binding = default;
+            return false;
+        }
+
+        public void Set(int version, MaterialBinding3D binding)
+        {
+            _version = version;
+            _binding = binding;
+        }
+    }
 }

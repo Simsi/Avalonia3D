@@ -30,10 +30,17 @@ internal sealed class WebGlRetainedOrdinaryRenderer
     private readonly HashSet<string> _liveBatchIds = new(StringComparer.Ordinal);
     private readonly List<WebGlRetainedBatchPacket> _drawRefs = new(256);
     private readonly List<string> _deadScratch = new(64);
+    private readonly Dictionary<string, ObjectSlot> _objectSlots = new(StringComparer.Ordinal);
+    private readonly List<Object3D> _transformScratch = new(256);
+    private readonly List<string> _dirtyTransformBatchIds = new(64);
+    private readonly HashSet<string> _dirtyTransformBatchIdSet = new(StringComparer.Ordinal);
+    private readonly List<string> _dirtyStateBatchIds = new(64);
+    private readonly HashSet<string> _dirtyStateBatchIdSet = new(StringComparer.Ordinal);
     private bool _sceneDirty = true;
     private bool _hasTransparentBatches;
     private int _lastInterpolationVersion = -1;
     private int _lastTransparentCameraVersion = -1;
+    private int _lastBatchTransformVersion = -1;
     private ulong _version;
     private ulong _lastDrawHash;
 
@@ -42,16 +49,20 @@ internal sealed class WebGlRetainedOrdinaryRenderer
     public bool RequiresScenePlan(SceneRenderFrameContext3D frame)
     {
         if (frame is null) throw new ArgumentNullException(nameof(frame));
+        var scene = frame.Scene;
+        var interpolationChanged = scene.FrameInterpolator.Enabled &&
+                                   _lastInterpolationVersion != scene.FrameInterpolator.RenderVersion;
         return _sceneDirty ||
-               _lastInterpolationVersion != frame.Scene.FrameInterpolator.RenderVersion ||
-               (_hasTransparentBatches && _lastTransparentCameraVersion != frame.Scene.CameraVersion);
+               interpolationChanged ||
+               (_hasTransparentBatches && _lastTransparentCameraVersion != scene.CameraVersion);
     }
 
     public void MarkDirty(SceneChangedEventArgs change)
     {
         // Camera and lighting changes are frame-global uniforms handled by the retained frame call;
-        // they must not force a CPU-side object/batch rebuild. Everything that can affect batch
-        // membership, transforms, materials, visibility or debug overlays is rebuilt lazily.
+        // they must not force a CPU-side object/batch rebuild. Pure transform/physics changes are
+        // patched into retained instance buffers by BatchTransformVersion, avoiding full render-plan
+        // rebuilds on browser physics/animation frames.
         if (change.Kind == SceneChangeKind.Camera)
         {
             if (_hasTransparentBatches)
@@ -68,6 +79,42 @@ internal sealed class WebGlRetainedOrdinaryRenderer
             return;
         }
 
+        if (change.Kind == SceneChangeKind.Transform || change.Kind == SceneChangeKind.Physics || change.Kind == SceneChangeKind.AnimationPose)
+        {
+            if (_objectSlots.Count == 0)
+            {
+                _sceneDirty = true;
+            }
+
+            return;
+        }
+
+        if (change.Kind == SceneChangeKind.Material && change.Source is not null)
+        {
+            if (_objectSlots.Count == 0)
+            {
+                _sceneDirty = true;
+                return;
+            }
+
+            if (_objectSlots.TryGetValue(change.Source.Id, out var slot) &&
+                slot.Batch.TryQueueMaterialStatePatch(change.Source, slot.Offset, out var requiresRebuild))
+            {
+                if (requiresRebuild)
+                {
+                    _sceneDirty = true;
+                    return;
+                }
+
+                if (_dirtyStateBatchIdSet.Add(slot.BatchId))
+                {
+                    _dirtyStateBatchIds.Add(slot.BatchId);
+                }
+
+                return;
+            }
+        }
+
         _sceneDirty = true;
     }
 
@@ -76,6 +123,7 @@ internal sealed class WebGlRetainedOrdinaryRenderer
         if (plan is null) throw new ArgumentNullException(nameof(plan));
         if (!plan.IncludesOrdinary)
         {
+            UploadIncrementalPatches(hostId, plan.Frame, stats);
             stats.DrawCallCount += _drawRefs.Count;
             stats.EstimatedDrawCallCount += _drawRefs.Count;
             stats.InstancedBatchCount += _drawRefs.Count;
@@ -84,7 +132,7 @@ internal sealed class WebGlRetainedOrdinaryRenderer
 
         var scene = plan.Frame.Scene;
         var interpolationVersion = scene.FrameInterpolator.RenderVersion;
-        if (_lastInterpolationVersion != interpolationVersion ||
+        if ((scene.FrameInterpolator.Enabled && _lastInterpolationVersion != interpolationVersion) ||
             (_hasTransparentBatches && _lastTransparentCameraVersion != scene.CameraVersion))
         {
             _sceneDirty = true;
@@ -92,6 +140,7 @@ internal sealed class WebGlRetainedOrdinaryRenderer
 
         if (!_sceneDirty)
         {
+            UploadIncrementalPatches(hostId, plan.Frame, stats);
             stats.DrawCallCount += _drawRefs.Count;
             stats.EstimatedDrawCallCount += _drawRefs.Count;
             stats.InstancedBatchCount += _drawRefs.Count;
@@ -102,6 +151,11 @@ internal sealed class WebGlRetainedOrdinaryRenderer
         _drawRefs.Clear();
         _liveBatchIds.Clear();
         _deadScratch.Clear();
+        _objectSlots.Clear();
+        _dirtyTransformBatchIds.Clear();
+        _dirtyTransformBatchIdSet.Clear();
+        _dirtyStateBatchIds.Clear();
+        _dirtyStateBatchIdSet.Clear();
         _hasTransparentBatches = false;
 
         var ordinaryBatches = plan.OrdinaryBatches;
@@ -114,7 +168,9 @@ internal sealed class WebGlRetainedOrdinaryRenderer
             batch.BeginFrame(plannedBatch.Mesh, plannedBatch.Material);
             for (var itemIndex = 0; itemIndex < plannedBatch.Items.Count; itemIndex++)
             {
-                batch.Add(plannedBatch.Items[itemIndex]);
+                var item = plannedBatch.Items[itemIndex];
+                var offset = batch.Add(item);
+                _objectSlots[item.Owner.Id] = new ObjectSlot(batchId, batch, offset);
             }
         }
 
@@ -126,7 +182,8 @@ internal sealed class WebGlRetainedOrdinaryRenderer
             var batch = GetOrCreateBatch(batchId);
             _liveBatchIds.Add(batchId);
             batch.BeginFrame(transparent.Item.Mesh, transparent.Item.Material);
-            batch.Add(transparent.Item);
+            var offset = batch.Add(transparent.Item);
+            _objectSlots[transparent.Item.Owner.Id] = new ObjectSlot(batchId, batch, offset);
         }
 
         var transparentBatches = plan.TransparentOrdinaryBatches;
@@ -139,7 +196,9 @@ internal sealed class WebGlRetainedOrdinaryRenderer
             batch.BeginFrame(plannedBatch.Mesh, plannedBatch.Material);
             for (var itemIndex = 0; itemIndex < plannedBatch.Items.Count; itemIndex++)
             {
-                batch.Add(plannedBatch.Items[itemIndex]);
+                var item = plannedBatch.Items[itemIndex];
+                var offset = batch.Add(item);
+                _objectSlots[item.Owner.Id] = new ObjectSlot(batchId, batch, offset);
             }
         }
 
@@ -204,7 +263,125 @@ internal sealed class WebGlRetainedOrdinaryRenderer
         _sceneDirty = false;
         _lastInterpolationVersion = interpolationVersion;
         _lastTransparentCameraVersion = scene.CameraVersion;
+        _lastBatchTransformVersion = scene.BatchTransformVersion;
         return _drawRefs;
+    }
+
+
+    private void UploadIncrementalPatches(int hostId, SceneRenderFrameContext3D frame, RenderStats stats)
+    {
+        UploadIncrementalTransformPatches(hostId, frame, stats);
+        UploadQueuedStatePatches(hostId, stats);
+    }
+
+    private void UploadQueuedStatePatches(int hostId, RenderStats stats)
+    {
+        if (_dirtyStateBatchIds.Count == 0)
+        {
+            return;
+        }
+
+        for (var i = 0; i < _dirtyStateBatchIds.Count; i++)
+        {
+            var batchId = _dirtyStateBatchIds[i];
+            if (_batches.TryGetValue(batchId, out var batch))
+            {
+                batch.UploadQueuedStateRanges(hostId, batchId, stats);
+            }
+        }
+
+        _dirtyStateBatchIds.Clear();
+        _dirtyStateBatchIdSet.Clear();
+    }
+
+    private void UploadIncrementalTransformPatches(int hostId, SceneRenderFrameContext3D frame, RenderStats stats)
+    {
+        var scene = frame.Scene;
+        if (_lastBatchTransformVersion == scene.BatchTransformVersion)
+        {
+            return;
+        }
+
+        if (_lastBatchTransformVersion < 0 || _objectSlots.Count == 0)
+        {
+            _sceneDirty = true;
+            return;
+        }
+
+        if (!scene.TryCopyBatchTransformChangesSince(_lastBatchTransformVersion, _transformScratch))
+        {
+            _sceneDirty = true;
+            _lastBatchTransformVersion = scene.BatchTransformVersion;
+            _transformScratch.Clear();
+            return;
+        }
+
+        if (_transformScratch.Count == 0)
+        {
+            _lastBatchTransformVersion = scene.BatchTransformVersion;
+            return;
+        }
+
+        _dirtyTransformBatchIds.Clear();
+        _dirtyTransformBatchIdSet.Clear();
+        for (var i = 0; i < _transformScratch.Count; i++)
+        {
+            var obj = _transformScratch[i];
+            if (obj is null)
+            {
+                continue;
+            }
+
+            if (!_objectSlots.TryGetValue(obj.Id, out var slot))
+            {
+                continue;
+            }
+
+            if (!obj.IsVisible || !obj.UseMeshRendering)
+            {
+                _sceneDirty = true;
+                continue;
+            }
+
+            var model = scene.FrameInterpolator.TryGetInterpolatedModel(obj.Id, out var interpolated)
+                ? interpolated
+                : obj.GetModelMatrix();
+            slot.Batch.WriteTransformAt(slot.Offset, model, obj.TransformVersion);
+            slot.Batch.QueueTransformDirtyOffset(slot.Offset);
+            if (_dirtyTransformBatchIdSet.Add(slot.BatchId))
+            {
+                _dirtyTransformBatchIds.Add(slot.BatchId);
+            }
+        }
+
+        for (var i = 0; i < _dirtyTransformBatchIds.Count; i++)
+        {
+            var batchId = _dirtyTransformBatchIds[i];
+            if (_batches.TryGetValue(batchId, out var batch))
+            {
+                batch.UploadQueuedTransformRanges(hostId, batchId, stats);
+                batch.UploadSkinningIfNeededForIncrementalPatch(hostId, batchId, stats);
+            }
+        }
+
+        _lastBatchTransformVersion = scene.BatchTransformVersion;
+        _transformScratch.Clear();
+        _dirtyTransformBatchIds.Clear();
+        _dirtyTransformBatchIdSet.Clear();
+    }
+
+    private readonly struct ObjectSlot
+    {
+        public ObjectSlot(string batchId, BatchState batch, int offset)
+        {
+            BatchId = batchId;
+            Batch = batch;
+            Offset = offset;
+        }
+
+        public string BatchId { get; }
+        public BatchState Batch { get; }
+        public int Offset { get; }
     }
 
     private static ulong ComputeDrawHash(List<WebGlRetainedBatchPacket> refs)
@@ -236,10 +413,17 @@ internal sealed class WebGlRetainedOrdinaryRenderer
         _drawRefs.Clear();
         _liveBatchIds.Clear();
         _deadScratch.Clear();
+        _objectSlots.Clear();
+        _transformScratch.Clear();
+        _dirtyTransformBatchIds.Clear();
+        _dirtyTransformBatchIdSet.Clear();
+        _dirtyStateBatchIds.Clear();
+        _dirtyStateBatchIdSet.Clear();
         _sceneDirty = true;
         _hasTransparentBatches = false;
         _lastInterpolationVersion = -1;
         _lastTransparentCameraVersion = -1;
+        _lastBatchTransformVersion = -1;
         _lastDrawHash = 0UL;
         _version++;
     }
@@ -306,13 +490,14 @@ internal sealed class WebGlRetainedOrdinaryRenderer
             }
         }
 
-        public void Add(OrdinaryRenderItem3D item)
+        public int Add(OrdinaryRenderItem3D item)
         {
             _objects.Add(item.Owner);
             var offset = _objects.Count - 1;
             EnsureCapacity(_objects.Count);
             WriteMatrix(_transforms, offset * TransformStride, item.Model);
             WriteColor(_state, offset * StateStride, item.Color);
+            return offset;
         }
 
         public bool EndFrameAndUpload(int hostId, string batchId, int interpolationVersion, RenderStats stats)
@@ -407,6 +592,68 @@ internal sealed class WebGlRetainedOrdinaryRenderer
         }
 
 
+        public void WriteTransformAt(int offset, Matrix4x4 model, int transformVersion)
+        {
+            if ((uint)offset >= (uint)_count)
+            {
+                return;
+            }
+
+            WriteMatrix(_transforms, offset * TransformStride, model);
+            _transformVersions[offset] = transformVersion;
+        }
+
+        public void QueueTransformDirtyOffset(int offset)
+        {
+            if ((uint)offset < (uint)_count)
+            {
+                _transformDirtyOffsets.Add(offset);
+            }
+        }
+
+        public bool UploadQueuedTransformRanges(int hostId, string batchId, RenderStats stats)
+        {
+            var changed = UploadDirtyRanges(hostId, batchId, _transformDirtyOffsets, _transforms, _count, TransformStride, true, stats);
+            _transformDirtyOffsets.Clear();
+            return changed;
+        }
+
+        public bool UploadSkinningIfNeededForIncrementalPatch(int hostId, string batchId, RenderStats stats)
+            => UploadSkinningIfNeeded(hostId, batchId, stats);
+
+        public bool TryQueueMaterialStatePatch(Object3D obj, int offset, out bool requiresRebuild)
+        {
+            requiresRebuild = false;
+            if ((uint)offset >= (uint)_count || !string.Equals(_objectIds[offset], obj.Id, StringComparison.Ordinal))
+            {
+                requiresRebuild = true;
+                return true;
+            }
+
+            var material = MaterialBinding3D.FromMaterial(obj.Material);
+            var transparent = material.Surface == SurfaceMode.Transparent || material.BaseColor.A < 0.999f;
+            if (!string.Equals(_material.BatchKey, material.BatchKey, StringComparison.Ordinal) || Transparent != transparent)
+            {
+                requiresRebuild = true;
+                return true;
+            }
+
+            var stateOffset = offset * StateStride;
+            WriteColor(_state, stateOffset, SceneOrdinaryRenderItemBuilder3D.ResolveColor(obj));
+            _materialVersions[offset] = obj.MaterialVersion;
+            _stateHashes[offset] = ComputeStateHash(_state, stateOffset);
+            _stateDirtyOffsets.Add(offset);
+            return true;
+        }
+
+        public bool UploadQueuedStateRanges(int hostId, string batchId, RenderStats stats)
+        {
+            var changed = UploadDirtyRanges(hostId, batchId, _stateDirtyOffsets, _state, _count, StateStride, false, stats);
+            _stateDirtyOffsets.Clear();
+            return changed;
+        }
+
+
         private bool UploadSkinningIfNeeded(int hostId, string batchId, RenderStats stats)
         {
             if (_objects.Count == 0 || _objects[0] is not ModelPart3D part || !part.IsSkinned || part.CurrentGpuSkinMatrices.Length == 0)
@@ -467,10 +714,19 @@ internal sealed class WebGlRetainedOrdinaryRenderer
             var previous = rangeStart;
             for (var i = 1; i <= dirtyOffsets.Count; i++)
             {
-                if (i < dirtyOffsets.Count && dirtyOffsets[i] == previous + 1)
+                if (i < dirtyOffsets.Count)
                 {
-                    previous = dirtyOffsets[i];
-                    continue;
+                    var current = dirtyOffsets[i];
+                    if (current == previous)
+                    {
+                        continue;
+                    }
+
+                    if (current == previous + 1)
+                    {
+                        previous = current;
+                        continue;
+                    }
                 }
 
                 var floatOffset = rangeStart * stride;

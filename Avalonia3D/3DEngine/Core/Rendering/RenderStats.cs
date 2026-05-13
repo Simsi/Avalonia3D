@@ -111,6 +111,10 @@ public string SkinningFallbackReason { get; set; } = string.Empty;
     public double UploadMilliseconds { get; set; }
     public double BackendMilliseconds { get; set; }
     public double PickingMilliseconds { get; set; }
+    public int ControlSnapshotRefreshCount { get; set; }
+    public int ControlSnapshotQueueHighWater { get; set; }
+    public int ControlPointerPickCount { get; set; }
+    public int ControlPlanePickTestCount { get; set; }
     public double PhysicsMilliseconds { get; set; }
     public double LiveSnapshotMilliseconds { get; set; }
     public double CpuPreparationMilliseconds { get; set; }
@@ -147,6 +151,12 @@ public string SkinningFallbackReason { get; set; } = string.Empty;
     public int JsDrawBatchCount { get; set; }
     public int JsTransformPatchRanges { get; set; }
     public int JsStatePatchRanges { get; set; }
+    public int JsHighScaleDirtyTransformInstances { get; set; }
+    public int JsHighScaleDirtyStateInstances { get; set; }
+    public int JsHighScalePatchRoutedTransformRefs { get; set; }
+    public int JsHighScalePatchRoutedStateRefs { get; set; }
+    public int JsHighScalePatchTouchedTransformBatches { get; set; }
+    public int JsHighScalePatchTouchedStateBatches { get; set; }
     public long JsTransformPatchBytes { get; set; }
     public long JsStatePatchBytes { get; set; }
     public int JsAnimationUploadBatches { get; set; }
@@ -158,6 +168,11 @@ public string SkinningFallbackReason { get; set; } = string.Empty;
     public int WebGlTextureBinds { get; set; }
     public int WebGlBufferBinds { get; set; }
     public int WebGlVaoBinds { get; set; }
+    public int WebGlLegacyDrawPathCalls { get; set; }
+    public int WebGlLegacyDrawPathBlockedCalls { get; set; }
+    public int WebGlLegacyStringProtocolCalls { get; set; }
+    public int WebGlBufferDataCalls { get; set; }
+    public int WebGlDynamicBufferDataCalls { get; set; }
 
     public static RenderStats Empty => new RenderStats();
 }

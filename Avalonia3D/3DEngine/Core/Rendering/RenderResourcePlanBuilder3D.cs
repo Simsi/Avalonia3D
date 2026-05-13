@@ -23,9 +23,26 @@ public static class RenderResourcePlanBuilder3D
         bool includesParticles,
         bool includesHighScale)
     {
-        if (frame is null) throw new ArgumentNullException(nameof(frame));
-
         var plan = new RenderResourcePlan3D(includesOrdinary, includesParticles, includesHighScale);
+        BuildInto(frame, ordinaryBatches, transparentOrdinaryItems, transparentOrdinaryBatches, particleItems, highScaleLayers, includesOrdinary, includesParticles, includesHighScale, plan);
+        return plan;
+    }
+
+    public static void BuildInto(
+        SceneRenderFrameContext3D frame,
+        System.Collections.Generic.IReadOnlyList<OrdinaryRenderBatch3D> ordinaryBatches,
+        System.Collections.Generic.IReadOnlyList<TransparentOrdinaryRenderItem3D> transparentOrdinaryItems,
+        System.Collections.Generic.IReadOnlyList<TransparentOrdinaryBatch3D> transparentOrdinaryBatches,
+        System.Collections.Generic.IReadOnlyList<ParticleRenderItem3D> particleItems,
+        System.Collections.Generic.IReadOnlyList<HighScaleInstanceLayer3D> highScaleLayers,
+        bool includesOrdinary,
+        bool includesParticles,
+        bool includesHighScale,
+        RenderResourcePlan3D plan)
+    {
+        if (frame is null) throw new ArgumentNullException(nameof(frame));
+        if (plan is null) throw new ArgumentNullException(nameof(plan));
+        plan.Reset(includesOrdinary, includesParticles, includesHighScale);
 
         if (includesOrdinary)
         {
@@ -70,7 +87,6 @@ public static class RenderResourcePlanBuilder3D
         }
 
         AddEnvironmentTextures(plan, frame.Scene.Environment.Skybox);
-        return plan;
     }
 
     private static void AddMaterialTextures(RenderResourcePlan3D plan, MaterialBinding3D material)

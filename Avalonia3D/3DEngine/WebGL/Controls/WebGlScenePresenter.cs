@@ -25,7 +25,7 @@ using ThreeDEngine.Core.Scene;
 
 namespace ThreeDEngine.Avalonia.WebGL.Controls;
 
-public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformanceMetricsOverlayPresenter, ICenterCursorOverlayPresenter, IPointerLockPresenter
+public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformanceMetricsOverlayPresenter, ICenterCursorOverlayPresenter, IPointerLockPresenter, IBrowserPageVisibilityPresenter
 {
     private readonly Dictionary<string, int> _textureVersions = new();
     private readonly Dictionary<string, int> _meshGeometryVersions = new();
@@ -56,12 +56,14 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
     private readonly WebGlRetainedHighScaleRenderer _retainedHighScale = new();
     private readonly WebGlClientHighScaleRenderer _clientHighScale = new();
     private readonly List<WebGlRetainedBatchPacket> _retainedBatches = new(256);
+    private readonly SceneRenderPlanScratch3D _renderPlanScratch = new();
     private readonly Dictionary<string, byte[]> _controlTexturePixelBuffers = new(StringComparer.Ordinal);
     private readonly HashSet<string> _liveTextureSweepScratch = new(StringComparer.Ordinal);
     private readonly List<string> _sweepRemovalScratch = new(64);
     private readonly List<ControlPlaneRenderItem3D> _controlPlaneItems = new(16);
     private readonly List<ControlPlaneUploadRecord> _controlPlaneRecords = new(16);
     private byte[] _controlPlanePlaneBytes = Array.Empty<byte>();
+    private byte[] _retainedDrawOrderBytes = Array.Empty<byte>();
     private readonly byte[] _viewProjectionBytes = new byte[16 * sizeof(float)];
     private readonly byte[] _cameraBytes = new byte[12 * sizeof(float)];
     private readonly byte[] _lightingBytes = new byte[33 * sizeof(float)];
@@ -135,6 +137,10 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
     }
 
     public bool SupportsPointerLock => true;
+
+    public bool IsDocumentHidden => _moduleReady && WebGlInterop.IsDocumentHidden();
+
+    public int DocumentVisibilityVersion => _moduleReady ? WebGlInterop.GetDocumentVisibilityVersion() : 0;
 
     public bool IsPointerLockActive => _moduleReady && _hostId >= 0 && WebGlInterop.IsPointerLockActive(_hostId);
 
@@ -342,6 +348,7 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         var particleNeedsPlan = _retainedParticles.RequiresScenePlan(frame);
         var plan = SceneRenderPlanBuilder3D.Build(
             frame,
+            _renderPlanScratch,
             requiresCpuSkinFallback: null,
             stats: stats,
             includeOrdinary: ordinaryNeedsPlan,
@@ -443,7 +450,7 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
             {
                 Debug.WriteLine("3DEngine WebGL FrameRendered subscriber failed: " + ex);
             }
-        }, DispatcherPriority.Background);
+        }, DispatcherPriority.Render);
     }
 
 
@@ -558,8 +565,9 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
                         {
                             output.Add(new WebGlRetainedBatchPacket
                             {
-                                Id = WebGlClientHighScaleRenderer.BuildLayerDrawCommandId(command.HighScaleLayer.Id),
+                                Id = command.HighScaleLayer.Id,
                                 Transparent = false,
+                                IsHighScaleLayer = true,
                                 SortDistanceSquared = command.SortDistanceSquared,
                                 DrawOrder = command.SourceOrder
                             });
@@ -575,6 +583,7 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
                             {
                                 Id = packet.Id,
                                 Transparent = packet.Transparent,
+                                IsHighScaleLayer = packet.IsHighScaleLayer,
                                 SortDistanceSquared = command.SortDistanceSquared,
                                 DrawOrder = command.SourceOrder
                             });
@@ -624,6 +633,7 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
             {
                 Id = packet.Id,
                 Transparent = packet.Transparent,
+                IsHighScaleLayer = packet.IsHighScaleLayer,
                 SortDistanceSquared = packet.SortDistanceSquared,
                 DrawOrder = packet.DrawOrder
             });
@@ -635,6 +645,7 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         {
             Id = packet.Id,
             Transparent = command.Transparent,
+            IsHighScaleLayer = packet.IsHighScaleLayer,
             SortDistanceSquared = command.SortDistanceSquared,
             DrawOrder = command.SourceOrder
         };
@@ -667,37 +678,49 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         _lastRetainedDrawOrderVersion = _combinedDrawListVersion;
         if (retainedBatches.Count == 0)
         {
-            WebGlInterop.SetRetainedDrawOrder(_hostId, string.Empty);
+            WebGlInterop.SetRetainedDrawOrderBytes(_hostId, 0, Array.Empty<byte>());
             return;
         }
 
-        var order = string.Create(EstimateDrawOrderLength(retainedBatches), retainedBatches, static (span, batches) =>
-        {
-            var pos = 0;
-            for (var i = 0; i < batches.Count; i++)
-            {
-                if (i > 0) span[pos++] = '\n';
-                var id = batches[i].Id;
-                for (var c = 0; c < id.Length; c++)
-                {
-                    var ch = id[c];
-                    if (ch != '\n' && ch != '\r') span[pos++] = ch;
-                }
-                span[pos++] = '|';
-                span[pos++] = batches[i].Transparent ? '1' : '0';
-            }
-        });
-        WebGlInterop.SetRetainedDrawOrder(_hostId, order);
-    }
+        var byteCount = retainedBatches.Count * RetainedDrawOrderRecordByteSize;
+        EnsureRetainedDrawOrderBuffer(byteCount);
 
-    private static int EstimateDrawOrderLength(List<WebGlRetainedBatchPacket> retainedBatches)
-    {
-        var length = retainedBatches.Count > 0 ? retainedBatches.Count - 1 : 0;
         for (var i = 0; i < retainedBatches.Count; i++)
         {
-            length += retainedBatches[i].Id.Length + 2;
+            var packet = retainedBatches[i];
+            var handle = RenderId3D.StableHash64(packet.Id);
+            var offset = i * RetainedDrawOrderRecordByteSize;
+            WriteUInt32(_retainedDrawOrderBytes, offset + 0, (uint)handle);
+            WriteUInt32(_retainedDrawOrderBytes, offset + 4, (uint)(handle >> 32));
+            var flags = (packet.Transparent ? 1u : 0u) | (packet.IsHighScaleLayer ? 2u : 0u);
+            WriteUInt32(_retainedDrawOrderBytes, offset + 8, flags);
         }
-        return length;
+
+        WebGlInterop.SetRetainedDrawOrderBytes(_hostId, retainedBatches.Count, _retainedDrawOrderBytes);
+        stats.PacketBytes += byteCount;
+    }
+
+    private const int RetainedDrawOrderRecordByteSize = 12;
+
+    private void EnsureRetainedDrawOrderBuffer(int byteCount)
+    {
+        if (byteCount <= 0)
+        {
+            return;
+        }
+
+        if (_retainedDrawOrderBytes.Length >= byteCount)
+        {
+            return;
+        }
+
+        var capacity = _retainedDrawOrderBytes.Length == 0 ? 512 : _retainedDrawOrderBytes.Length;
+        while (capacity < byteCount)
+        {
+            capacity *= 2;
+        }
+
+        _retainedDrawOrderBytes = new byte[capacity];
     }
 
     private static ulong ComputeClientHighScaleDrawOrderVersion(SceneRenderPlan3D plan)
@@ -713,7 +736,7 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
 
             hash = SceneRenderDrawOrder3D.HashPacket(
                 hash,
-                WebGlClientHighScaleRenderer.BuildLayerDrawCommandId(command.HighScaleLayer.Id),
+                command.HighScaleLayer.Id,
                 transparent: false,
                 sortDistanceSquared: command.SortDistanceSquared,
                 sourceOrder: command.SourceOrder,
@@ -731,7 +754,7 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
             var packet = retainedBatches[i];
             hash = SceneRenderDrawOrder3D.HashPacket(
                 hash,
-                packet.Id,
+                packet.IsHighScaleLayer ? "hs:" + packet.Id : packet.Id,
                 packet.Transparent,
                 packet.SortDistanceSquared,
                 packet.DrawOrder,
@@ -777,10 +800,18 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
     private void EnsureControlPlaneBuffers(int count)
     {
         var byteCount = Math.Max(0, count) * ControlPlaneUploadRecord.FloatStride * sizeof(float);
-        if (_controlPlanePlaneBytes.Length != byteCount)
+        if (byteCount <= 0 || _controlPlanePlaneBytes.Length >= byteCount)
         {
-            _controlPlanePlaneBytes = byteCount == 0 ? Array.Empty<byte>() : new byte[byteCount];
+            return;
         }
+
+        var capacity = _controlPlanePlaneBytes.Length == 0 ? 1024 : _controlPlanePlaneBytes.Length;
+        while (capacity < byteCount)
+        {
+            capacity *= 2;
+        }
+
+        _controlPlanePlaneBytes = new byte[capacity];
     }
 
     private static string BuildControlPlaneIdList(List<ControlPlaneUploadRecord> records)
@@ -901,13 +932,18 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
 
 
 
+    private static void WriteUInt32(byte[] destination, int byteOffset, uint value)
+    {
+        destination[byteOffset + 0] = (byte)value;
+        destination[byteOffset + 1] = (byte)(value >> 8);
+        destination[byteOffset + 2] = (byte)(value >> 16);
+        destination[byteOffset + 3] = (byte)(value >> 24);
+    }
+
     private static void WriteFloat(byte[] destination, int byteOffset, float value)
     {
         var bits = BitConverter.SingleToInt32Bits(value);
-        destination[byteOffset + 0] = (byte)bits;
-        destination[byteOffset + 1] = (byte)(bits >> 8);
-        destination[byteOffset + 2] = (byte)(bits >> 16);
-        destination[byteOffset + 3] = (byte)(bits >> 24);
+        WriteUInt32(destination, byteOffset, (uint)bits);
     }
 
     private void RenderRetainedFrameDirect(RenderStats stats, SceneRenderFrameContext3D frame)
@@ -1048,6 +1084,11 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         stats.WebGlTextureBinds = WebGlInterop.GetWebGlStateMetric(hostId, 2);
         stats.WebGlBufferBinds = WebGlInterop.GetWebGlStateMetric(hostId, 3);
         stats.WebGlVaoBinds = WebGlInterop.GetWebGlStateMetric(hostId, 4);
+        stats.WebGlLegacyDrawPathCalls = WebGlInterop.GetWebGlStateMetric(hostId, 5);
+        stats.WebGlLegacyDrawPathBlockedCalls = WebGlInterop.GetWebGlStateMetric(hostId, 6);
+        stats.WebGlLegacyStringProtocolCalls = WebGlInterop.GetWebGlStateMetric(hostId, 7);
+        stats.WebGlBufferDataCalls = WebGlInterop.GetWebGlStateMetric(hostId, 8);
+        stats.WebGlDynamicBufferDataCalls = WebGlInterop.GetWebGlStateMetric(hostId, 9);
     }
 
     private static void ApplyAnimationStats(RenderStats stats, SceneFrameSnapshot3D snapshot, bool gpuSkinningActive, string fallbackReason)

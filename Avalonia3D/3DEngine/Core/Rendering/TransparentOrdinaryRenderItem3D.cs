@@ -14,7 +14,7 @@ public readonly struct TransparentOrdinaryRenderItem3D
         Item = item;
         SortDistanceSquared = sortDistanceSquared;
         SourceOrder = sourceOrder;
-        DrawId = RenderId3D.StableHash(item.RetainedBatchId + ":transparent:" + item.Owner.Id + ":" + sourceOrder.ToString());
+        DrawId = RenderId3D.BuildTransparentDrawId(item.RetainedBatchId, item.Owner.Id, sourceOrder);
     }
 
     public OrdinaryRenderItem3D Item { get; }

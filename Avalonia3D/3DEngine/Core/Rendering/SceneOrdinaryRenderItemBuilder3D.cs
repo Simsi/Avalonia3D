@@ -21,7 +21,8 @@ public static class SceneOrdinaryRenderItemBuilder3D
         SceneFrameSnapshot3D snapshot,
         List<OrdinaryRenderItem3D> output,
         Func<ModelPart3D?, bool>? requiresCpuSkinFallback = null,
-        RenderStats? stats = null)
+        RenderStats? stats = null,
+        SceneRenderPlanScratch3D? scratch = null)
     {
         if (scene is null) throw new ArgumentNullException(nameof(scene));
         if (snapshot is null) throw new ArgumentNullException(nameof(snapshot));
@@ -61,8 +62,10 @@ public static class SceneOrdinaryRenderItemBuilder3D
             var material = MaterialBinding3D.FromMaterial(obj.Material);
             var usesGpuSkinning = skinnedPart is not null && skinnedPart.IsSkinned && !useCpuSkinFallback;
             var skinOwnerId = usesGpuSkinning ? obj.Id : null;
-            var logicalBatchKey = RenderId3D.BuildLogicalMeshBatchKey(mesh.ResourceKey, skinOwnerId);
-            var retainedBatchId = RenderId3D.BuildOrdinaryRetainedBatchId(mesh.ResourceKey, material.Key, skinOwnerId);
+            var logicalBatchKey = scratch?.GetLogicalMeshBatchKey(mesh.ResourceKey, skinOwnerId)
+                ?? RenderId3D.BuildLogicalMeshBatchKey(mesh.ResourceKey, skinOwnerId);
+            var retainedBatchId = scratch?.GetOrdinaryRetainedBatchId(mesh.ResourceKey, material.BatchKeyHash, skinOwnerId)
+                ?? RenderId3D.BuildOrdinaryRetainedBatchId(mesh.ResourceKey, material.BatchKeyHash, skinOwnerId);
 
             output.Add(new OrdinaryRenderItem3D(
                 obj,

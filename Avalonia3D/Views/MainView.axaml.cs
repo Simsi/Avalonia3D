@@ -74,7 +74,7 @@ public partial class MainView : UserControl
 
     private readonly Scene3DControl _sceneControl;
     private readonly DispatcherTimer _animationTimer;
-    private readonly Stopwatch _clock = Stopwatch.StartNew();
+    private readonly bool _driveAnimationFromRenderLoop;
     private readonly Random _random = new(20260506);
     private readonly List<Object3D> _selectableObjects = new();
     private readonly List<Object3D> _physicsObjects = new();
@@ -134,30 +134,34 @@ public partial class MainView : UserControl
     private float _doctorWatsonBaseY;
     private SceneFrameRenderedEventArgs? _lastFrame;
     private double _lastFrameTime;
+    private double _animationTimeSeconds;
+    private long _lastAnimationTick;
     private double _lastFps;
     private int _clickCount;
     private int _telemetryCursor;
     private int _embeddedCounter;
     private long _lastStatusTicks;
     private long _lastBackendTextTicks;
+    private string _lastStatusText = string.Empty;
 
     public MainView()
     {
         InitializeComponent();
 
         var isBrowser = OperatingSystem.IsBrowser();
+        _driveAnimationFromRenderLoop = isBrowser;
         _sceneControl = new Scene3DControl
         {
             HorizontalAlignment = HorizontalAlignment.Stretch,
             VerticalAlignment = VerticalAlignment.Stretch,
             ShowPerformanceMetrics = !isBrowser,
             ContinuousRendering = true,
-            ContinuousRenderingFps = isBrowser ? 30d : 60d,
+            ContinuousRenderingFps = 60d,
             FpsLockEnabled = true,
-            TargetFps = isBrowser ? 30d : 60d,
+            TargetFps = 60d,
             UnlockedMaxFps = isBrowser ? 60d : 180d,
             FrameInterpolationEnabled = !isBrowser,
-            FrameInterpolationTickFps = isBrowser ? 15d : 30d,
+            FrameInterpolationTickFps = 30d,
             AdaptivePerformanceEnabled = isBrowser,
             EnableSceneNavigation = true,
             ShowCenterCursor = !isBrowser,
@@ -168,12 +172,15 @@ public partial class MainView : UserControl
         _sceneControl.SelectionChanged += (_, e) => SetSelection(e.NewSelection);
         _sceneControl.FrameRendered += OnFrameRendered;
 
-        _animationTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(isBrowser ? 33 : 16) };
+        _animationTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
         _animationTimer.Tick += OnAnimationTick;
 
         BuildUi();
         LoadDemo(DemoSceneKind.PrimitivesAndMaterials);
-        _animationTimer.Start();
+        if (!_driveAnimationFromRenderLoop)
+        {
+            _animationTimer.Start();
+        }
     }
 
     protected override void OnDetachedFromVisualTree(VisualTreeAttachmentEventArgs e)
@@ -454,6 +461,9 @@ public partial class MainView : UserControl
         _shaderSun = null;
         _shaderAccent = null;
         _characterSequenceTime = 0f;
+        _animationTimeSeconds = 0d;
+        _lastAnimationTick = 0;
+        _lastFrameTime = 0d;
         _doctorWatsonBaseY = 0f;
         _clickCount = 0;
         _telemetryCursor = 0;
@@ -485,9 +495,10 @@ public partial class MainView : UserControl
         scene.Performance.EnableWebGlClientGpuTransformAnimation = false;
         scene.Performance.WebGlClientGpuTransformAnimationAmplitude = 0f;
         scene.Performance.EnableWebGlClientHighScaleRuntime = true;
+        scene.Performance.UseConservativeSkinnedPicking = OperatingSystem.IsBrowser();
         scene.Performance.EnableBakedHighScaleDetailedMeshes = true;
         scene.Performance.EnableHighScalePaletteTexture = true;
-        scene.FrameInterpolator.Enabled = true;
+        scene.FrameInterpolator.Enabled = !OperatingSystem.IsBrowser();
         scene.FrameInterpolator.SimulationTickFps = 30d;
         scene.PhysicsCore = null;
 
@@ -728,7 +739,7 @@ public partial class MainView : UserControl
             if (_rotatingBox is not null)
             {
                 var hue = (_embeddedCounter % 6) / 6f;
-                _rotatingBox.Material = Material3D.CreatePhong(ColorFromHue(hue), 0.55f, 72f);
+                _rotatingBox.Material.BaseColor = ColorFromHue(hue);
             }
         };
 
@@ -2165,7 +2176,7 @@ public partial class MainView : UserControl
                 _embeddedCounter++;
                 if (_rotatingBox is not null)
                 {
-                    _rotatingBox.Material = Material3D.CreatePhong(ColorFromHue((_embeddedCounter % 6) / 6f), 0.55f, 72f);
+                    _rotatingBox.Material.BaseColor = ColorFromHue((_embeddedCounter % 6) / 6f);
                 }
                 break;
             case DemoSceneKind.PickingAndInteraction:
@@ -2201,17 +2212,20 @@ public partial class MainView : UserControl
         SetSelection(_selectableObjects[next]);
     }
 
-    private void OnAnimationTick(object? sender, EventArgs e)
+    private void OnAnimationTick(object? sender, EventArgs e) => RunAnimationTick();
+
+    private void RunAnimationTick()
     {
         try
         {
-            var now = _clock.Elapsed.TotalSeconds;
-            var dt = _lastFrameTime <= 0d ? 1d / 60d : System.Math.Clamp(now - _lastFrameTime, 0.001d, 0.05d);
-            _lastFrameTime = now;
+            var nowTicks = Stopwatch.GetTimestamp();
+            var dt = ComputeAnimationDelta(nowTicks);
+            _animationTimeSeconds += dt;
+            _lastFrameTime = _animationTimeSeconds;
 
             if (_animateCheck is not null && _animateCheck.IsChecked == true)
             {
-                AnimateScene((float)now, (float)dt);
+                AnimateScene((float)_animationTimeSeconds, (float)dt);
             }
 
             UpdateStatus();
@@ -2222,11 +2236,35 @@ public partial class MainView : UserControl
         }
     }
 
+    private double ComputeAnimationDelta(long nowTicks)
+    {
+        if (_lastAnimationTick == 0)
+        {
+            _lastAnimationTick = nowTicks;
+            return 1d / 60d;
+        }
+
+        var rawDt = (nowTicks - _lastAnimationTick) / (double)Stopwatch.Frequency;
+        _lastAnimationTick = nowTicks;
+
+        if (rawDt > 0.25d)
+        {
+            _sceneControl.Scene.FrameInterpolator.Reset();
+            return 1d / 60d;
+        }
+
+        var maxDt = OperatingSystem.IsBrowser() ? 1d / 30d : 0.05d;
+        return System.Math.Clamp(rawDt, 0.001d, maxDt);
+    }
+
     private void AnimateScene(float t, float dt)
     {
         var scene = _sceneControl.Scene;
-        using (scene.BeginUpdate())
+        scene.BeginSimulationTick();
+        try
         {
+            using (scene.BeginUpdate())
+            {
             if (_rotatingBox is not null)
             {
                 _rotatingBox.RotationDegrees = new Vector3(10f + MathF.Sin(t * 0.9f) * 7f, t * 35f, MathF.Cos(t * 0.7f) * 5f);
@@ -2309,10 +2347,15 @@ public partial class MainView : UserControl
                 }
             }
 
-            if (_rackLayer is not null)
-            {
-                AnimateRackTelemetry(t);
+                if (_rackLayer is not null)
+                {
+                    AnimateRackTelemetry(t);
+                }
             }
+        }
+        finally
+        {
+            scene.EndSimulationTick();
         }
     }
 
@@ -2513,7 +2556,7 @@ public partial class MainView : UserControl
 
         _planetFocusPoint = PlanetPointFromLatLon(lat, lon);
         ShowPlanetLocationLabel(lat, lon, _planetFocusPoint);
-        UpdatePlanetFocusMarker((float)_clock.Elapsed.TotalSeconds);
+        UpdatePlanetFocusMarker((float)_animationTimeSeconds);
         var target = _planetMarker?.Position ?? (_planet.Position + _planetFocusPoint * (_planet.Radius + 0.12f));
         _cameraFlight.StartOrbitAround(
             _sceneControl.Scene.Camera,
@@ -2544,7 +2587,7 @@ public partial class MainView : UserControl
         if (_planetLatBox is not null) _planetLatBox.Text = lat.ToString("0.###", CultureInfo.InvariantCulture);
         if (_planetLonBox is not null) _planetLonBox.Text = lon.ToString("0.###", CultureInfo.InvariantCulture);
         _planetFocusPoint = PlanetPointFromLatLon(lat, lon);
-        UpdatePlanetFocusMarker((float)_clock.Elapsed.TotalSeconds);
+        UpdatePlanetFocusMarker((float)_animationTimeSeconds);
         if (showLabel) ShowPlanetLocationLabel(lat, lon, _planetFocusPoint);
     }
 
@@ -2838,6 +2881,11 @@ public partial class MainView : UserControl
             _lastBackendTextTicks = now;
             _backendText.Text = $"Backend: {e.Kind} | frame {e.FrameMilliseconds:0.00} ms";
         }
+
+        if (_driveAnimationFromRenderLoop)
+        {
+            RunAnimationTick();
+        }
     }
 
     private void UpdateStatus(bool force = false)
@@ -2848,14 +2896,15 @@ public partial class MainView : UserControl
         }
 
         var now = Stopwatch.GetTimestamp();
-        if (!force && _lastStatusTicks != 0 && (now - _lastStatusTicks) < Stopwatch.Frequency / 4)
+        var statusIntervalTicks = OperatingSystem.IsBrowser() ? Stopwatch.Frequency : Stopwatch.Frequency / 4;
+        if (!force && _lastStatusTicks != 0 && (now - _lastStatusTicks) < statusIntervalTicks)
         {
             return;
         }
         _lastStatusTicks = now;
 
         var stats = _lastFrame?.Stats ?? new RenderStats();
-        _statusText.Text =
+        var statusText =
             $"Demo: {GetDefinition(_activeDemo).Title}\n" +
             $"FPS: {_lastFps:0.0}\n" +
             $"Objects: {stats.ObjectCount:n0} | Renderables: {stats.RenderableCount:n0} | Pickables: {stats.PickableCount:n0}\n" +
@@ -2867,6 +2916,12 @@ public partial class MainView : UserControl
             (_activeDemo == DemoSceneKind.ImportedGlbModel && !string.IsNullOrWhiteSpace(_doctorWatsonImportInfo)
                 ? "\n" + _doctorWatsonImportInfo
                 : string.Empty);
+
+        if (!string.Equals(_lastStatusText, statusText, StringComparison.Ordinal))
+        {
+            _lastStatusText = statusText;
+            _statusText.Text = statusText;
+        }
     }
 
     private static IEnumerable<Matrix4x4> CreateRackTransforms(int columns, int rows, float spacingX, float spacingZ)

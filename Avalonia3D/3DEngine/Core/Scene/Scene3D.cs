@@ -37,6 +37,7 @@ public sealed class Scene3D
     private int _structureVersion;
     private const int MaxBatchTransformChangeLogEntries = 8192;
     private readonly List<BatchTransformChangeRecord> _batchTransformChangeLog = new();
+    private readonly HashSet<string> _batchTransformCopySeen = new(StringComparer.Ordinal);
     private int _batchTransformChangeLogFirstVersion = 1;
 
     public Scene3D()
@@ -129,30 +130,36 @@ public sealed class Scene3D
             return true;
         }
 
-        if (lastObservedBatchTransformVersion < 0 || lastObservedBatchTransformVersion < _batchTransformChangeLogFirstVersion - 1)
+        if (lastObservedBatchTransformVersion < 0 ||
+            lastObservedBatchTransformVersion > _batchTransformVersion ||
+            lastObservedBatchTransformVersion < _batchTransformChangeLogFirstVersion - 1)
         {
             return false;
         }
 
-        var seen = new HashSet<string>(StringComparer.Ordinal);
-        for (var i = 0; i < _batchTransformChangeLog.Count; i++)
+        var startIndex = System.Math.Max(0, lastObservedBatchTransformVersion - _batchTransformChangeLogFirstVersion + 1);
+        var seen = _batchTransformCopySeen;
+        seen.Clear();
+        try
         {
-            var record = _batchTransformChangeLog[i];
-            if (record.Version <= lastObservedBatchTransformVersion)
+            for (var i = startIndex; i < _batchTransformChangeLog.Count; i++)
             {
-                continue;
+                var record = _batchTransformChangeLog[i];
+                if (record.Source is null)
+                {
+                    output.Clear();
+                    return false;
+                }
+
+                AddTransformChangedObject(record.Source, output, seen);
             }
 
-            if (record.Source is null)
-            {
-                output.Clear();
-                return false;
-            }
-
-            AddTransformChangedObject(record.Source, output, seen);
+            return true;
         }
-
-        return true;
+        finally
+        {
+            seen.Clear();
+        }
     }
 
 
@@ -616,7 +623,7 @@ public sealed class Scene3D
 
     private static bool IsIncrementalBatchTransformChange(SceneChangeKind kind)
     {
-        return kind == SceneChangeKind.Transform || kind == SceneChangeKind.Physics;
+        return kind == SceneChangeKind.Transform || kind == SceneChangeKind.Physics || kind == SceneChangeKind.AnimationPose;
     }
 
     private static bool RequiresBatchContentInvalidation(SceneChangeKind kind)
@@ -632,6 +639,7 @@ public sealed class Scene3D
     {
         return kind == SceneChangeKind.Transform ||
                kind == SceneChangeKind.Physics ||
+               kind == SceneChangeKind.AnimationPose ||
                kind == SceneChangeKind.Unknown;
     }
 
@@ -663,12 +671,13 @@ public sealed class Scene3D
             return next;
         }
 
+        var source = ReferenceEquals(current.Source, next.Source) ? current.Source : null;
         if (current.Kind == SceneChangeKind.Structure || next.Kind == SceneChangeKind.Structure)
         {
-            return new SceneChangedEventArgs(SceneChangeKind.Structure, next.Source ?? current.Source);
+            return new SceneChangedEventArgs(SceneChangeKind.Structure, source);
         }
 
-        return new SceneChangedEventArgs(next.Kind == SceneChangeKind.Unknown ? current.Kind : next.Kind, next.Source ?? current.Source);
+        return new SceneChangedEventArgs(next.Kind == SceneChangeKind.Unknown ? current.Kind : next.Kind, source);
     }
 
     private void EndUpdate()

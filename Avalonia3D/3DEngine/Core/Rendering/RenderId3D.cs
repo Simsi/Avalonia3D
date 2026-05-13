@@ -11,6 +11,9 @@ namespace ThreeDEngine.Core.Rendering;
 /// </summary>
 public static class RenderId3D
 {
+    public const ulong FnvOffsetBasis = 14695981039346656037UL;
+    public const ulong FnvPrime = 1099511628211UL;
+
     public static string BuildLogicalMeshBatchKey(string meshResourceKey, string? gpuSkinOwnerId)
     {
         return string.IsNullOrEmpty(gpuSkinOwnerId)
@@ -20,8 +23,14 @@ public static class RenderId3D
 
     public static string BuildOrdinaryRetainedBatchId(string meshResourceKey, string materialKey, string? gpuSkinOwnerId)
     {
+        var materialHash = StableHash64(materialKey);
+        return BuildOrdinaryRetainedBatchId(meshResourceKey, materialHash, gpuSkinOwnerId);
+    }
+
+    public static string BuildOrdinaryRetainedBatchId(string meshResourceKey, ulong materialBatchHash, string? gpuSkinOwnerId)
+    {
         var skinKey = string.IsNullOrEmpty(gpuSkinOwnerId) ? string.Empty : ":skin:" + StableHash(gpuSkinOwnerId);
-        return "ord:" + StableHash(meshResourceKey) + ":" + StableHash(materialKey) + skinKey;
+        return "ord:" + FormatStableHash(StableHash64(meshResourceKey)) + ":" + FormatStableHash(materialBatchHash) + skinKey;
     }
 
     public static string BuildParticleRetainedBatchId(string particleSystemId, object renderMode)
@@ -30,19 +39,48 @@ public static class RenderId3D
     public static string BuildHighScaleBatchId(string layerId, int chunkX, int chunkY, int chunkZ, int lod, int partIndex)
         => $"hs:{layerId}:{chunkX}:{chunkY}:{chunkZ}:{lod}:{partIndex}";
 
-    public static string StableHash(string value)
+    public static string BuildTransparentDrawId(string retainedBatchId, string ownerId, int sourceOrder)
+    {
+        var hash = StableHash64(retainedBatchId);
+        hash = CombineStableHash(hash, StableHash64(ownerId));
+        hash = CombineStableHash(hash, unchecked((ulong)(uint)sourceOrder));
+        return FormatStableHash(hash, "tr:");
+    }
+
+    public static ulong CombineStableHash(ulong hash, ulong value)
     {
         unchecked
         {
-            ulong hash = 14695981039346656037UL;
+            hash ^= value & 0xFFUL; hash *= FnvPrime;
+            hash ^= (value >> 8) & 0xFFUL; hash *= FnvPrime;
+            hash ^= (value >> 16) & 0xFFUL; hash *= FnvPrime;
+            hash ^= (value >> 24) & 0xFFUL; hash *= FnvPrime;
+            hash ^= (value >> 32) & 0xFFUL; hash *= FnvPrime;
+            hash ^= (value >> 40) & 0xFFUL; hash *= FnvPrime;
+            hash ^= (value >> 48) & 0xFFUL; hash *= FnvPrime;
+            hash ^= (value >> 56) & 0xFFUL; hash *= FnvPrime;
+            return hash;
+        }
+    }
+
+    public static string StableHash(string value) => FormatStableHash(StableHash64(value));
+
+    public static string FormatStableHash(ulong hash, string prefix = "")
+        => prefix + hash.ToString("x16", CultureInfo.InvariantCulture);
+
+    public static ulong StableHash64(string? value)
+    {
+        unchecked
+        {
+            ulong hash = FnvOffsetBasis;
             value ??= string.Empty;
             for (var i = 0; i < value.Length; i++)
             {
                 hash ^= value[i];
-                hash *= 1099511628211UL;
+                hash *= FnvPrime;
             }
 
-            return hash.ToString("x16", CultureInfo.InvariantCulture);
+            return hash;
         }
     }
 }

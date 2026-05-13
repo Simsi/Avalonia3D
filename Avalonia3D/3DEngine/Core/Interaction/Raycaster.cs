@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Numerics;
 using ThreeDEngine.Core.Assets.Models;
@@ -21,13 +21,28 @@ public static class Raycaster
     private static SpatialQueryScratch3D? _queryScratch;
 
     public static PickingResult? Pick(Scene3D scene, Vector2 viewportPosition, Vector2 viewportSize)
-        => Pick(scene, viewportPosition, viewportSize, null);
+        => PickCore(scene, viewportPosition, viewportSize, null, null);
 
     public static PickingResult? Pick(
         Scene3D scene,
         Vector2 viewportPosition,
         Vector2 viewportSize,
         Func<Object3D, bool>? predicate)
+        => PickCore(scene, viewportPosition, viewportSize, predicate, null);
+
+    public static PickingResult? PickExcluding(
+        Scene3D scene,
+        Vector2 viewportPosition,
+        Vector2 viewportSize,
+        ISet<Object3D>? excludedObjects)
+        => PickCore(scene, viewportPosition, viewportSize, null, excludedObjects);
+
+    private static PickingResult? PickCore(
+        Scene3D scene,
+        Vector2 viewportPosition,
+        Vector2 viewportSize,
+        Func<Object3D, bool>? predicate,
+        ISet<Object3D>? excludedObjects)
     {
         var ray = ProjectionHelper.CreateRay(scene.Camera, viewportPosition, viewportSize);
         PickingResult? closest = null;
@@ -41,6 +56,11 @@ public static class Raycaster
         for (var objectIndex = 0; objectIndex < objects.Count; objectIndex++)
         {
             var obj = objects[objectIndex];
+            if (excludedObjects is not null && excludedObjects.Contains(obj))
+            {
+                continue;
+            }
+
             if (predicate is not null && !predicate(obj))
             {
                 continue;
@@ -58,7 +78,7 @@ public static class Raycaster
             }
 
             var hit = obj is ModelPart3D modelPart
-                ? PickModelPart(modelPart, ray)
+                ? PickModelPart(modelPart, ray, scene.Performance)
                 : PickObjectTriangles(obj, ray);
 
             if (hit is not null && (closest is null || hit.Distance < closest.Distance))
@@ -100,7 +120,7 @@ public static class Raycaster
         return new PickingResult(obj, worldPoint, worldDistance);
     }
 
-    private static PickingResult? PickModelPart(ModelPart3D part, Ray worldRay)
+    private static PickingResult? PickModelPart(ModelPart3D part, Ray worldRay, ScenePerformanceOptions performance)
     {
         var model = part.GetModelMatrix();
         if (!TryCreateLocalRay(worldRay, model, out var localRay))
@@ -115,9 +135,21 @@ public static class Raycaster
             // cheap conservative world-bounds test passes. This keeps hover picking over large
             // animated models from deforming/rebuilding data for rays that cannot hit the part.
             var worldBounds = part.GetWorldBounds();
-            if (worldBounds.IsValid && !IntersectsBounds(worldRay, worldBounds, out _, out _))
+            if (!worldBounds.IsValid || !IntersectsBounds(worldRay, worldBounds, out var boundsNear, out var boundsFar))
             {
                 return null;
+            }
+
+            if (performance.UseConservativeSkinnedPicking)
+            {
+                var distance = boundsNear >= 0f ? boundsNear : boundsFar;
+                if (!float.IsFinite(distance) || distance < 0f)
+                {
+                    return null;
+                }
+
+                var worldPoint1 = worldRay.Origin + worldRay.Direction * distance;
+                return new PickingResult(part, worldPoint1, distance, TryBuildBoundsModelHit(part, worldPoint1, distance));
             }
         }
 

@@ -187,7 +187,6 @@ internal sealed class WebGlRetainedParticleRenderer
         private int[] _particleSortOrder = Array.Empty<int>();
         private float[] _particleSortKeys = Array.Empty<float>();
         private int _capacity;
-        private int _lastInstanceCount;
         private string? _lastMeshKey;
         private string? _lastMaterialKey;
 
@@ -223,8 +222,7 @@ internal sealed class WebGlRetainedParticleRenderer
             stats.InstanceBufferUploads++;
             stats.InstanceUploadBytes += count * stride * sizeof(float);
 
-            if (_lastInstanceCount != count ||
-                !string.Equals(_lastMeshKey, mesh.ResourceKey, StringComparison.Ordinal) ||
+            if (!string.Equals(_lastMeshKey, mesh.ResourceKey, StringComparison.Ordinal) ||
                 !string.Equals(_lastMaterialKey, material.Key, StringComparison.Ordinal))
             {
                 WebGlInterop.UploadRetainedBatchMaterial(
@@ -246,7 +244,6 @@ internal sealed class WebGlRetainedParticleRenderer
                 _lastMaterialKey = material.Key;
             }
 
-            _lastInstanceCount = count;
             _lastMeshKey = mesh.ResourceKey;
         }
 

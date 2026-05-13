@@ -61,6 +61,12 @@ public sealed class Material3D
 
     public event EventHandler? Changed;
 
+    /// <summary>
+    /// Monotonic material signature version. Render-side caches use it to avoid rebuilding
+    /// material bindings and string keys for unchanged materials on every frame.
+    /// </summary>
+    public int Version { get; private set; }
+
     public static Material3D Default { get; } = new Material3D();
 
     public static Material3D CreateUnlit(ColorRgba color) => new Material3D { BaseColor = color, Lighting = LightingMode.Unlit };
@@ -496,5 +502,9 @@ public sealed class Material3D
             NormalMapStrength = NormalMapStrength
         };
 
-    private void RaiseChanged() => Changed?.Invoke(this, EventArgs.Empty);
+    private void RaiseChanged()
+    {
+        unchecked { Version++; }
+        Changed?.Invoke(this, EventArgs.Empty);
+    }
 }

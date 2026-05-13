@@ -4,6 +4,8 @@ namespace ThreeDEngine.Core.Rendering.Shadows;
 
 public sealed class DirectionalShadowSnapshot3D
 {
+    public static DirectionalShadowSnapshot3D Disabled { get; } = new DirectionalShadowSnapshot3D { IsEnabled = false, Resolution = 0, Reason = string.Empty };
+
     public bool IsEnabled { get; init; }
     public int Resolution { get; init; }
     public float Strength { get; init; }

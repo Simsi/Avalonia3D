@@ -96,8 +96,13 @@ public sealed class SceneObjectRegistry
 
     internal void Invalidate(SceneChangeKind kind, Object3D? source)
     {
-        if (kind == SceneChangeKind.Transform && !_dirty && source is not null)
+        if ((kind == SceneChangeKind.Transform || kind == SceneChangeKind.Physics) && !_dirty && source is not null)
         {
+            if (kind == SceneChangeKind.Transform && !CanAffectSpatialIndexes(source))
+            {
+                return;
+            }
+
             RefreshSpatialIndexes(source);
             return;
         }
@@ -117,11 +122,39 @@ public sealed class SceneObjectRegistry
         }
     }
 
+    private static bool CanAffectSpatialIndexes(Object3D obj)
+    {
+        if (ObjectUsesSpatialIndexes(obj))
+        {
+            return true;
+        }
+
+        if (obj is not CompositeObject3D composite)
+        {
+            return false;
+        }
+
+        foreach (var child in composite.EnumerateDescendants())
+        {
+            if (ObjectUsesSpatialIndexes(child))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool ObjectUsesSpatialIndexes(Object3D obj)
+        => obj.IsVisible && (obj.UseScenePicking || obj.Collider is not null);
+
     private void RefreshSpatialIndexesForObject(Object3D obj)
     {
-        if (obj.IsVisible && obj.UseScenePicking)
+        var visible = obj.IsVisible;
+        var collider = obj.Collider;
+        if (visible && obj.UseScenePicking)
         {
-            var bounds = obj.Collider?.GetWorldBounds(obj) ?? obj.GetWorldBounds();
+            var bounds = collider?.GetWorldBounds(obj) ?? obj.GetWorldBounds();
             PickableIndex.Update(obj, bounds);
         }
         else
@@ -129,9 +162,9 @@ public sealed class SceneObjectRegistry
             PickableIndex.Remove(obj);
         }
 
-        if (obj.IsVisible && obj.Collider is not null)
+        if (visible && collider is not null)
         {
-            ColliderIndex.Update(obj, obj.Collider.GetWorldBounds(obj));
+            ColliderIndex.Update(obj, collider.GetWorldBounds(obj));
         }
         else
         {

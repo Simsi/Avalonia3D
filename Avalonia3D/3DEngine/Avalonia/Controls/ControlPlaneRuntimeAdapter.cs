@@ -1,6 +1,6 @@
 using System;
 using System.Numerics;
-using System.Linq;
+using System.Collections.Generic;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
@@ -31,6 +31,7 @@ internal sealed class ControlPlaneRuntimeAdapter : IDisposable
     private bool _isUpdatingSnapshot;
     private DateTime _lastSnapshotUtc = DateTime.MinValue;
     private Size _lastRenderedSize;
+    private readonly List<Visual> _hitTestChildrenScratch = new(32);
 
     public ControlPlaneRuntimeAdapter(ControlPlane3D plane, Canvas host)
     {
@@ -46,6 +47,8 @@ internal sealed class ControlPlaneRuntimeAdapter : IDisposable
         _sourceControl.PropertyChanged += OnControlPropertyChanged;
         _sourceControl.LayoutUpdated += OnControlLayoutUpdated;
     }
+
+    public event Action<ControlPlaneRuntimeAdapter>? SnapshotDirtyRequested;
 
     public ControlPlane3D Plane => _plane;
     public Control SourceControl => _sourceControl;
@@ -70,6 +73,7 @@ internal sealed class ControlPlaneRuntimeAdapter : IDisposable
     public void MarkDirty()
     {
         _plane.MarkSnapshotDirty();
+        SnapshotDirtyRequested?.Invoke(this);
     }
 
     public void UpdateSnapshot(bool force = false)
@@ -601,40 +605,62 @@ internal sealed class ControlPlaneRuntimeAdapter : IDisposable
         return _sourceControl;
     }
 
-    private static Visual? FindDeepestVisualAtPoint(Visual root, Point pointInRoot)
+    private Visual? FindDeepestVisualAtPoint(Visual root, Point pointInRoot)
     {
-        if (!root.IsVisible || root is InputElement rootInput && !rootInput.IsHitTestVisible)
-        {
-            return null;
-        }
+        var current = root;
+        var currentPoint = pointInRoot;
 
-        var rootBounds = root.Bounds;
-        if (rootBounds.Width > 0d && rootBounds.Height > 0d)
+        while (true)
         {
-            if (pointInRoot.X < 0d || pointInRoot.Y < 0d || pointInRoot.X > rootBounds.Width || pointInRoot.Y > rootBounds.Height)
+            if (!IsVisualHitCandidate(current, currentPoint))
             {
                 return null;
             }
-        }
 
-        var children = root.GetVisualChildren().ToList();
-        for (var i = children.Count - 1; i >= 0; i--)
+            var children = _hitTestChildrenScratch;
+            children.Clear();
+            foreach (var child in current.GetVisualChildren())
+            {
+                children.Add(child);
+            }
+
+            Visual? next = null;
+            Point nextPoint = default;
+            for (var i = children.Count - 1; i >= 0; i--)
+            {
+                var child = children[i];
+                var pointInChild = current.TranslatePoint(currentPoint, child);
+                if (!pointInChild.HasValue || !IsVisualHitCandidate(child, pointInChild.Value))
+                {
+                    continue;
+                }
+
+                next = child;
+                nextPoint = pointInChild.Value;
+                break;
+            }
+
+            children.Clear();
+            if (next is null)
+            {
+                return current;
+            }
+
+            current = next;
+            currentPoint = nextPoint;
+        }
+    }
+
+    private static bool IsVisualHitCandidate(Visual visual, Point pointInVisual)
+    {
+        if (!visual.IsVisible || visual is InputElement input && !input.IsHitTestVisible)
         {
-            var child = children[i];
-            var pointInChild = root.TranslatePoint(pointInRoot, child);
-            if (!pointInChild.HasValue)
-            {
-                continue;
-            }
-
-            var hit = FindDeepestVisualAtPoint(child, pointInChild.Value);
-            if (hit is not null)
-            {
-                return hit;
-            }
+            return false;
         }
 
-        return root;
+        var bounds = visual.Bounds;
+        return bounds.Width <= 0d || bounds.Height <= 0d ||
+               (pointInVisual.X >= 0d && pointInVisual.Y >= 0d && pointInVisual.X <= bounds.Width && pointInVisual.Y <= bounds.Height);
     }
 
 

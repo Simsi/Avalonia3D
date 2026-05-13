@@ -1,6 +1,25 @@
 const hosts = new Map();
 let nextHostId = 1;
+let documentVisibilityVersion = 0;
 const uniformCacheByContext = new WeakMap();
+
+if (typeof document !== 'undefined' && document.addEventListener) {
+  document.addEventListener('visibilitychange', () => {
+    documentVisibilityVersion++;
+    for (const host of hosts.values()) {
+      host.pointerDeltaX = 0;
+      host.pointerDeltaY = 0;
+    }
+  }, true);
+}
+
+export function isDocumentHidden() {
+  return typeof document !== 'undefined' && !!document.hidden;
+}
+
+export function getDocumentVisibilityVersion() {
+  return documentVisibilityVersion;
+}
 
 function createShader(gl, type, source) {
   const shader = gl.createShader(type);
@@ -474,7 +493,11 @@ void main() {
     retainedBatches: new Map(),
     retainedBatchList: [],
     retainedBatchIdToIndex: new Map(),
+    retainedHandleRefs: new Map(),
+    highScaleLayerHandleRefs: new Map(),
     retainedDrawOrder: [],
+    allowLegacyDrawPath: false,
+    allowLegacyStringProtocol: false,
     controlPlanes: [],
     controlPlaneDrawList: [],
     emptyBatches: [],
@@ -508,7 +531,12 @@ void main() {
       uniformUpdates: 0,
       textureBinds: 0,
       bufferBinds: 0,
-      vaoBinds: 0
+      vaoBinds: 0,
+      legacyDrawPathCalls: 0,
+      legacyDrawPathBlockedCalls: 0,
+      legacyStringProtocolCalls: 0,
+      bufferDataCalls: 0,
+      dynamicBufferDataCalls: 0
     },
     maxDevicePixelRatio: 1.0,
     gpuSkinningSupported: (gl.getParameter(gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS) || 0) > 0 && (!!gl.getExtension('OES_texture_float') || !!gl.texImage3D),
@@ -619,6 +647,14 @@ export function createHost() {
       host.pointerDeltaY = 0;
     }
   };
+  host.contextMenuHandler = (event) => {
+    const rect = canvas.getBoundingClientRect();
+    const inside = event.clientX >= rect.left && event.clientX <= rect.right &&
+      event.clientY >= rect.top && event.clientY <= rect.bottom;
+    if (inside && canvas.style.display !== 'none') {
+      event.preventDefault();
+    }
+  };
   host.contextLostHandler = (event) => {
     event.preventDefault();
     host.contextLost = true;
@@ -629,12 +665,14 @@ export function createHost() {
     // GPU runtime immediately and ask C# to clear its upload-version caches on the next frame.
     const pointerMoveHandler = host.pointerMoveHandler;
     const pointerLockChangeHandler = host.pointerLockChangeHandler;
+    const contextMenuHandler = host.contextMenuHandler;
     const contextLostHandler = host.contextLostHandler;
     const contextRestoredHandler = host.contextRestoredHandler;
     const fresh = createHostState(canvas, gl, metricsElement, centerCursorElement);
     Object.assign(host, fresh);
     host.pointerMoveHandler = pointerMoveHandler;
     host.pointerLockChangeHandler = pointerLockChangeHandler;
+    host.contextMenuHandler = contextMenuHandler;
     host.contextLostHandler = contextLostHandler;
     host.contextRestoredHandler = contextRestoredHandler;
     host.contextLost = false;
@@ -644,6 +682,7 @@ export function createHost() {
   canvas.addEventListener('webglcontextlost', host.contextLostHandler, false);
   canvas.addEventListener('webglcontextrestored', host.contextRestoredHandler, false);
   document.addEventListener('mousemove', host.pointerMoveHandler, true);
+  document.addEventListener('contextmenu', host.contextMenuHandler, true);
   document.addEventListener('pointerlockchange', host.pointerLockChangeHandler, true);
   document.addEventListener('mozpointerlockchange', host.pointerLockChangeHandler, true);
   document.addEventListener('webkitpointerlockchange', host.pointerLockChangeHandler, true);
@@ -666,6 +705,7 @@ export function destroyHost(hostId) {
   if (host.contextLostHandler) host.canvas.removeEventListener('webglcontextlost', host.contextLostHandler, false);
   if (host.contextRestoredHandler) host.canvas.removeEventListener('webglcontextrestored', host.contextRestoredHandler, false);
   if (host.pointerMoveHandler) document.removeEventListener('mousemove', host.pointerMoveHandler, true);
+  if (host.contextMenuHandler) document.removeEventListener('contextmenu', host.contextMenuHandler, true);
   if (host.pointerLockChangeHandler) {
     document.removeEventListener('pointerlockchange', host.pointerLockChangeHandler, true);
     document.removeEventListener('mozpointerlockchange', host.pointerLockChangeHandler, true);
@@ -851,6 +891,7 @@ function uploadMeshGeometryTyped(hostId, meshId, vertexCount, indexCount, positi
       vaoExt: null,
       indexCount: 0,
       wireframeIndexCount: 0,
+      wireframeIndexType: gl.UNSIGNED_SHORT,
       indexType: gl.UNSIGNED_SHORT,
       hasTexCoords: false,
       hasTangents: false,
@@ -943,7 +984,14 @@ function uploadMeshGeometryTyped(hostId, meshId, vertexCount, indexCount, positi
 
   if (wireframeIndices && wireframeIndices.length > 0) {
     if (!resource.wireframeIndexBuffer) resource.wireframeIndexBuffer = gl.createBuffer();
-    const safeWireframe = wireframeIndices instanceof Uint16Array ? wireframeIndices : new Uint16Array(Array.from(wireframeIndices).filter(i => i <= 65535));
+    let safeWireframe = wireframeIndices;
+    if (wireframeIndices instanceof Uint32Array) {
+      if (!host.elementIndexUintExt) throw new Error('Wireframe for mesh ' + meshId + ' requires 32-bit indices, but OES_element_index_uint is unavailable.');
+      resource.wireframeIndexType = gl.UNSIGNED_INT;
+    } else {
+      resource.wireframeIndexType = gl.UNSIGNED_SHORT;
+      if (!(wireframeIndices instanceof Uint16Array)) safeWireframe = new Uint16Array(wireframeIndices);
+    }
     bindElementArrayBufferCached(host, resource.wireframeIndexBuffer);
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, safeWireframe, gl.STATIC_DRAW);
     resource.wireframeIndexCount = safeWireframe.length;
@@ -951,6 +999,7 @@ function uploadMeshGeometryTyped(hostId, meshId, vertexCount, indexCount, positi
     if (resource.wireframeIndexBuffer) gl.deleteBuffer(resource.wireframeIndexBuffer);
     resource.wireframeIndexBuffer = null;
     resource.wireframeIndexCount = 0;
+    resource.wireframeIndexType = gl.UNSIGNED_SHORT;
   }
 
   rebuildMeshVao(host, resource);
@@ -1093,6 +1142,50 @@ function decodeFloat32Base64(base64) {
   return decodeFloat32Payload(base64);
 }
 
+
+const fnv64Offset = typeof BigInt !== 'undefined' ? BigInt('0xcbf29ce484222325') : null;
+const fnv64Prime = typeof BigInt !== 'undefined' ? BigInt('0x100000001b3') : null;
+const uint64Mask = typeof BigInt !== 'undefined' ? BigInt('0xffffffffffffffff') : null;
+
+function stableHash64Utf16(value) {
+  if (typeof BigInt === 'undefined') return null;
+  const s = value === null || value === undefined ? '' : String(value);
+  let hash = fnv64Offset;
+  for (let i = 0; i < s.length; i++) {
+    hash ^= BigInt(s.charCodeAt(i));
+    hash = (hash * fnv64Prime) & uint64Mask;
+  }
+  return hash;
+}
+
+function handleKey(lo, hi) {
+  return ((lo >>> 0).toString(16)) + ':' + ((hi >>> 0).toString(16));
+}
+
+function handleKeyFromString(value) {
+  const hash = stableHash64Utf16(value);
+  if (hash === null) return null;
+  const lo = Number(hash & BigInt(0xffffffff));
+  const hi = Number((hash >> BigInt(32)) & BigInt(0xffffffff));
+  return handleKey(lo, hi);
+}
+
+function registerRetainedBatchHandle(host, batch) {
+  if (!host || !batch) return;
+  const key = handleKeyFromString(batch.batchId);
+  if (!key) return;
+  batch.handleKey = key;
+  host.retainedHandleRefs.set(key, { id: batch.batchId, batchIndex: batch.batchIndex, transparent: false });
+}
+
+function registerHighScaleLayerHandle(host, layer) {
+  if (!host || !layer) return;
+  const key = handleKeyFromString(layer.id);
+  if (!key) return;
+  layer.handleKey = key;
+  host.highScaleLayerHandleRefs.set(key, { id: layer.id, kind: 'highScaleLayer', layerId: layer.id, transparent: false });
+}
+
 function getOrCreateRetainedBatch(host, batchId) {
   let batch = host.retainedBatches.get(batchId);
   if (!batch) {
@@ -1113,6 +1206,8 @@ function getOrCreateRetainedBatch(host, batchId) {
       visibleStateData: new Float32Array(0),
       culledTransformBuffer: null,
       culledStateBuffer: null,
+      culledTransformCapacityFloats: 0,
+      culledStateCapacityFloats: 0,
       animatedTransformData: new Float32Array(0),
       animationFrameId: -1,
       animationActive: false,
@@ -1134,6 +1229,7 @@ function getOrCreateRetainedBatch(host, batchId) {
     host.retainedBatches.set(batchId, batch);
     host.retainedBatchIdToIndex.set(batchId, batch.batchIndex);
     host.retainedBatchList.push(batch);
+    registerRetainedBatchHandle(host, batch);
   }
   return batch;
 }
@@ -1154,7 +1250,7 @@ function uploadRetainedBatchTransforms(hostId, batchId, meshId, lightingEnabled,
   batch.animationFrameId = -1;
   batch.animationActive = false;
   bindArrayBufferCached(host, batch.transformBuffer);
-  gl.bufferData(gl.ARRAY_BUFFER, batch.baseTransformData, gl.DYNAMIC_DRAW);
+  trackedBufferData(host, gl.ARRAY_BUFFER, batch.baseTransformData, gl.DYNAMIC_DRAW);
   bindArrayBufferCached(host, null);
 }
 
@@ -1192,7 +1288,7 @@ function uploadRetainedBatchState(hostId, batchId, usePalette, paletteWidth, pal
   const states = decodeFloat32Payload(stateFloatsBase64);
   batch.baseStateData = new Float32Array(states);
   bindArrayBufferCached(host, batch.stateBuffer);
-  gl.bufferData(gl.ARRAY_BUFFER, batch.baseStateData, gl.DYNAMIC_DRAW);
+  trackedBufferData(host, gl.ARRAY_BUFFER, batch.baseStateData, gl.DYNAMIC_DRAW);
   bindArrayBufferCached(host, null);
   if (batch.usePalette && hasNonEmptyPayload(paletteRgbaBase64)) {
     if (!batch.paletteTexture) batch.paletteTexture = gl.createTexture();
@@ -1277,6 +1373,7 @@ export function uploadRetainedBatchStateRangeBytes(hostId, batchId, startInstanc
 function removeRetainedBatchFromIndexTables(host, batch) {
   if (!batch) return;
   host.retainedBatchIdToIndex.delete(batch.batchId);
+  if (batch.handleKey) host.retainedHandleRefs.delete(batch.handleKey);
   if ((batch.batchIndex | 0) >= 0 && host.retainedBatchList[batch.batchIndex] === batch) {
     host.retainedBatchList[batch.batchIndex] = null;
   }
@@ -1293,6 +1390,7 @@ export function destroyRetainedBatch(hostId, batchId) {
   if (batch.culledTransformBuffer) gl.deleteBuffer(batch.culledTransformBuffer);
   if (batch.culledStateBuffer) gl.deleteBuffer(batch.culledStateBuffer);
   if (batch.paletteTexture) gl.deleteTexture(batch.paletteTexture);
+  if (batch.boneTexture) gl.deleteTexture(batch.boneTexture);
   removeRetainedBatchFromIndexTables(host, batch);
   host.retainedBatches.delete(batchId);
 }
@@ -1396,28 +1494,47 @@ export function uploadRetainedBatchSkinningBytes(hostId, batchId, enabled, boneC
     return;
   }
 
+  const count = boneCount | 0;
+  const expected = count * 16;
   const matrices = decodeFloat32Payload(boneMatrixBytes);
-  const expected = (boneCount | 0) * 16;
   if (matrices.length < expected) {
     batch.skinningEnabled = false;
     batch.boneCount = 0;
     return;
   }
 
-  if (!batch.boneTexture) batch.boneTexture = gl.createTexture();
-  bindTexture2DCached(host, 0, batch.boneTexture);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
   const upload = matrices.length === expected ? matrices : matrices.subarray(0, expected);
   const internalFormat = host.isWebGl2 && gl.RGBA32F ? gl.RGBA32F : gl.RGBA;
-  gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, 4, boneCount | 0, 0, gl.RGBA, gl.FLOAT, upload);
+  const needsCreate = !batch.boneTexture;
+  if (needsCreate) {
+    batch.boneTexture = gl.createTexture();
+    batch.boneTextureWidth = 0;
+    batch.boneTextureHeight = 0;
+  }
+
+  bindTexture2DCached(host, 0, batch.boneTexture);
+  if (needsCreate) {
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+
+  // Do not redefine the bone texture every animation frame. texImage2D may force
+  // driver allocation/synchronization and can produce multi-second stalls on WASM/WebGL.
+  // Allocate only when the bone count changes, then stream matrix rows with texSubImage2D.
+  if (batch.boneTextureWidth !== 4 || batch.boneTextureHeight !== count) {
+    gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, 4, count, 0, gl.RGBA, gl.FLOAT, null);
+    batch.boneTextureWidth = 4;
+    batch.boneTextureHeight = count;
+  }
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 4, count, gl.RGBA, gl.FLOAT, upload);
+
   bindTexture2DCached(host, 0, null);
   resetTextureBindCache(host);
   batch.skinningEnabled = true;
-  batch.boneCount = boneCount | 0;
+  batch.boneCount = count;
 }
 
 const HIGH_SCALE_COMMAND_PREFIX = '__hs64:';
@@ -1442,6 +1559,11 @@ function isHighScaleCommandRef(ref) {
 export function setRetainedDrawOrder(hostId, drawOrder) {
   const host = hosts.get(hostId);
   if (!host) return;
+  if (host.glState) host.glState.legacyStringProtocolCalls++;
+  if (!host.allowLegacyStringProtocol) {
+    host.retainedDrawOrder = [];
+    return;
+  }
   if (!drawOrder) { host.retainedDrawOrder = []; return; }
   const lines = String(drawOrder).split('\n');
   const refs = [];
@@ -1453,9 +1575,38 @@ export function setRetainedDrawOrder(hostId, drawOrder) {
     if (layerId !== null) {
       refs.push({ id, kind: 'highScaleLayer', layerId, transparent: false });
     } else {
-      refs.push({ id, transparent: sep >= 0 && line.substring(sep + 1) === '1' });
+      const idx = host.retainedBatchIdToIndex.get(id);
+      refs.push({ id, batchIndex: idx === undefined ? -1 : idx, transparent: sep >= 0 && line.substring(sep + 1) === '1' });
     }
   }
+  host.retainedDrawOrder = refs;
+}
+
+export function setRetainedDrawOrderBytes(hostId, count, orderBytes) {
+  const host = hosts.get(hostId);
+  if (!host) return;
+  const safeCount = Math.max(0, count | 0);
+  if (safeCount === 0) { host.retainedDrawOrder = []; return; }
+  const bytes = toUint8Array(orderBytes);
+  const available = Math.min(safeCount, Math.floor(bytes.byteLength / 12));
+  if (available <= 0) { host.retainedDrawOrder = []; return; }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const refs = new Array(available);
+  let used = 0;
+  for (let i = 0; i < available; i++) {
+    const offset = i * 12;
+    const lo = view.getUint32(offset + 0, true);
+    const hi = view.getUint32(offset + 4, true);
+    const flags = view.getUint32(offset + 8, true);
+    const transparent = (flags & 1) !== 0;
+    const highScale = (flags & 2) !== 0;
+    const key = handleKey(lo, hi);
+    const source = highScale ? host.highScaleLayerHandleRefs.get(key) : host.retainedHandleRefs.get(key);
+    if (!source) continue;
+    if (highScale) refs[used++] = { id: source.id, kind: 'highScaleLayer', layerId: source.layerId, transparent };
+    else refs[used++] = { id: source.id, batchIndex: source.batchIndex, transparent };
+  }
+  refs.length = used;
   host.retainedDrawOrder = refs;
 }
 
@@ -1631,7 +1782,7 @@ export function uploadRetainedParticleBatchBytes(hostId, batchId, meshId, lighti
   const activeBytes = uploadData.byteLength || 0;
   if (!batch.particleBufferCapacityBytes || batch.particleBufferCapacityBytes < activeBytes) {
     batch.particleBufferCapacityBytes = nextBufferCapacity(activeBytes);
-    gl.bufferData(gl.ARRAY_BUFFER, batch.particleBufferCapacityBytes, gl.DYNAMIC_DRAW);
+    trackedBufferData(host, gl.ARRAY_BUFFER, batch.particleBufferCapacityBytes, gl.DYNAMIC_DRAW);
   }
   if (activeBytes > 0) gl.bufferSubData(gl.ARRAY_BUFFER, 0, uploadData);
   bindArrayBufferCached(host, null);
@@ -1757,9 +1908,13 @@ function renderScenePacket(host, packet, cleanupLiveResources) {
   const hasHighScale = host.highScaleFramePacket && host.highScaleLayers && host.highScaleLayers.size > 0;
   if (hasHighScale) beginHighScaleCommandFrame(host);
 
-  for (const batch of batches) if (!batch.transparent) drawMeshBatch(host, batch);
+  const legacyBatchCount = Array.isArray(batches) ? batches.length : 0;
+  if (legacyBatchCount > 0 && !host.allowLegacyDrawPath) {
+    if (host.glState) host.glState.legacyDrawPathBlockedCalls += legacyBatchCount;
+  }
+  if (host.allowLegacyDrawPath) for (const batch of batches) if (!batch.transparent) drawMeshBatch(host, batch);
   for (const ref of retainedRefs) if (!ref || !ref.transparent) drawRetainedCommandRef(host, ref, packet, viewProj);
-  for (const batch of batches) if (batch.transparent) drawMeshBatch(host, batch);
+  if (host.allowLegacyDrawPath) for (const batch of batches) if (batch.transparent) drawMeshBatch(host, batch);
   for (const ref of retainedRefs) if (ref && ref.transparent) drawRetainedCommandRef(host, ref, packet, viewProj);
   if (hasHighScale) publishHighScaleCommandMetrics(host);
   drawControlPlanes(host, packet, viewProj);
@@ -1812,7 +1967,11 @@ function drawRetainedCommandRef(host, ref, packet, viewProj) {
     return;
   }
 
-  drawRetainedBatch(host, ref.id || '');
+  if ((ref.batchIndex | 0) >= 0) {
+    drawRetainedBatchByIndex(host, ref.batchIndex | 0);
+  } else {
+    drawRetainedBatch(host, ref.id || '');
+  }
 }
 
 function restoreMeshGlobalsAfterHighScale(host, packet, viewProj) {
@@ -2005,7 +2164,20 @@ function resetWebGlFrameCounters(host) {
   host.glState.textureBinds = 0;
   host.glState.bufferBinds = 0;
   host.glState.vaoBinds = 0;
+  host.glState.legacyDrawPathCalls = 0;
+  host.glState.legacyDrawPathBlockedCalls = 0;
+  host.glState.legacyStringProtocolCalls = 0;
+  host.glState.bufferDataCalls = 0;
+  host.glState.dynamicBufferDataCalls = 0;
   host.retainedOrdinaryCulledInstances = 0;
+}
+
+function trackedBufferData(host, target, dataOrSize, usage) {
+  if (host && host.glState) {
+    host.glState.bufferDataCalls++;
+    if (usage === host.gl.DYNAMIC_DRAW) host.glState.dynamicBufferDataCalls++;
+  }
+  host.gl.bufferData(target, dataOrSize, usage);
 }
 
 function createMeshVaoObject(host) {
@@ -2177,6 +2349,9 @@ function prepareVisibleRetainedBatch(host, batch, resource) {
   const states = batch.baseStateData;
   const count = Math.min(batch.instanceCount | 0, Math.floor(transforms.length / 16));
   if (count <= 0) return { count: 0, transformBuffer: batch.transformBuffer, stateBuffer: batch.stateBuffer };
+  if (count < retainedOrdinaryCullMinInstances) {
+    return { count, transformBuffer: batch.transformBuffer, stateBuffer: batch.stateBuffer };
+  }
   const viewProj = host.frameViewProjection;
   const center = host.retainedCullCenter || (host.retainedCullCenter = [0, 0, 0]);
   const extents = host.retainedCullExtents || (host.retainedCullExtents = [0, 0, 0]);
@@ -2220,10 +2395,20 @@ function prepareVisibleRetainedBatch(host, batch, resource) {
   if (!batch.culledStateBuffer) batch.culledStateBuffer = gl.createBuffer();
   if (batch.visibleTransformData.length < visible * 16) batch.visibleTransformData = ensureFloatCapacity(batch.visibleTransformData, visible * 16);
   if (states && states.length >= count * 4 && batch.visibleStateData.length < visible * 4) batch.visibleStateData = ensureFloatCapacity(batch.visibleStateData, visible * 4);
+  const transformFloats = visible * 16;
+  const stateFloats = visible * 4;
   bindArrayBufferCached(host, batch.culledTransformBuffer);
-  gl.bufferData(gl.ARRAY_BUFFER, batch.visibleTransformData.subarray(0, visible * 16), gl.DYNAMIC_DRAW);
+  if ((batch.culledTransformCapacityFloats || 0) < transformFloats) {
+    trackedBufferData(host, gl.ARRAY_BUFFER, transformFloats * 4, gl.DYNAMIC_DRAW);
+    batch.culledTransformCapacityFloats = transformFloats;
+  }
+  gl.bufferSubData(gl.ARRAY_BUFFER, 0, batch.visibleTransformData.subarray(0, transformFloats));
   bindArrayBufferCached(host, batch.culledStateBuffer);
-  gl.bufferData(gl.ARRAY_BUFFER, batch.visibleStateData.subarray(0, visible * 4), gl.DYNAMIC_DRAW);
+  if ((batch.culledStateCapacityFloats || 0) < stateFloats) {
+    trackedBufferData(host, gl.ARRAY_BUFFER, stateFloats * 4, gl.DYNAMIC_DRAW);
+    batch.culledStateCapacityFloats = stateFloats;
+  }
+  gl.bufferSubData(gl.ARRAY_BUFFER, 0, batch.visibleStateData.subarray(0, stateFloats));
   bindArrayBufferCached(host, null);
   host.retainedOrdinaryCulledInstances = (host.retainedOrdinaryCulledInstances || 0) + (count - visible);
   return { count: visible, transformBuffer: batch.culledTransformBuffer, stateBuffer: batch.culledStateBuffer };
@@ -2466,16 +2651,23 @@ export function uploadHighScaleLayerSnapshotBytes(hostId, layerId, snapshotBytes
   if (!host) return;
   const layer = parseHighScaleSnapshotBytes(host, snapshotBytes);
   if (!layer) {
-    if (layerId) host.highScaleLayers.delete(layerId);
+    if (layerId) {
+      const key = handleKeyFromString(layerId);
+      if (key) host.highScaleLayerHandleRefs.delete(key);
+      host.highScaleLayers.delete(layerId);
+    }
     return;
   }
   host.highScaleLayers.set(layerId || layer.id, layer);
+  registerHighScaleLayerHandle(host, layer);
 }
 
 
 export function destroyHighScaleLayer(hostId, layerId) {
   const host = hosts.get(hostId);
   if (!host) return;
+  const key = handleKeyFromString(layerId);
+  if (key) host.highScaleLayerHandleRefs.delete(key);
   host.highScaleLayers.delete(layerId);
 }
 
@@ -2782,6 +2974,7 @@ function bindSkyboxCubemapTextures(host, ids) {
 }
 
 function drawMeshBatch(host, batch) {
+  if (host.glState) host.glState.legacyDrawPathCalls++;
   const { gl } = host;
   const resource = host.meshResources.get(batch.id);
   if (!resource || resource.indexCount === 0 || !batch.instanceData || batch.instanceCount <= 0) return;
@@ -2809,7 +3002,7 @@ function drawMeshBatch(host, batch) {
   if (host.instancing) {
     const buffer = getOrCreateInstanceBuffer(host, batch.id + '|l:' + (batch.lightingEnabled || 0));
     bindArrayBufferCached(host, buffer);
-    gl.bufferData(gl.ARRAY_BUFFER, batch.instanceData instanceof Float32Array ? batch.instanceData : new Float32Array(batch.instanceData), gl.DYNAMIC_DRAW);
+    trackedBufferData(host, gl.ARRAY_BUFFER, batch.instanceData instanceof Float32Array ? batch.instanceData : new Float32Array(batch.instanceData), gl.DYNAMIC_DRAW);
     setInstanceAttribute(host, host.meshInstanceModel0Location, 4, 0);
     setInstanceAttribute(host, host.meshInstanceModel1Location, 4, 16);
     setInstanceAttribute(host, host.meshInstanceModel2Location, 4, 32);
@@ -2817,7 +3010,7 @@ function drawMeshBatch(host, batch) {
     setInstanceAttribute(host, host.meshInstanceColorLocation, 4, 64);
     uniform1fCached(host, host.meshUseInstancingLocation, 1);
     host.instancing.drawElementsInstancedANGLE(gl.TRIANGLES, resource.indexCount, resource.indexType, 0, batch.instanceCount);
-    drawWireframeOverlayForCurrentBatch(host, resource, visible.count, true);
+    drawWireframeOverlayForCurrentBatch(host, resource, batch.instanceCount, true);
     resetInstanceDivisors(host);
   } else {
     uniform1fCached(host, host.meshUseInstancingLocation, 0);
@@ -2845,9 +3038,9 @@ function drawWireframeOverlayForCurrentBatch(host, resource, instanceCount, inst
   uniform1fCached(host, host.meshNormalMapStrengthLocation, 0);
   bindElementArrayBufferCached(host, resource.wireframeIndexBuffer);
   if (instanced && host.instancing) {
-    host.instancing.drawElementsInstancedANGLE(gl.LINES, resource.wireframeIndexCount, gl.UNSIGNED_SHORT, 0, instanceCount);
+    host.instancing.drawElementsInstancedANGLE(gl.LINES, resource.wireframeIndexCount, resource.wireframeIndexType || gl.UNSIGNED_SHORT, 0, instanceCount);
   } else {
-    gl.drawElements(gl.LINES, resource.wireframeIndexCount, gl.UNSIGNED_SHORT, 0);
+    gl.drawElements(gl.LINES, resource.wireframeIndexCount, resource.wireframeIndexType || gl.UNSIGNED_SHORT, 0);
   }
   bindElementArrayBufferCached(host, resource.indexBuffer);
 }
@@ -2977,7 +3170,7 @@ function drawControlPlanes(host, packet, viewProj) {
     const vertexBuffer = getOrCreateControlBuffer(host, plane.id);
     bindArrayBufferCached(host, vertexBuffer);
     if (!plane.gpuBufferInitialized) {
-      gl.bufferData(gl.ARRAY_BUFFER, plane.vertices.byteLength, gl.DYNAMIC_DRAW);
+      trackedBufferData(host, gl.ARRAY_BUFFER, plane.vertices.byteLength, gl.DYNAMIC_DRAW);
       plane.gpuBufferInitialized = true;
       plane.verticesDirty = true;
     }
@@ -3006,6 +3199,11 @@ export function getWebGlStateMetric(hostId, index) {
     case 2: return s.textureBinds || 0;
     case 3: return s.bufferBinds || 0;
     case 4: return s.vaoBinds || 0;
+    case 5: return s.legacyDrawPathCalls || 0;
+    case 6: return s.legacyDrawPathBlockedCalls || 0;
+    case 7: return s.legacyStringProtocolCalls || 0;
+    case 8: return s.bufferDataCalls || 0;
+    case 9: return s.dynamicBufferDataCalls || 0;
     default: return 0;
   }
 }

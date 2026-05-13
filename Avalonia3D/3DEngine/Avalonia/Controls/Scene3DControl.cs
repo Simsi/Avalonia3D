@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Linq;
 using System.Numerics;
 using Avalonia;
 using Avalonia.Controls;
@@ -43,6 +42,8 @@ public sealed class Scene3DControl : Border
     public static readonly StyledProperty<bool> AdaptivePerformanceEnabledProperty = AvaloniaProperty.Register<Scene3DControl, bool>(nameof(AdaptivePerformanceEnabled), false);
 
     private const double PerformanceMetricsUpdateIntervalMilliseconds = 1000d;
+    private const double BrowserCameraHoverSuppressionMilliseconds = 180d;
+    private const double BrowserVisibilityPollMilliseconds = 250d;
 
     private readonly Grid _root;
     private readonly Canvas _hiddenHost;
@@ -71,10 +72,17 @@ public sealed class Scene3DControl : Border
     private DateTime _lastNavigationTickUtc;
     private readonly Dictionary<ControlPlane3D, ControlPlaneRuntimeAdapter> _controlAdapters;
     private readonly HashSet<ControlPlane3D> _creatingControlAdapters;
+    private readonly List<ControlPlane3D> _controlPlanes;
+    private readonly HashSet<ControlPlane3D> _controlPlaneSet;
+    private readonly HashSet<Object3D> _controlPlanePickExclusions;
+    private readonly List<ControlPlane3D> _staleControlPlanesScratch;
+    private readonly Queue<ControlPlaneRuntimeAdapter> _dirtyControlSnapshotQueue;
+    private readonly HashSet<ControlPlaneRuntimeAdapter> _dirtyControlSnapshotSet;
     private Scene3D _scene;
     private IScenePresenter? _presenter;
     private ControlPlaneRuntimeAdapter? _activeControlAdapter;
     private ControlPlaneRuntimeAdapter? _focusedControlAdapter;
+    private ControlPlaneRuntimeAdapter? _hoveredControlAdapter;
     private int _forwardedControlInputDepth;
     private int _performanceFrameCount;
     private double _performanceFrameMillisecondsTotal;
@@ -83,6 +91,10 @@ public sealed class Scene3DControl : Border
     private string? _pendingPerformanceMetricsText;
     private bool _performanceMetricsTextUpdateScheduled;
     private bool _unlockedRenderPending;
+    private bool _browserContinuousRenderScheduled;
+    private long _suppressHoverPickingUntilTicks;
+    private long _lastBrowserVisibilityPollTicks;
+    private int _lastBrowserDocumentVisibilityVersion = -1;
     private long _lastFrameRenderedTicks;
     private long _lastFrameAllocatedBytes;
     private long _lastAllocationWindowTicks;
@@ -91,6 +103,11 @@ public sealed class Scene3DControl : Border
     private int _lastGen1Count;
     private int _lastGen2Count;
     private double _lastAllocatedMegabytesPerSecond;
+    private int _controlSnapshotRefreshesSinceLastFrame;
+    private int _controlSnapshotQueueHighWaterSinceLastFrame;
+    private int _controlPickingRequestsSinceLastFrame;
+    private int _controlPlanePickTestsSinceLastFrame;
+    private double _pickingMillisecondsSinceLastFrame;
 
     public Scene3DControl()
     {
@@ -142,9 +159,16 @@ public sealed class Scene3DControl : Border
         Child = _root;
 
         _scene = new Scene3D();
+        ApplyBrowserPerformanceDefaults(_scene);
 
         _controlAdapters = new Dictionary<ControlPlane3D, ControlPlaneRuntimeAdapter>();
         _creatingControlAdapters = new HashSet<ControlPlane3D>();
+        _controlPlanes = new List<ControlPlane3D>();
+        _controlPlaneSet = new HashSet<ControlPlane3D>();
+        _controlPlanePickExclusions = new HashSet<Object3D>();
+        _staleControlPlanesScratch = new List<ControlPlane3D>();
+        _dirtyControlSnapshotQueue = new Queue<ControlPlaneRuntimeAdapter>();
+        _dirtyControlSnapshotSet = new HashSet<ControlPlaneRuntimeAdapter>();
         _pressedKeys = new HashSet<Key>();
 
         _navigationTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
@@ -162,6 +186,7 @@ public sealed class Scene3DControl : Border
         if (OperatingSystem.IsBrowser())
         {
             _scene.Performance.MaxLiveControlSnapshotsPerFrame = 1;
+            _scene.Performance.UseConservativeSkinnedPicking = true;
             LiveControlSnapshotFps = 12d;
             TargetFps = 60d;
             UnlockedMaxFps = 60d;
@@ -322,6 +347,7 @@ public sealed class Scene3DControl : Border
             ClearControlAdapters();
 
             _scene = value ?? throw new ArgumentNullException(nameof(value));
+            ApplyBrowserPerformanceDefaults(_scene);
             SubscribeToScene(_scene);
             InteractionManager.SetScene(_scene);
             Adapters.SetScene(_scene);
@@ -345,6 +371,7 @@ public sealed class Scene3DControl : Border
         var added = Scene.Add(obj);
         if (added is ControlPlane3D plane)
         {
+            TrackControlPlane(plane);
             EnsureControlAdapter(plane);
         }
 
@@ -357,6 +384,7 @@ public sealed class Scene3DControl : Border
         var added = Adapters.Add(avaloniaControl);
         if (added is ControlPlane3D plane)
         {
+            TrackControlPlane(plane);
             EnsureControlAdapter(plane);
         }
 
@@ -410,6 +438,7 @@ public sealed class Scene3DControl : Border
         _navigationTimer.Stop();
         _continuousRenderTimer.Stop();
         _unlockedRenderPending = false;
+        _browserContinuousRenderScheduled = false;
         _pressedKeys.Clear();
         EndMouseLook();
         _isPointerInsideScene = false;
@@ -435,7 +464,7 @@ public sealed class Scene3DControl : Border
         // CenterLocked behaves like a game pointer-lock mode: once active, the
         // logical cursor stays at the viewport center until Escape/mode change.
         // Do not stop it just because the OS cursor left the control bounds.
-        if (!IsCenterLockedMouseLookActive)
+        if (!IsCenterLockedMouseLookActive && !ShouldSuppressHoverPicking(e))
         {
             ClearControlHover(e);
             InteractionManager.ClearHover();
@@ -518,6 +547,12 @@ public sealed class Scene3DControl : Border
             }
 
             UpdateCenterLockedHover(e);
+            e.Handled = true;
+            return;
+        }
+
+        if (ShouldSuppressHoverPicking(e))
+        {
             e.Handled = true;
             return;
         }
@@ -811,9 +846,13 @@ public sealed class Scene3DControl : Border
 
     private void OnSceneChanged(object? sender, SceneChangedEventArgs e)
     {
-        if (e.Kind == SceneChangeKind.Structure || e.Kind == SceneChangeKind.Control)
+        if (e.Kind == SceneChangeKind.Structure)
         {
             SyncControlAdapters();
+        }
+        else if (e.Kind == SceneChangeKind.Control)
+        {
+            EnqueueDirtyControlSnapshot(e.Source as ControlPlane3D);
         }
 
         if (e.Kind != SceneChangeKind.HighScaleState)
@@ -897,6 +936,20 @@ public sealed class Scene3DControl : Border
         target = System.Math.Clamp(target <= 0d ? 60d : target, 1d, 500d);
         _continuousRenderTimer.Interval = TimeSpan.FromMilliseconds(1000d / target);
 
+        if (OperatingSystem.IsBrowser())
+        {
+            if (_continuousRenderTimer.IsEnabled)
+            {
+                _continuousRenderTimer.Stop();
+            }
+
+            if (ContinuousRendering)
+            {
+                ScheduleBrowserContinuousFrame();
+            }
+            return;
+        }
+
         if (ContinuousRendering && TopLevel.GetTopLevel(this) is not null && FpsLockEnabled)
         {
             if (!_continuousRenderTimer.IsEnabled)
@@ -914,6 +967,28 @@ public sealed class Scene3DControl : Border
             RequestUnlockedFrameSoon();
         }
     }
+
+    private void ScheduleBrowserContinuousFrame()
+    {
+        if (!OperatingSystem.IsBrowser() ||
+            _browserContinuousRenderScheduled ||
+            !ContinuousRendering ||
+            TopLevel.GetTopLevel(this) is null)
+        {
+            return;
+        }
+
+        _browserContinuousRenderScheduled = true;
+        Dispatcher.UIThread.Post(() =>
+        {
+            _browserContinuousRenderScheduled = false;
+            if (ContinuousRendering && TopLevel.GetTopLevel(this) is not null)
+            {
+                RequestPresenterRenderOnly();
+            }
+        }, DispatcherPriority.Render);
+    }
+
 
     private double EffectiveTargetFps => FpsLockEnabled ? System.Math.Clamp(TargetFps, 1d, 500d) : System.Math.Clamp(UnlockedMaxFps, 1d, 500d);
 
@@ -984,6 +1059,16 @@ public sealed class Scene3DControl : Border
         stats.FrameInterpolationEnabled = FrameInterpolationEnabled;
         stats.AdaptivePerformanceEnabled = AdaptivePerformanceEnabled;
         stats.InterpolationAlpha = Scene.FrameInterpolator.Alpha;
+        stats.ControlSnapshotRefreshCount = _controlSnapshotRefreshesSinceLastFrame;
+        stats.ControlSnapshotQueueHighWater = _controlSnapshotQueueHighWaterSinceLastFrame;
+        stats.ControlPointerPickCount = _controlPickingRequestsSinceLastFrame;
+        stats.ControlPlanePickTestCount = _controlPlanePickTestsSinceLastFrame;
+        stats.PickingMilliseconds += _pickingMillisecondsSinceLastFrame;
+        _controlSnapshotRefreshesSinceLastFrame = 0;
+        _controlSnapshotQueueHighWaterSinceLastFrame = _dirtyControlSnapshotQueue.Count;
+        _controlPickingRequestsSinceLastFrame = 0;
+        _controlPlanePickTestsSinceLastFrame = 0;
+        _pickingMillisecondsSinceLastFrame = 0d;
 
         Scene.AdaptivePerformance.Enabled = AdaptivePerformanceEnabled;
         Scene.AdaptivePerformance.RecordFrame(stats, Scene.Performance, EffectiveTargetFps);
@@ -1001,6 +1086,8 @@ public sealed class Scene3DControl : Border
 
         try
         {
+            RefreshBrowserVisibilityState(force: true);
+
             var statsForRuntime = e.Stats ?? new RenderStats();
             UpdateRuntimeStats(statsForRuntime);
             try
@@ -1012,7 +1099,11 @@ public sealed class Scene3DControl : Border
                 Debug.WriteLine("3DEngine Scene3DControl FrameRendered subscriber failed: " + subscriberEx);
             }
 
-            if (ContinuousRendering && !FpsLockEnabled)
+            if (OperatingSystem.IsBrowser())
+            {
+                ScheduleBrowserContinuousFrame();
+            }
+            else if (ContinuousRendering && !FpsLockEnabled)
             {
                 RequestUnlockedFrameSoon();
             }
@@ -1062,9 +1153,9 @@ public sealed class Scene3DControl : Border
                 $"MeshUpload: {stats.MeshUploadBytes / 1024d:0.0} KB | V/I: {stats.VertexBufferUploadBytes / 1024d:0.0}/{stats.IndexBufferUploadBytes / 1024d:0.0} KB | Tangent: {stats.TangentUploadBytes / 1024d:0.0} KB | WireIdx: {stats.WireframeIndexUploadBytes / 1024d:0.0} KB\n" +
                 $"Surface: tangentMeshes={stats.TangentSpaceMeshCount} normalMapped={stats.NormalMappedMeshCount} wire/sil={stats.WireframeOverlayDrawCalls}/{stats.SilhouetteOverlayDrawCalls} | Geom: {stats.RenderGeometryCount} | VB/IB: {stats.VertexBufferUploadCount}/{stats.IndexBufferUploadCount} | PacketBytes: {stats.PacketBytes / 1024d:0.0} KB\n" +
                 $"Packet: {stats.PacketBuildMilliseconds:0.00} ms | Ser: {stats.SerializationMilliseconds:0.00} ms | Upload: {stats.UploadMilliseconds:0.00} ms | Backend: {stats.BackendMilliseconds:0.00} ms\n" +
-                $"WebGLv{stats.WebGlVersion} ClientHS: {(stats.WebGlClientHighScaleRuntime ? "on" : "off")} | GPUAnim: {(stats.WebGlClientGpuTransformAnimation ? "on" : "off")} | JS Cull: {stats.JsCullMilliseconds:0.00} ms | JS Draw: {stats.JsDrawMilliseconds:0.00} ms | JS Frame: {stats.JsFrameMilliseconds:0.00} ms | JS Batches: {stats.JsDrawBatchCount}\n" +
-                $"JSPatch T/S: {stats.JsTransformPatchRanges}/{stats.JsStatePatchRanges} ranges | {stats.JsTransformPatchBytes / 1024d:0.0}/{stats.JsStatePatchBytes / 1024d:0.0} KB | JSAnim: {stats.JsAnimationUploadBatches} batches/{stats.JsAnimationUploadBytes / 1024d:0.0} KB | TexErr: {stats.JsTexturePayloadErrors}/{stats.JsPalettePayloadErrors} | Patch: {stats.JsPatchMilliseconds:0.00} ms\n" +
-                $"Pick: {stats.PickingMilliseconds:0.00} ms | Phys: {stats.PhysicsMilliseconds:0.00} ms | Live: {stats.LiveSnapshotMilliseconds:0.00} ms\n" +
+                $"WebGLv{stats.WebGlVersion} ClientHS: {(stats.WebGlClientHighScaleRuntime ? "on" : "off")} | GPUAnim: {(stats.WebGlClientGpuTransformAnimation ? "on" : "off")} | JS Cull: {stats.JsCullMilliseconds:0.00} ms | JS Draw: {stats.JsDrawMilliseconds:0.00} ms | JS Frame: {stats.JsFrameMilliseconds:0.00} ms | JS Batches: {stats.JsDrawBatchCount} | Legacy draw/block/str={stats.WebGlLegacyDrawPathCalls}/{stats.WebGlLegacyDrawPathBlockedCalls}/{stats.WebGlLegacyStringProtocolCalls} | bufferData={stats.WebGlBufferDataCalls}/{stats.WebGlDynamicBufferDataCalls}\n" +
+                $"JSPatch T/S: {stats.JsTransformPatchRanges}/{stats.JsStatePatchRanges} ranges | {stats.JsTransformPatchBytes / 1024d:0.0}/{stats.JsStatePatchBytes / 1024d:0.0} KB | Route dirty {stats.JsHighScaleDirtyTransformInstances}/{stats.JsHighScaleDirtyStateInstances} refs {stats.JsHighScalePatchRoutedTransformRefs}/{stats.JsHighScalePatchRoutedStateRefs} batches {stats.JsHighScalePatchTouchedTransformBatches}/{stats.JsHighScalePatchTouchedStateBatches} | JSAnim: {stats.JsAnimationUploadBatches} batches/{stats.JsAnimationUploadBytes / 1024d:0.0} KB | TexErr: {stats.JsTexturePayloadErrors}/{stats.JsPalettePayloadErrors} | Patch: {stats.JsPatchMilliseconds:0.00} ms\n" +
+                $"Pick: {stats.PickingMilliseconds:0.00} ms ({stats.ControlPointerPickCount}/{stats.ControlPlanePickTestCount}) | Phys: {stats.PhysicsMilliseconds:0.00} ms | Live: {stats.LiveSnapshotMilliseconds:0.00} ms snap={stats.ControlSnapshotRefreshCount} q={stats.ControlSnapshotQueueHighWater}\n" +
                 $"Alloc: {stats.AllocatedMegabytesPerSecond:0.00} MB/s | FrameAlloc: {stats.AllocatedBytesPerFrame / 1024d:0.0} KB | GC: {stats.Gen0Collections}/{stats.Gen1Collections}/{stats.Gen2Collections} | Heap: {stats.ManagedHeapBytes / (1024d * 1024d):0.0} MB\n" +
                 $"FPSLock: {(stats.FpsLocked ? "on" : "off")} {stats.TargetFps:0} | Interp: {(stats.FrameInterpolationEnabled ? "on" : "off")} a={stats.InterpolationAlpha:0.00} | Adaptive: {(stats.AdaptivePerformanceEnabled ? "on" : "off")} q={stats.AdaptiveQualityScale:0.00} | Delay: {stats.RenderScheduleDelayMilliseconds:0.00} ms\n" +
                 $"MeshCache: {stats.MeshCacheCount} | Registry: {stats.RegistryVersion}";
@@ -1125,6 +1216,17 @@ public sealed class Scene3DControl : Border
             (_presenter as IPerformanceMetricsOverlayPresenter)?.SetPerformanceMetricsOverlay(_performanceMetricsText.Text, true);
         }
     }
+    private static void ApplyBrowserPerformanceDefaults(Scene3D scene)
+    {
+        if (!OperatingSystem.IsBrowser())
+        {
+            return;
+        }
+
+        scene.Performance.MaxLiveControlSnapshotsPerFrame = 1;
+        scene.Performance.UseConservativeSkinnedPicking = true;
+    }
+
     private bool IsButtonDragMouseLookActive => _isMouseLooking && MouseLookMode == SceneMouseLookMode.ButtonDrag;
 
     private bool IsCenterLockedMouseLookActive => _isMouseLooking && MouseLookMode == SceneMouseLookMode.CenterLocked;
@@ -1145,6 +1247,7 @@ public sealed class Scene3DControl : Border
         _isMouseLooking = true;
         _mouseLookPointer = e.Pointer;
         _mouseLookPointer.Capture(this);
+        SuppressHoverPickingBriefly();
         UpdateNavigationTimerState();
     }
 
@@ -1172,6 +1275,7 @@ public sealed class Scene3DControl : Border
         }
 
         ApplyCenterLockedCursor();
+        SuppressHoverPickingBriefly();
         RequestPresenterPointerLock();
         UpdateCenterCursorVisibility();
         UpdateNavigationTimerState();
@@ -1194,6 +1298,7 @@ public sealed class Scene3DControl : Border
         _hasMouseLookPosition = false;
         RestoreCenterLockedCursor();
         ExitPresenterPointerLock();
+        SuppressHoverPickingBriefly();
         UpdateCenterCursorVisibility();
         UpdateNavigationTimerState();
     }
@@ -1207,6 +1312,7 @@ public sealed class Scene3DControl : Border
         _hasMouseLookPosition = false;
         RestoreCenterLockedCursor();
         ExitPresenterPointerLock();
+        SuppressHoverPickingBriefly();
         UpdateCenterCursorVisibility();
         UpdateNavigationTimerState();
     }
@@ -1332,6 +1438,11 @@ public sealed class Scene3DControl : Border
 
     private void UpdateCenterLockedHover(PointerEventArgs e)
     {
+        if (ShouldSuppressHoverPicking(e))
+        {
+            return;
+        }
+
         var center = GetCenterViewportPoint();
         if (TryHandleControlPointerMoved(e, center))
         {
@@ -1340,6 +1451,72 @@ public sealed class Scene3DControl : Border
 
         ClearControlHover(e);
         InteractionManager.HandlePointerHover(this, e, GetCenterViewportPosition());
+    }
+
+    private void SuppressHoverPickingBriefly()
+    {
+        SuppressHoverPickingBriefly(Stopwatch.GetTimestamp());
+    }
+
+    private void SuppressHoverPickingBriefly(long nowTicks)
+    {
+        if (!OperatingSystem.IsBrowser())
+        {
+            return;
+        }
+
+        _suppressHoverPickingUntilTicks = nowTicks + (long)(Stopwatch.Frequency * BrowserCameraHoverSuppressionMilliseconds / 1000d);
+    }
+
+    private bool RefreshBrowserVisibilityState(bool force = false)
+    {
+        if (!OperatingSystem.IsBrowser() || _presenter is not IBrowserPageVisibilityPresenter browserVisibility)
+        {
+            return false;
+        }
+
+        var now = Stopwatch.GetTimestamp();
+        if (!force && _lastBrowserVisibilityPollTicks != 0 &&
+            now - _lastBrowserVisibilityPollTicks < (long)(Stopwatch.Frequency * BrowserVisibilityPollMilliseconds / 1000d))
+        {
+            return false;
+        }
+
+        _lastBrowserVisibilityPollTicks = now;
+        var visibilityVersion = browserVisibility.DocumentVisibilityVersion;
+        if (visibilityVersion == _lastBrowserDocumentVisibilityVersion)
+        {
+            return false;
+        }
+
+        _lastBrowserDocumentVisibilityVersion = visibilityVersion;
+        _lastFrameRenderedTicks = now;
+        SuppressHoverPickingBriefly(now);
+        return true;
+    }
+
+    private bool ShouldSuppressHoverPicking(PointerEventArgs e)
+    {
+        if (!OperatingSystem.IsBrowser())
+        {
+            return false;
+        }
+
+        RefreshBrowserVisibilityState();
+        if (_suppressHoverPickingUntilTicks == 0)
+        {
+            return false;
+        }
+
+        var now = Stopwatch.GetTimestamp();
+        if (now >= _suppressHoverPickingUntilTicks)
+        {
+            _suppressHoverPickingUntilTicks = 0;
+            return false;
+        }
+
+        var props = e.GetCurrentPoint(this).Properties;
+        return !props.IsLeftButtonPressed && !props.IsRightButtonPressed && !props.IsMiddleButtonPressed;
     }
 
     private void ApplyMouseLookFromPointer(PointerEventArgs e)
@@ -1376,6 +1553,7 @@ public sealed class Scene3DControl : Border
         _yawDegrees += delta.X * sensitivity * (invertX ? -1f : 1f);
         _pitchDegrees = System.Math.Clamp(_pitchDegrees + (-delta.Y * sensitivity * (invertY ? -1f : 1f)), -88f, 88f);
         ApplyCameraForwardFromAngles();
+        SuppressHoverPickingBriefly();
         RequestRender();
     }
 
@@ -1717,8 +1895,31 @@ public sealed class Scene3DControl : Border
         Scene.Camera.Up = Vector3.UnitY;
     }
 
+    private void TrackControlPlane(ControlPlane3D plane)
+    {
+        if (!_controlPlaneSet.Add(plane))
+        {
+            return;
+        }
+
+        _controlPlanes.Add(plane);
+        _controlPlanePickExclusions.Add(plane);
+    }
+
+    private void UntrackControlPlane(ControlPlane3D plane)
+    {
+        if (!_controlPlaneSet.Remove(plane))
+        {
+            return;
+        }
+
+        _controlPlanes.Remove(plane);
+        _controlPlanePickExclusions.Remove(plane);
+    }
+
     private void EnsureControlAdapter(ControlPlane3D plane)
     {
+        TrackControlPlane(plane);
         if (_controlAdapters.ContainsKey(plane) || _creatingControlAdapters.Contains(plane))
         {
             return;
@@ -1733,6 +1934,7 @@ public sealed class Scene3DControl : Border
         try
         {
             var adapter = new ControlPlaneRuntimeAdapter(plane, _hiddenHost);
+            adapter.SnapshotDirtyRequested += OnControlAdapterSnapshotDirtyRequested;
             _controlAdapters[plane] = adapter;
             adapter.MarkDirty();
         }
@@ -1745,10 +1947,54 @@ public sealed class Scene3DControl : Border
         UpdateNavigationTimerState();
     }
 
+    private void OnControlAdapterSnapshotDirtyRequested(ControlPlaneRuntimeAdapter adapter)
+    {
+        EnqueueDirtyControlSnapshot(adapter);
+    }
+
+    private void EnqueueDirtyControlSnapshot(ControlPlane3D? plane)
+    {
+        if (plane is not null && _controlAdapters.TryGetValue(plane, out var adapter))
+        {
+            EnqueueDirtyControlSnapshot(adapter);
+            return;
+        }
+
+        if (plane is not null)
+        {
+            return;
+        }
+
+        foreach (var item in _controlAdapters.Values)
+        {
+            EnqueueDirtyControlSnapshot(item);
+        }
+    }
+
+    private void EnqueueDirtyControlSnapshot(ControlPlaneRuntimeAdapter adapter)
+    {
+        if (!adapter.IsDirty || !_controlAdapters.TryGetValue(adapter.Plane, out var current) || !ReferenceEquals(adapter, current))
+        {
+            return;
+        }
+
+        if (!_dirtyControlSnapshotSet.Add(adapter))
+        {
+            return;
+        }
+
+        _dirtyControlSnapshotQueue.Enqueue(adapter);
+        if (_dirtyControlSnapshotQueue.Count > _controlSnapshotQueueHighWaterSinceLastFrame)
+        {
+            _controlSnapshotQueueHighWaterSinceLastFrame = _dirtyControlSnapshotQueue.Count;
+        }
+    }
+
     private void RemoveControlAdapter(ControlPlane3D plane)
     {
         if (!_controlAdapters.TryGetValue(plane, out var adapter))
         {
+            UntrackControlPlane(plane);
             return;
         }
 
@@ -1762,8 +2008,16 @@ public sealed class Scene3DControl : Border
             _focusedControlAdapter = null;
         }
 
+        if (ReferenceEquals(_hoveredControlAdapter, adapter))
+        {
+            _hoveredControlAdapter = null;
+        }
+
+        adapter.SnapshotDirtyRequested -= OnControlAdapterSnapshotDirtyRequested;
         adapter.Dispose();
         _controlAdapters.Remove(plane);
+        _dirtyControlSnapshotSet.Remove(adapter);
+        UntrackControlPlane(plane);
         UpdateSnapshotTimerState();
         UpdateNavigationTimerState();
     }
@@ -1772,28 +2026,56 @@ public sealed class Scene3DControl : Border
     {
         foreach (var adapter in _controlAdapters.Values)
         {
+            adapter.SnapshotDirtyRequested -= OnControlAdapterSnapshotDirtyRequested;
             adapter.Dispose();
         }
 
         _controlAdapters.Clear();
+        _controlPlanes.Clear();
+        _controlPlaneSet.Clear();
+        _controlPlanePickExclusions.Clear();
+        _dirtyControlSnapshotQueue.Clear();
+        _dirtyControlSnapshotSet.Clear();
         _activeControlAdapter = null;
         _focusedControlAdapter = null;
+        _hoveredControlAdapter = null;
         UpdateSnapshotTimerState();
         UpdateNavigationTimerState();
     }
 
     private void SyncControlAdapters()
     {
-        var planes = Scene.Registry.SnapshotAllObjects().OfType<ControlPlane3D>().ToHashSet();
-        foreach (var plane in planes)
+        _controlPlanes.Clear();
+        _controlPlaneSet.Clear();
+        _controlPlanePickExclusions.Clear();
+
+        var objects = Scene.Registry.SnapshotAllObjects();
+        for (var i = 0; i < objects.Length; i++)
         {
+            if (objects[i] is not ControlPlane3D plane)
+            {
+                continue;
+            }
+
+            TrackControlPlane(plane);
             EnsureControlAdapter(plane);
         }
 
-        foreach (var stale in _controlAdapters.Keys.Where(p => !planes.Contains(p)).ToList())
+        _staleControlPlanesScratch.Clear();
+        foreach (var plane in _controlAdapters.Keys)
         {
-            RemoveControlAdapter(stale);
+            if (!_controlPlaneSet.Contains(plane))
+            {
+                _staleControlPlanesScratch.Add(plane);
+            }
         }
+
+        for (var i = 0; i < _staleControlPlanesScratch.Count; i++)
+        {
+            RemoveControlAdapter(_staleControlPlanesScratch[i]);
+        }
+
+        _staleControlPlanesScratch.Clear();
     }
 
     private void RefreshDirtyControlSnapshots()
@@ -1803,21 +2085,38 @@ public sealed class Scene3DControl : Border
         var budget = OperatingSystem.IsBrowser()
             ? System.Math.Clamp(Scene.Performance.MaxLiveControlSnapshotsPerFrame, 0, 1)
             : System.Math.Max(1, Scene.Performance.MaxLiveControlSnapshotsPerFrame);
-        if (budget <= 0)
+        if (budget <= 0 || _dirtyControlSnapshotQueue.Count == 0)
         {
             return;
         }
-        foreach (var adapter in _controlAdapters.Values)
+
+        var minInterval = GetSnapshotMinInterval();
+        var inspected = _dirtyControlSnapshotQueue.Count;
+        while (inspected-- > 0 && refreshed < budget && _dirtyControlSnapshotQueue.Count > 0)
         {
-            if (refreshed >= budget)
+            var adapter = _dirtyControlSnapshotQueue.Dequeue();
+            _dirtyControlSnapshotSet.Remove(adapter);
+
+            if (!_controlAdapters.TryGetValue(adapter.Plane, out var current) || !ReferenceEquals(adapter, current) || !adapter.IsDirty)
             {
-                break;
+                continue;
             }
 
-            if (adapter.ShouldRefresh(now, GetSnapshotMinInterval()))
+            if (!adapter.ShouldRefresh(now, minInterval))
             {
-                adapter.UpdateSnapshot();
+                EnqueueDirtyControlSnapshot(adapter);
+                continue;
+            }
+
+            adapter.UpdateSnapshot();
+            if (adapter.IsDirty)
+            {
+                EnqueueDirtyControlSnapshot(adapter);
+            }
+            else
+            {
                 refreshed++;
+                _controlSnapshotRefreshesSinceLastFrame++;
             }
         }
     }
@@ -1905,21 +2204,23 @@ public sealed class Scene3DControl : Border
 
     private bool TryHandleControlPointerMoved(PointerEventArgs e, Point viewportPoint)
     {
-        var hit = PickSceneObject(viewportPoint);
-        var plane = hit?.Object as ControlPlane3D;
-
         if (_activeControlAdapter is not null && _activeControlAdapter.IsPointerCaptured)
         {
-            var worldPoint = ReferenceEquals(plane, _activeControlAdapter.Plane) ? hit?.WorldPosition : null;
+            var worldPoint = TryPickControlPlane(_activeControlAdapter.Plane, viewportPoint, out var capturedHit)
+                ? capturedHit.WorldPosition
+                : (Vector3?)null;
             InteractionManager.ClearHover();
             if (ExecuteForwardedControlInput(() => _activeControlAdapter.HandlePointerMoved(e, Scene.Camera, GetRootVisual(), worldPoint)))
             {
+                _hoveredControlAdapter = _activeControlAdapter;
                 UpdateFocusedControlAdapterState();
                 RequestRender();
                 return true;
             }
         }
 
+        var hit = PickSceneObject(viewportPoint);
+        var plane = hit?.Object as ControlPlane3D;
         if (plane is null || !_controlAdapters.TryGetValue(plane, out var adapter))
         {
             return false;
@@ -1930,12 +2231,19 @@ public sealed class Scene3DControl : Border
             return false;
         }
 
+        if (_hoveredControlAdapter is not null && !ReferenceEquals(_hoveredControlAdapter, adapter))
+        {
+            _hoveredControlAdapter.ClearHover(e, GetRootVisual());
+            _hoveredControlAdapter = null;
+        }
+
         InteractionManager.ClearHover();
         if (!ExecuteForwardedControlInput(() => adapter.HandlePointerMoved(e, Scene.Camera, GetRootVisual(), hit!.WorldPosition)))
         {
             return false;
         }
 
+        _hoveredControlAdapter = adapter;
         UpdateFocusedControlAdapterState();
         RequestRender();
         return true;
@@ -1946,13 +2254,26 @@ public sealed class Scene3DControl : Border
 
     private bool TryHandleControlPointerReleased(PointerReleasedEventArgs e, Point viewportPoint)
     {
-        var hit = PickSceneObject(viewportPoint);
-        var plane = hit?.Object as ControlPlane3D;
         var adapter = _activeControlAdapter;
+        PickingResult? hit = null;
+        ControlPlane3D? plane = null;
 
-        if (adapter is null && plane is not null)
+        if (adapter is not null)
         {
-            _controlAdapters.TryGetValue(plane, out adapter);
+            if (TryPickControlPlane(adapter.Plane, viewportPoint, out var activeHit))
+            {
+                hit = activeHit;
+                plane = adapter.Plane;
+            }
+        }
+        else
+        {
+            hit = PickSceneObject(viewportPoint);
+            plane = hit?.Object as ControlPlane3D;
+            if (plane is not null)
+            {
+                _controlAdapters.TryGetValue(plane, out adapter);
+            }
         }
 
         if (adapter is null)
@@ -2004,6 +2325,18 @@ public sealed class Scene3DControl : Border
 
     private void ClearControlHover(PointerEventArgs e)
     {
+        if (_hoveredControlAdapter is not null)
+        {
+            if (!ReferenceEquals(_hoveredControlAdapter, _activeControlAdapter) || !_hoveredControlAdapter.IsPointerCaptured)
+            {
+                _hoveredControlAdapter.ClearHover(e, GetRootVisual());
+                _hoveredControlAdapter = null;
+            }
+
+            UpdateFocusedControlAdapterState();
+            return;
+        }
+
         foreach (var adapter in _controlAdapters.Values)
         {
             if (!ReferenceEquals(adapter, _activeControlAdapter) || !adapter.IsPointerCaptured)
@@ -2049,46 +2382,88 @@ public sealed class Scene3DControl : Border
 
     private PickingResult? PickSceneObject(Point point)
     {
-        if (Bounds.Width <= 0d || Bounds.Height <= 0d)
+        var start = Stopwatch.GetTimestamp();
+        try
         {
-            return null;
-        }
-
-        var viewportPosition = new Vector2((float)point.X, (float)point.Y);
-        var viewportSize = GetViewportSize();
-        var ray = ProjectionHelper.CreateRay(Scene.Camera, viewportPosition, viewportSize);
-
-        var meshHit = Raycaster.Pick(Scene, viewportPosition, viewportSize, obj => obj is not ControlPlane3D);
-        PickingResult? best = meshHit;
-
-        foreach (var plane in Scene.Registry.SnapshotAllObjects().OfType<ControlPlane3D>())
-        {
-            if (!plane.IsVisible)
+            if (Bounds.Width <= 0d || Bounds.Height <= 0d)
             {
-                continue;
+                return null;
             }
 
-            var corners = ControlPlaneGeometry.GetWorldCorners(plane, Scene.Camera);
-            if (Raycaster.IntersectTriangle(ray, corners[0], corners[1], corners[2], out var distanceA, out var pointA))
+            _controlPickingRequestsSinceLastFrame++;
+            var viewportPosition = new Vector2((float)point.X, (float)point.Y);
+            var viewportSize = GetViewportSize();
+            var ray = ProjectionHelper.CreateRay(Scene.Camera, viewportPosition, viewportSize);
+
+            var meshHit = Raycaster.PickExcluding(Scene, viewportPosition, viewportSize, _controlPlanePickExclusions);
+            PickingResult? best = meshHit;
+
+            for (var i = 0; i < _controlPlanes.Count; i++)
             {
-                if (best is null || distanceA < best.Distance)
+                var plane = _controlPlanes[i];
+                if (!plane.IsVisible)
                 {
-                    best = new PickingResult(plane, pointA, distanceA);
+                    continue;
                 }
 
-                continue;
-            }
-
-            if (Raycaster.IntersectTriangle(ray, corners[0], corners[2], corners[3], out var distanceB, out var pointB))
-            {
-                if (best is null || distanceB < best.Distance)
+                _controlPlanePickTestsSinceLastFrame++;
+                if (TryIntersectControlPlane(plane, ray, out var planeHit) &&
+                    (best is null || planeHit.Distance < best.Distance))
                 {
-                    best = new PickingResult(plane, pointB, distanceB);
+                    best = planeHit;
                 }
             }
+
+            return best;
+        }
+        finally
+        {
+            _pickingMillisecondsSinceLastFrame += (Stopwatch.GetTimestamp() - start) * 1000d / Stopwatch.Frequency;
+        }
+    }
+
+    private bool TryPickControlPlane(ControlPlane3D plane, Point point, out PickingResult hit)
+    {
+        var start = Stopwatch.GetTimestamp();
+        try
+        {
+            hit = default!;
+            if (Bounds.Width <= 0d || Bounds.Height <= 0d || !plane.IsVisible)
+            {
+                return false;
+            }
+
+            _controlPickingRequestsSinceLastFrame++;
+            _controlPlanePickTestsSinceLastFrame++;
+            var viewportPosition = new Vector2((float)point.X, (float)point.Y);
+            var viewportSize = GetViewportSize();
+            var ray = ProjectionHelper.CreateRay(Scene.Camera, viewportPosition, viewportSize);
+            return TryIntersectControlPlane(plane, ray, out hit);
+        }
+        finally
+        {
+            _pickingMillisecondsSinceLastFrame += (Stopwatch.GetTimestamp() - start) * 1000d / Stopwatch.Frequency;
+        }
+    }
+
+    private bool TryIntersectControlPlane(ControlPlane3D plane, Ray ray, out PickingResult hit)
+    {
+        Span<Vector3> corners = stackalloc Vector3[4];
+        ControlPlaneGeometry.GetWorldCorners(plane, Scene.Camera, corners);
+        if (Raycaster.IntersectTriangle(ray, corners[0], corners[1], corners[2], out var distanceA, out var pointA))
+        {
+            hit = new PickingResult(plane, pointA, distanceA);
+            return true;
         }
 
-        return best;
+        if (Raycaster.IntersectTriangle(ray, corners[0], corners[2], corners[3], out var distanceB, out var pointB))
+        {
+            hit = new PickingResult(plane, pointB, distanceB);
+            return true;
+        }
+
+        hit = default!;
+        return false;
     }
 
     private Visual GetRootVisual()

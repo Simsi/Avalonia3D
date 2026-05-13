@@ -6,12 +6,14 @@ public sealed class ModelAnimationController3D
 {
     private readonly ImportedModel3D _model;
     private AnimationClip3D? _clip;
+    private readonly ModelAnimationEvaluatorRuntime3D _runtime;
     private float _timeSeconds;
 
     internal ModelAnimationController3D(ImportedModel3D model)
     {
         _model = model;
-        CurrentPose = ModelAnimationEvaluator3D.Evaluate(model.Asset, null, 0f);
+        _runtime = new ModelAnimationEvaluatorRuntime3D(model.Asset);
+        CurrentPose = _runtime.Evaluate(null, 0f);
     }
 
     public AnimationClip3D? CurrentClip => _clip;
@@ -89,7 +91,7 @@ public sealed class ModelAnimationController3D
 
     private void Reevaluate()
     {
-        CurrentPose = ModelAnimationEvaluator3D.Evaluate(_model.Asset, _clip, _timeSeconds);
+        CurrentPose = _runtime.Evaluate(_clip, _timeSeconds);
         _model.ApplyAnimationPose(CurrentPose);
     }
 }

@@ -15,6 +15,7 @@ public sealed class ModelPart3D : Object3D
     private Mesh3D? _deformedMesh;
     private readonly ModelMaterialAsset3D _assetMaterial;
     private int _deformedMeshFrame;
+    private Matrix4x4[] _gpuSkinMatricesScratch = Array.Empty<Matrix4x4>();
     private Bounds3D _conservativeSkinnedLocalBounds = Bounds3D.Empty;
     private int _conservativeSkinnedBoundsVersion = -1;
 
@@ -68,7 +69,7 @@ public sealed class ModelPart3D : Object3D
             SkinningVersion++;
             _deformedMesh = null;
             InvalidateWorldCacheRecursive();
-            RaiseChanged(SceneChangeKind.Transform);
+            RaiseChanged(SceneChangeKind.AnimationPose);
         }
         else
         {
@@ -203,14 +204,18 @@ public sealed class ModelPart3D : Object3D
     private Matrix4x4[] BuildGpuSkinMatrices(Matrix4x4[] source)
     {
         if (source.Length == 0) return Array.Empty<Matrix4x4>();
-        var result = new Matrix4x4[source.Length];
+        if (_gpuSkinMatricesScratch.Length != source.Length)
+        {
+            _gpuSkinMatricesScratch = new Matrix4x4[source.Length];
+        }
+
         for (var i = 0; i < source.Length; i++)
         {
             // Match the CPU skinning path: skin vertices into this ModelPart's local space.
-            result[i] = source[i] * _inverseNodeTransform;
+            _gpuSkinMatricesScratch[i] = source[i] * _inverseNodeTransform;
         }
 
-        return result;
+        return _gpuSkinMatricesScratch;
     }
 
     private static Vector3[] CreateFallbackNormals(int count)

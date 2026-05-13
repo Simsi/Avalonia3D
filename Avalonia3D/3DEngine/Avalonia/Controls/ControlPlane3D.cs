@@ -112,6 +112,11 @@ public class ControlPlane3D : Object3D
 
     internal void MarkSnapshotDirty()
     {
+        if (_snapshotDirty)
+        {
+            return;
+        }
+
         _snapshotDirty = true;
         RaiseChanged(SceneChangeKind.Control);
     }

@@ -20,8 +20,22 @@ public sealed class RenderResourcePlan3D
     private readonly HashSet<string> _textureKeys = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _textureIndexByKey = new(StringComparer.Ordinal);
 
+    internal RenderResourcePlan3D()
+    {
+    }
+
     internal RenderResourcePlan3D(bool includesOrdinary, bool includesParticles, bool includesHighScale)
     {
+        Reset(includesOrdinary, includesParticles, includesHighScale);
+    }
+
+    internal void Reset(bool includesOrdinary, bool includesParticles, bool includesHighScale)
+    {
+        _meshes.Clear();
+        _textures.Clear();
+        _meshKeys.Clear();
+        _textureKeys.Clear();
+        _textureIndexByKey.Clear();
         IncludesOrdinary = includesOrdinary;
         IncludesParticles = includesParticles;
         IncludesHighScale = includesHighScale;
@@ -30,9 +44,9 @@ public sealed class RenderResourcePlan3D
     public IReadOnlyList<Mesh3D> Meshes => _meshes;
     public IReadOnlyList<RenderTextureResource3D> Textures => _textures;
 
-    public bool IncludesOrdinary { get; }
-    public bool IncludesParticles { get; }
-    public bool IncludesHighScale { get; }
+    public bool IncludesOrdinary { get; private set; }
+    public bool IncludesParticles { get; private set; }
+    public bool IncludesHighScale { get; private set; }
 
     /// <summary>
     /// True only when the plan covers all scene categories that can own retained WebGL mesh resources.

@@ -115,6 +115,8 @@ internal sealed partial class OpenGlSceneRenderer
     private readonly float[] _controlVertexData = new float[20];
     private readonly List<ControlPlaneRenderItem3D> _controlPlaneScratch = new(16);
     private readonly Vector3[] _controlCornerScratch = new Vector3[4];
+    private readonly SceneRenderPlanScratch3D _renderPlanScratch = new();
+    private readonly SceneRenderPlanScratch3D _fallbackRenderPlanScratch = new();
     private readonly HashSet<string> _liveMeshSweepScratch = new(StringComparer.Ordinal);
     private readonly HashSet<string> _liveControlPlaneSweepScratch = new(StringComparer.Ordinal);
     private readonly HashSet<string> _liveMaterialTextureSweepScratch = new(StringComparer.Ordinal);
@@ -552,6 +554,7 @@ internal sealed partial class OpenGlSceneRenderer
         var overlayPlanNeeded = scene.Debug.ShowWireframeOverlay || scene.Debug.ShowSilhouetteOverlay;
         var plan = SceneRenderPlanBuilder3D.Build(
             frame,
+            _renderPlanScratch,
             RequiresCpuSkinFallback,
             batchPlanNeeded ? stats : null,
             includeOrdinary: batchPlanNeeded || overlayPlanNeeded,
@@ -1420,6 +1423,7 @@ internal sealed partial class OpenGlSceneRenderer
             // ordinary/particle plan rather than silently drawing stale transforms.
             plan = SceneRenderPlanBuilder3D.Build(
                 frame,
+                _fallbackRenderPlanScratch,
                 RequiresCpuSkinFallback,
                 stats,
                 includeOrdinary: true,

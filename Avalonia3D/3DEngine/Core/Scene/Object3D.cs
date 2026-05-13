@@ -264,13 +264,29 @@ public abstract class Object3D : INotifyPropertyChanged
     public virtual bool IsHovered
     {
         get => _isHovered;
-        set => SetField(ref _isHovered, value);
+        set
+        {
+            if (_isHovered == value) return;
+            _isHovered = value;
+            _materialVersion++;
+            OnPropertyChanged(nameof(IsHovered));
+            OnPropertyChanged(nameof(IsEffectivelyHovered));
+            RaiseChanged(SceneChangeKind.Material);
+        }
     }
 
     public virtual bool IsSelected
     {
         get => _isSelected;
-        set => SetField(ref _isSelected, value);
+        set
+        {
+            if (_isSelected == value) return;
+            _isSelected = value;
+            _materialVersion++;
+            OnPropertyChanged(nameof(IsSelected));
+            OnPropertyChanged(nameof(IsEffectivelySelected));
+            RaiseChanged(SceneChangeKind.Material);
+        }
     }
 
     public bool IsEffectivelyHovered => IsHovered || (Parent?.IsEffectivelyHovered ?? false);
