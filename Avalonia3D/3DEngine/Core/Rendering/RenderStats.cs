@@ -21,8 +21,6 @@ public int ParticleVertexCount { get; set; }
 public long ParticleMeshUploadBytes { get; set; }
 public int InstancedMeshLayerCount { get; set; }
 public int InstancedMeshInstanceCount { get; set; }
-public int ThroughputFallbackDrawCount { get; set; }
-public int RetainedThroughputDrawCount { get; set; }
 public bool IndirectDrawRequested { get; set; }
 public bool IndirectDrawActive { get; set; }
 public bool BindlessTextureRequested { get; set; }
@@ -35,7 +33,6 @@ public int SkinnedPrimitiveCount { get; set; }
 public long SkinningVertexPayloadBytes { get; set; }
 public bool GpuSkinningRequested { get; set; }
 public bool GpuSkinningActive { get; set; }
-public string SkinningFallbackReason { get; set; } = string.Empty;
     public int RenderPipelineMode { get; set; }
     public bool DeferredRequested { get; set; }
     public bool DeferredActive { get; set; }
@@ -81,14 +78,21 @@ public string SkinningFallbackReason { get; set; } = string.Empty;
     public bool SkyboxEnabled { get; set; }
     public int SkyboxMode { get; set; }
     public int SkyboxDrawCalls { get; set; }
-    public bool DirectionalShadowEnabled { get; set; }
-    public int ShadowMapCount { get; set; }
-    public int ShadowCasterCount { get; set; }
-    public int ShadowMapResolution { get; set; }
-    public string ShadowMapReason { get; set; } = string.Empty;
-    public double ShadowMapMilliseconds { get; set; }
-    public int RegistryVersion { get; set; }
+    public long RegistryVersion { get; set; }
+    public int RegistryFullRebuildCount { get; set; }
+    public int RegistryIncrementalChangeCount { get; set; }
+    public int RegistrySpatialRefreshCount { get; set; }
+    public int RegistrySnapshotBuildCount { get; set; }
+    public long SceneChangeSequence { get; set; }
+    public int RetainedSceneChangeCount { get; set; }
     public int MeshCacheCount { get; set; }
+    public long MeshCacheHitCount { get; set; }
+    public long MeshCacheMissCount { get; set; }
+    public int GeometryResourceCount { get; set; }
+    public long GeometrySourceBytes { get; set; }
+    public long GeometryResidentBytes { get; set; }
+    public long GeometryCompactIndexBytesSaved { get; set; }
+    public int MaterializedWireframeGeometryCount { get; set; }
     public int SceneTraversalCount { get; set; }
     public int TotalChunkCount { get; set; }
     public int VisibleChunkCount { get; set; }
@@ -122,7 +126,19 @@ public string SkinningFallbackReason { get; set; } = string.Empty;
     public double HighScaleBufferBuildMilliseconds { get; set; }
     public double HighScaleUploadMilliseconds { get; set; }
     public double SchedulerDelayMilliseconds { get; set; }
+    /// <summary>Interval between the two most recently presented frames.</summary>
     public double FrameTotalMilliseconds { get; set; }
+    /// <summary>Rolling rate of frames actually presented by the viewport.</summary>
+    public double PresentedFramesPerSecond { get; set; }
+    /// <summary>Rate derived from the most recent presentation interval.</summary>
+    public double InstantaneousPresentedFramesPerSecond { get; set; }
+    /// <summary>Absolute deviation of the most recent interval from the configured target interval.</summary>
+    public double PresentationJitterMilliseconds { get; set; }
+    public long PresentedFrameCount { get; set; }
+    public long RetainedOrdinaryPlanRebuildCount { get; set; }
+    public long RetainedOrdinaryCursorRecoveryCount { get; set; }
+    public long RetainedSkinningBatchUpdateCount { get; set; }
+    public string RetainedOrdinaryLastFailureReason { get; set; } = string.Empty;
     public double RenderScheduleDelayMilliseconds { get; set; }
     public double AllocatedMegabytesPerSecond { get; set; }
     public long AllocatedBytesPerFrame { get; set; }
@@ -137,6 +153,29 @@ public string SkinningFallbackReason { get; set; } = string.Empty;
     public bool FrameInterpolationEnabled { get; set; }
     public bool AdaptivePerformanceEnabled { get; set; }
     public double InterpolationAlpha { get; set; }
+    public long SimulationTick { get; set; }
+    public double SimulationTimeSeconds { get; set; }
+    public double FixedUpdatesPerSecond { get; set; }
+    public double SimulationAccumulatorSeconds { get; set; }
+    public double DroppedSimulationSeconds { get; set; }
+    public int LastSimulationStepCount { get; set; }
+    public int SimulationCommandsExecuted { get; set; }
+    public double SimulationCommandsMilliseconds { get; set; }
+    public int SimulationJobsExecuted { get; set; }
+    public int SimulationJobCommandsCommitted { get; set; }
+    public int SimulationParallelJobBatches { get; set; }
+    public double SimulationJobsSnapshotMilliseconds { get; set; }
+    public double SimulationJobsExecutionMilliseconds { get; set; }
+    public double SimulationJobsCommitMilliseconds { get; set; }
+    public double SimulationJobsTotalMilliseconds { get; set; }
+    public double SimulationUserUpdateMilliseconds { get; set; }
+    public double SimulationAnimationMilliseconds { get; set; }
+    public double SimulationPhysicsMilliseconds { get; set; }
+    public double SimulationParticleMilliseconds { get; set; }
+    public double SimulationCompletionMilliseconds { get; set; }
+    public double SimulationTotalMilliseconds { get; set; }
+    public bool SimulationPaused { get; set; }
+    public bool SimulationFaulted { get; set; }
     public long ManagedAllocatedBytes { get; set; }
     public int RenderTargetWidth { get; set; }
     public int RenderTargetHeight { get; set; }
@@ -173,6 +212,56 @@ public string SkinningFallbackReason { get; set; } = string.Empty;
     public int WebGlLegacyStringProtocolCalls { get; set; }
     public int WebGlBufferDataCalls { get; set; }
     public int WebGlDynamicBufferDataCalls { get; set; }
+    public string RhiBackend { get; set; } = string.Empty;
+    public string RhiAdapterName { get; set; } = string.Empty;
+    public string RhiApiVersion { get; set; } = string.Empty;
+    public string RhiFeatures { get; set; } = string.Empty;
+    public string RhiLimits { get; set; } = string.Empty;
+    public int RhiResourceCount { get; set; }
+    public int RhiBufferCount { get; set; }
+    public int RhiTextureCount { get; set; }
+    public int RhiOwnershipReferences { get; set; }
+    public long RhiResidentBytes { get; set; }
+    public long RhiTextureBytes { get; set; }
+    public long RhiResidentBudgetBytes { get; set; }
+    public long RhiTextureBudgetBytes { get; set; }
+    public long RhiPeakResidentBytes { get; set; }
+    public long RhiResourceCreates { get; set; }
+    public long RhiResourceUpdates { get; set; }
+    public long RhiResourceReleases { get; set; }
+    public uint RhiContextGeneration { get; set; }
+    public long RhiValidationCount { get; set; }
+    public string RhiCapabilityProfile { get; set; } = string.Empty;
+    public long RhiQueueSubmissionCount { get; set; }
+    public long RhiQueueCommandCount { get; set; }
+    public ulong RhiCompletedSubmissionId { get; set; }
+    public int RhiFrameResourceSlot { get; set; } = -1;
+    public int RhiBufferedFrameCount { get; set; }
+    public int RhiUploadRingCapacity { get; set; }
+    public int RhiUploadRingUsed { get; set; }
+    public int RhiUploadRingPeakUsed { get; set; }
+    public int RhiPipelineCacheCount { get; set; }
+    public long RhiPipelineCacheHits { get; set; }
+    public long RhiPipelineCacheMisses { get; set; }
+    public int RhiDeferredReleaseCount { get; set; }
+    public bool GpuTimingAvailable { get; set; }
+    public double GpuFrameMilliseconds { get; set; } = double.NaN;
+    public bool GpuDrivenActive { get; set; }
+    public int GpuDrivenObjectCount { get; set; }
+    public int GpuDrivenMeshCount { get; set; }
+    public int GpuDrivenMaterialCount { get; set; }
+    public int GpuDrivenMeshletCount { get; set; }
+    public int GpuDrivenParticleCapacity { get; set; }
+    public int GpuDrivenComputePassCount { get; set; }
+    public int GpuDrivenRenderPassCount { get; set; }
+    public int GpuDrivenBarrierCount { get; set; }
+    public int GpuDrivenIndirectCommandCapacity { get; set; }
+    public int GpuDrivenUploadedBytes { get; set; }
+    public int GpuDrivenPhysicalResourceCount { get; set; }
+    public int GpuDrivenAliasedResourceCount { get; set; }
+    public bool GpuDrivenOcclusionCullingActive { get; set; }
+    public bool GpuDrivenParticlesActive { get; set; }
+    public bool GpuDrivenClusteredLightingActive { get; set; }
 
     public static RenderStats Empty => new RenderStats();
 }

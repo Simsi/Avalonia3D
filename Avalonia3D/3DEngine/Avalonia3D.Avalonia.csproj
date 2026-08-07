@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net8.0-browser</TargetFrameworks>
+    <RootNamespace>ThreeDEngine</RootNamespace>
+    <AssemblyName>Avalonia3D.Avalonia</AssemblyName>
+    <PackageId>Avalonia3D.Avalonia</PackageId>
+    <Description>Avalonia controls, input, adapters and presenter contracts for Avalonia3D.</Description>
+    <IsPackable>true</IsPackable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Avalonia/**/*.cs" Exclude="Avalonia/Preview/**/*.cs" />
+    <ProjectReference Include="Avalonia3D.Core.csproj" />
+    <PackageReference Include="Avalonia" />
+  </ItemGroup>
+</Project>

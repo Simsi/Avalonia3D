@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>Avalonia3D.Engine.Tests</AssemblyName>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <DefineConstants>$(DefineConstants);AVALONIA3D_TEST_HOST</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="RegressionSuiteTests.cs" />
+    <Compile Include="../Core/Diagnostics/Avalonia3DSelfTestResult.cs" Link="Runtime/Avalonia3DSelfTestResult.cs" />
+    <Compile Include="../Core/Diagnostics/Avalonia3DSelfTestRunner.cs" Link="Runtime/Avalonia3DSelfTestRunner.cs" />
+    <ProjectReference Include="../Avalonia3D.Engine.csproj" />
+    <ProjectReference Include="../Avalonia3D.Editor.csproj" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="coverlet.collector">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+</Project>

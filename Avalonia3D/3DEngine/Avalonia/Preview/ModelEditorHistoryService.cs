@@ -177,7 +177,6 @@ public sealed class ModelEditorSceneSnapshot
             }
         }
 
-        scene.Registry.Invalidate();
         scene.Invalidate();
     }
 

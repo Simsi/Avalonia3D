@@ -1,4 +1,5 @@
 using System;
+using ThreeDEngine.Core.Scene;
 
 namespace ThreeDEngine.Core.Debugging;
 
@@ -15,6 +16,7 @@ public sealed class SceneDebugOptions
     private bool _showSurfaceNormals;
 
     public event EventHandler? Changed;
+    internal Func<SceneAccessLease3D>? MutationScopeRequested { get; set; }
 
     public bool ShowPerformanceMetrics { get => _showPerformanceMetrics; set => Set(ref _showPerformanceMetrics, value); }
     public bool ShowBounds { get => _showBounds; set => Set(ref _showBounds, value); }
@@ -28,6 +30,7 @@ public sealed class SceneDebugOptions
 
     private void Set(ref bool field, bool value)
     {
+        using var mutation = MutationScopeRequested?.Invoke() ?? default;
         if (field == value) return;
         field = value;
         Changed?.Invoke(this, EventArgs.Empty);

@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "engineVersion": "0.1.0-alpha.8.12.1",
+  "captures": [
+    {
+      "platform": "windows",
+      "backend": "opengl",
+      "status": "pending-real-device-capture",
+      "path": null
+    },
+    {
+      "platform": "linux",
+      "backend": "opengl",
+      "status": "pending-real-device-capture",
+      "path": null
+    },
+    {
+      "platform": "macos",
+      "backend": "opengl",
+      "status": "pending-real-device-capture",
+      "path": null
+    },
+    {
+      "platform": "browser",
+      "backend": "webgl2",
+      "status": "pending-real-device-capture",
+      "path": null
+    }
+  ]
+}

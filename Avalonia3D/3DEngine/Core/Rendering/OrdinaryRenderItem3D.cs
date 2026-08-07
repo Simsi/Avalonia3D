@@ -10,7 +10,7 @@ namespace ThreeDEngine.Core.Rendering;
 /// Backend-neutral ordinary mesh render item. It is the single extraction result used
 /// by desktop OpenGL and browser WebGL retained renderers.
 /// </summary>
-public readonly struct OrdinaryRenderItem3D
+internal readonly struct OrdinaryRenderItem3D
 {
     public OrdinaryRenderItem3D(
         Object3D owner,
@@ -18,7 +18,6 @@ public readonly struct OrdinaryRenderItem3D
         MaterialBinding3D material,
         Matrix4x4 model,
         ColorRgba color,
-        bool usesCpuSkinFallback,
         bool usesGpuSkinning,
         string logicalMeshBatchKey,
         string retainedBatchId)
@@ -28,7 +27,6 @@ public readonly struct OrdinaryRenderItem3D
         Material = material;
         Model = model;
         Color = color;
-        UsesCpuSkinFallback = usesCpuSkinFallback;
         UsesGpuSkinning = usesGpuSkinning;
         LogicalMeshBatchKey = logicalMeshBatchKey;
         RetainedBatchId = retainedBatchId;
@@ -39,7 +37,6 @@ public readonly struct OrdinaryRenderItem3D
     public MaterialBinding3D Material { get; }
     public Matrix4x4 Model { get; }
     public ColorRgba Color { get; }
-    public bool UsesCpuSkinFallback { get; }
     public bool UsesGpuSkinning { get; }
     public string LogicalMeshBatchKey { get; }
     public string RetainedBatchId { get; }

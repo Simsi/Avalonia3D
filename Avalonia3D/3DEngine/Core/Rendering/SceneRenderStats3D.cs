@@ -8,7 +8,7 @@ namespace ThreeDEngine.Core.Rendering;
 /// Shared render-stat population helpers. Keep backend-neutral counters here so
 /// desktop/browser presenters do not drift when pipeline fields are added.
 /// </summary>
-public static class SceneRenderStats3D
+internal static class SceneRenderStats3D
 {
     public static void ApplyPipelineStats(RenderStats stats, Scene3D scene, RenderPipelinePlan3D pipeline)
     {

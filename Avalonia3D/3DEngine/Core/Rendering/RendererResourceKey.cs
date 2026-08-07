@@ -3,9 +3,9 @@ using System.Globalization;
 
 namespace ThreeDEngine.Core.Rendering;
 
-public readonly struct RendererResourceKey : IEquatable<RendererResourceKey>
+internal readonly struct RendererResourceKey : IEquatable<RendererResourceKey>
 {
-    public RendererResourceKey(string kind, string id, int version = 0)
+    public RendererResourceKey(string kind, string id, long version = 0)
     {
         Kind = string.IsNullOrWhiteSpace(kind) ? "resource" : kind;
         Id = id ?? string.Empty;
@@ -14,13 +14,13 @@ public readonly struct RendererResourceKey : IEquatable<RendererResourceKey>
 
     public string Kind { get; }
     public string Id { get; }
-    public int Version { get; }
+    public long Version { get; }
     public string StableId => Kind + ":" + Id;
 
-    public static RendererResourceKey Mesh(string meshKey, int version = 0) => new("mesh", meshKey, version);
-    public static RendererResourceKey Material(string materialKey, int version = 0) => new("material", materialKey, version);
-    public static RendererResourceKey Shader(string shaderKey, int version = 0) => new("shader", shaderKey, version);
-    public static RendererResourceKey Texture(string textureKey, int version = 0) => new("texture", textureKey, version);
+    public static RendererResourceKey Mesh(string meshKey, long version = 0) => new("mesh", meshKey, version);
+    public static RendererResourceKey Material(string materialKey, long version = 0) => new("material", materialKey, version);
+    public static RendererResourceKey Shader(string shaderKey, long version = 0) => new("shader", shaderKey, version);
+    public static RendererResourceKey Texture(string textureKey, long version = 0) => new("texture", textureKey, version);
 
     public bool Equals(RendererResourceKey other)
         => Version == other.Version

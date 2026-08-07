@@ -1,5 +1,4 @@
 using System;
-using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Numerics;
@@ -11,6 +10,7 @@ using ThreeDEngine.Avalonia.Controls;
 using ThreeDEngine.Avalonia.Rendering;
 using ThreeDEngine.Core.Assets.Models;
 using ThreeDEngine.Core.Culling;
+using ThreeDEngine.Core.Diagnostics;
 using ThreeDEngine.Core.Environment;
 using ThreeDEngine.Core.Geometry;
 using ThreeDEngine.Core.HighScale;
@@ -20,13 +20,14 @@ using ThreeDEngine.Core.Lighting;
 using ThreeDEngine.Core.Materials;
 using ThreeDEngine.Core.Primitives;
 using ThreeDEngine.Core.Rendering;
-using ThreeDEngine.Core.Rendering.Shadows;
+using ThreeDEngine.Core.Rendering.Rhi;
 using ThreeDEngine.Core.Rendering.Pipeline;
+using ThreeDEngine.Core.Resources;
 using ThreeDEngine.Core.Scene;
 
 namespace ThreeDEngine.Avalonia.OpenGL.Rendering;
 
-internal sealed partial class OpenGlSceneRenderer
+internal sealed partial class OpenGlSceneRenderer : IRhiCommandExecutor3D
 {
     private const int GlColorBufferBit = 0x00004000;
     private const int GlDepthBufferBit = 0x00000100;
@@ -39,6 +40,8 @@ internal sealed partial class OpenGlSceneRenderer
     private const int GlTriangles = 0x0004;
     private const int GlLines = 0x0001;
     private const int GlFloat = 0x1406;
+    private const int GlShort = 0x1402;
+    private const int GlHalfFloat = 0x140B;
     private const int GlUnsignedInt = 0x1405;
     private const int GlUnsignedShort = 0x1403;
     private const int GlArrayBuffer = 0x8892;
@@ -46,7 +49,10 @@ internal sealed partial class OpenGlSceneRenderer
     private const int GlStaticDraw = 0x88E4;
     private const int GlDynamicDraw = 0x88E8;
     private const int GlDepthTest = 0x0B71;
+    private const int GlLess = 0x0201;
     private const int GlCullFace = 0x0B44;
+    private const int GlFront = 0x0404;
+    private const int GlBack = 0x0405;
     private const int GlBlend = 0x0BE2;
     private const int GlTexture2D = 0x0DE1;
     private const int GlTexture0 = 0x84C0;
@@ -69,18 +75,22 @@ internal sealed partial class OpenGlSceneRenderer
     private const int GlFragmentShader = 0x8B30;
     private const int GlSrcAlpha = 0x0302;
     private const int GlOneMinusSrcAlpha = 0x0303;
+    private const int GlVendor = 0x1F00;
+    private const int GlRenderer = 0x1F01;
+    private const int GlVersion = 0x1F02;
+    private const int GlExtensions = 0x1F03;
+    private const int GlNoError = 0;
+    private const int GlInvalidEnum = 0x0500;
+    private const int GlInvalidValue = 0x0501;
+    private const int GlInvalidOperation = 0x0502;
+    private const int GlOutOfMemory = 0x0505;
+    private const int GlInvalidFramebufferOperation = 0x0506;
+    private const int GlContextLost = 0x0507;
+    private const int GlTimeElapsed = 0x88BF;
+    private const int GlQueryResult = 0x8866;
+    private const int GlQueryResultAvailable = 0x8867;
     private const int InstanceFloatStride = 20;
     private const int InstanceByteStride = InstanceFloatStride * sizeof(float);
-    private const int MeshVertexFloatStride = 25;
-    private const int MeshVertexByteStride = MeshVertexFloatStride * sizeof(float);
-    private const int MeshPositionOffsetBytes = 0;
-    private const int MeshNormalOffsetBytes = 3 * sizeof(float);
-    private const int MeshTexCoordOffsetBytes = 6 * sizeof(float);
-    private const int MeshTangentOffsetBytes = 8 * sizeof(float);
-    private const int MeshVertexColorOffsetBytes = 12 * sizeof(float);
-    private const int MeshMaterialSlotOffsetBytes = 16 * sizeof(float);
-    private const int MeshBoneIndexOffsetBytes = 17 * sizeof(float);
-    private const int MeshBoneWeightOffsetBytes = 21 * sizeof(float);
     private const int ParticleBillboardFloatStride = 8; // center.xyz + size + color.rgba
     private const int ParticleBillboardByteStride = ParticleBillboardFloatStride * sizeof(float);
     private const int MaxGpuSkinTextureBones = 4096;
@@ -91,22 +101,22 @@ internal sealed partial class OpenGlSceneRenderer
     private const int MaxHighScaleMaterialVariants = 32;
     private const int RetainedOrdinaryCullMinInstances = 32;
     private const float RetainedOrdinaryCullMinCulledRatio = 0.15f;
+    private const float SparseInstanceUploadMaxDirtyRatio = 0.25f;
+    private const int MaxSparseInstanceUploadRanges = 64;
+    private const int MaxPartialHighScaleUploadRanges = 64;
 
-    // Desktop OpenGL backends used by Avalonia may expose VAO support while keeping
-    // divisor/attribute state in a way that is not stable across context rebinds. The
-    // engine binds vertex attributes explicitly per draw; this is a little more CPU
-    // work, but it removes a deterministic "draws once then disappears" failure mode.
-    private const bool DisableOpenGlVertexArraysForStability = true;
-
-    // Small/medium high-scale scenes are safer as explicit draws on Desktop GL. Large
-    // digital-twin layers still use the instanced retained path when it validates.
-    private const int StableHighScaleLegacyInstanceThreshold = 2048;
-    private const int InstancedDrawValidationBudgetInitial = 256;
+    // Capability setup is validated on a short startup sample. Hundreds of synchronous
+    // glGetError boundaries made the first complex Desktop frames visibly stall without
+    // improving coverage: every ordinary/particle/high-scale path uses the same entry points.
+    private const int InstancedDrawValidationBudgetInitial = 8;
     private static readonly HighScaleChunkKey3D AggregateChunkKey = new(int.MinValue, int.MinValue, int.MinValue);
 
     private readonly Dictionary<string, MeshGpuResource> _meshResources = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ControlTextureResource> _controlTextures = new(StringComparer.Ordinal);
     private readonly Dictionary<string, MaterialTextureResource> _materialTextures = new(StringComparer.Ordinal);
+    private readonly GpuDeferredReleaseQueue3D<MaterialTextureResource> _deferredMaterialTextureReleases = new();
+    private readonly GpuDeferredReleaseQueue3D<ControlTextureResource> _deferredControlTextureReleases = new();
+    private readonly string _rhiResourceOwnerId = "opengl-renderer:" + Guid.NewGuid().ToString("N");
     private readonly Dictionary<string, HighScalePaletteTextureResource> _highScalePaletteTextures = new(StringComparer.Ordinal);
     private readonly Dictionary<MeshBatchKey, MeshBatchData> _meshBatches = new();
     private readonly Dictionary<MeshBatchKey, ParticleBatchData> _particleBatches = new();
@@ -115,40 +125,52 @@ internal sealed partial class OpenGlSceneRenderer
     private readonly float[] _controlVertexData = new float[20];
     private readonly List<ControlPlaneRenderItem3D> _controlPlaneScratch = new(16);
     private readonly Vector3[] _controlCornerScratch = new Vector3[4];
+    private readonly SceneRenderFrameScratch3D _renderFrameScratch = new();
     private readonly SceneRenderPlanScratch3D _renderPlanScratch = new();
-    private readonly SceneRenderPlanScratch3D _fallbackRenderPlanScratch = new();
+    private readonly SceneRenderPlanScratch3D _fullRenderPlanScratch = new();
     private readonly HashSet<string> _liveMeshSweepScratch = new(StringComparer.Ordinal);
     private readonly HashSet<string> _liveControlPlaneSweepScratch = new(StringComparer.Ordinal);
     private readonly HashSet<string> _liveMaterialTextureSweepScratch = new(StringComparer.Ordinal);
     private readonly List<string> _meshSweepScratch = new();
     private readonly List<string> _textureSweepScratch = new();
     private readonly List<MeshBatchKey> _batchRemovalScratch = new();
-    private readonly Stopwatch _animationClock = Stopwatch.StartNew();
-    private int _lastSweptRegistryVersion = -1;
-    private int _lastSweptBatchContentVersion = -1;
-    private int _lastBuiltOrdinarySceneChangeVersion = -1;
-    private int _lastBuiltOrdinaryTransformVersion = -1;
-    private int _lastBuiltOrdinaryParticleVersion = -1;
-    private int _lastBuiltOrdinaryRegistryVersion = -1;
+    private long _lastSweptRegistryVersion = -1;
+    private long _lastSweptBatchContentVersion = -1;
+    private long _lastBuiltOrdinarySceneChangeVersion = -1;
+    private long _lastBuiltOrdinaryTransformVersion = -1;
+    private long _lastBuiltOrdinaryParticleVersion = -1;
+    private long _lastBuiltOrdinaryRegistryVersion = -1;
     private int _lastBuiltOrdinaryInterpolationVersion = -1;
-    private int _lastBuiltOrdinaryCameraVersion = -1;
-    private bool _hasTransparentOrdinaryBatches;
+    private long _lastBuiltOrdinaryCameraVersion = -1;
+    private bool _hasAdaptiveTransparentOrdinaryBatches;
     private bool _hasCameraDependentParticleBatches;
     private readonly OrdinaryBatchStatsCache _ordinaryBatchStatsCache = new();
     private readonly HighScaleLodSelectionPlan3D _highScaleLodPlanScratch = new();
-    private readonly List<int> _highScaleShadowInstanceScratch = new(1024);
-    private readonly RenderStats _shadowHighScalePlanningStats = new();
     private readonly List<CachedOpenGlDrawCommand> _cachedDrawCommands = new(384);
     private readonly List<CachedOpenGlDrawCommand> _frameDrawCommandScratch = new(384);
     private readonly Dictionary<string, RetainedOrdinarySlotRef> _ordinarySlotByObjectId = new(StringComparer.Ordinal);
     private readonly List<Object3D> _ordinaryTransformDirtyScratch = new(256);
+    private readonly List<Object3D> _ordinaryInterpolationDirtyScratch = new(256);
+    private readonly HashSet<Object3D> _ordinaryDirtySeen = new(ObjectReferenceComparer3D<Object3D>.Instance);
+    private long _lastRetainedPlanRebuildWarningTicks;
+    private int _suppressedRetainedPlanRebuildWarnings;
+    private long _retainedOrdinaryPlanRebuildCount;
+    private long _retainedOrdinaryCursorRecoveryCount;
+    private long _retainedSkinningBatchUpdateCount;
+    private string _lastRetainedOrdinaryFailureReason = string.Empty;
     private int[] _particleSortOrderScratch = Array.Empty<int>();
     private float[] _particleSortKeyScratch = Array.Empty<float>();
     private int _highScaleTransformBatchUploadsThisFrame;
+    private readonly int[] _gpuTimerQueries = new int[4];
+    private readonly bool[] _gpuTimerPending = new bool[4];
+    private int _gpuTimerActiveSlot = -1;
+    private int _gpuTimerNextSlot;
+    private double _lastGpuFrameMilliseconds = double.NaN;
+    private RhiDevice3D? _rhiDevice;
+    private EngineResourceConfiguration3D? _resourceConfiguration;
 
     private int _meshProgram;
     private int _texturedProgram;
-    private int _shadowProgram;
     private int _skyboxProgram;
     private int _meshPositionLocation;
     private int _meshNormalLocation;
@@ -191,10 +213,6 @@ internal sealed partial class OpenGlSceneRenderer
     private int _meshUseHighScaleStateLocation;
     private int _meshUsePaletteTextureLocation;
     private int _meshUseDirectStateColorLocation;
-    private int _meshShadowEnabledLocation;
-    private int _meshShadowMapLocation;
-    private int _meshLightViewProjLocation;
-    private int _meshShadowParamsLocation;
     private int _meshPaletteTextureLocation;
     private int _meshPaletteWidthLocation;
     private int _meshPaletteHeightLocation;
@@ -223,24 +241,6 @@ internal sealed partial class OpenGlSceneRenderer
     private int _textureUvLocation;
     private int _textureSamplerLocation;
     private int _textureViewProjLocation;
-    private int _shadowPositionLocation;
-    private int _shadowInstanceModel0Location;
-    private int _shadowInstanceModel1Location;
-    private int _shadowInstanceModel2Location;
-    private int _shadowInstanceModel3Location;
-    private int _shadowBoneIndicesLocation;
-    private int _shadowBoneWeightsLocation;
-    private int _shadowModelLocation;
-    private int _shadowPartLocalLocation;
-    private int _shadowUsePartLocalLocation;
-    private int _shadowLightViewProjLocation;
-    private int _shadowParticleBillboardLocation;
-    private int _shadowParticleCameraRightLocation;
-    private int _shadowParticleCameraUpLocation;
-    private int _shadowUseInstancingLocation;
-    private int _shadowSkinningEnabledLocation;
-    private int _shadowBoneTextureLocation;
-    private int _shadowBoneTextureHeightLocation;
     private int _skyboxPositionLocation;
     private int _skyboxTopColorLocation;
     private int _skyboxHorizonColorLocation;
@@ -250,6 +250,8 @@ internal sealed partial class OpenGlSceneRenderer
     private int _skyboxCameraRightLocation;
     private int _skyboxCameraUpLocation;
     private int _skyboxCameraForwardLocation;
+    private int _skyboxProjectionScaleXLocation;
+    private int _skyboxProjectionScaleYLocation;
     private int _skyboxTextureLocation;
     private int _skyboxTextureEnabledLocation;
     private int _skyboxPXLocation;
@@ -262,33 +264,35 @@ internal sealed partial class OpenGlSceneRenderer
     private int _skyboxVertexArray;
     private int _skyboxVertexBuffer;
     private int _skyboxIndexBuffer;
-    private DirectionalShadowMapResource? _directionalShadowMap;
     private int _controlVertexArray;
     private int _controlVertexBuffer;
     private int _controlIndexBuffer;
     private MeshGpuResource? _lastMeshAttributeResource;
-    private MeshGpuResource? _lastShadowAttributeResource;
-    private int _paletteTexture;
     private byte[] _paletteUploadBuffer = Array.Empty<byte>();
     private byte[] _controlBgraUploadBuffer = Array.Empty<byte>();
     private byte[] _controlRgbaUploadBuffer = Array.Empty<byte>();
     private GlInterface? _lastGl;
     private bool _initialized;
     private bool _supportsInstancing;
+    private string _instancingApi = "unresolved";
     private bool _instancedDrawPathBroken;
     private int _instancedDrawValidationBudget = InstancedDrawValidationBudgetInitial;
     private int _instancedDrawFailureCount;
+    private string _lastInstancedDrawFailureReason = "none";
     private bool _supportsBoneTextureSkinning;
     private int _gpuSkinTextureBoneLimit = 0;
     private GlBlendFuncDelegate? _blendFunc;
     private GlDepthMaskDelegate? _depthMask;
+    private GlDepthFuncDelegate? _depthFunc;
     private GlDisableDelegate? _disable;
+    private GlCullFaceDelegate? _cullFace;
     private GlUniform1iDelegate? _uniform1i;
     private GlUniform1fDelegate? _uniform1f;
     private GlUniform4fDelegate? _uniform4f;
     private GlUniform3fDelegate? _uniform3f;
     private GlUniformMatrix4fvDelegate? _uniformMatrix4fv;
     private GlVertexAttribDivisorDelegate? _vertexAttribDivisor;
+    private GlVertexAttrib4fDelegate? _vertexAttrib4f;
     private GlDrawElementsInstancedDelegate? _drawElementsInstanced;
     private GlBufferSubDataDelegate? _bufferSubData;
     private GlGenFramebuffersDelegate? _genFramebuffers;
@@ -302,9 +306,29 @@ internal sealed partial class OpenGlSceneRenderer
     private GlDeleteVertexArraysDelegate? _deleteVertexArrays;
     private GlDisableVertexAttribArrayDelegate? _disableVertexAttribArray;
     private GlGetIntegervDelegate? _getIntegerv;
+    private GlGetStringDelegate? _getString;
     private GlGetErrorDelegate? _getError;
+    private GlGenQueriesDelegate? _genQueries;
+    private GlDeleteQueriesDelegate? _deleteQueries;
+    private GlBeginQueryDelegate? _beginQuery;
+    private GlEndQueryDelegate? _endQuery;
+    private GlGetQueryObjectivDelegate? _getQueryObjectiv;
+    private GlGetQueryObjectui64vDelegate? _getQueryObjectui64v;
     private bool _supportsVertexArrays;
+    private string _vertexArrayApi = "unresolved";
     private int _boundVertexArray;
+    private long _graphicsCallbackSerial;
+    private CullMode _appliedCullMode = (CullMode)(-1);
+
+    public RhiDevice3D? Device => _rhiDevice;
+
+    public void ConfigureResources(EngineResourceConfiguration3D configuration)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+        if (_initialized && !Equals(_resourceConfiguration, configuration))
+            throw new InvalidOperationException("An initialized OpenGL renderer cannot switch to a different engine resource policy without recreating its presenter.");
+        _resourceConfiguration = configuration;
+    }
 
     public void Initialize(GlInterface gl)
     {
@@ -331,24 +355,30 @@ internal sealed partial class OpenGlSceneRenderer
 
         _lastGl = gl;
 
+        // Resolve context identity/error reporting before extension entry points.
+        // EGL/ANGLE may return non-null addresses for core names that are illegal
+        // in the active ES2 context, so pointer presence is not a capability test.
+        _getIntegerv = LoadDelegate<GlGetIntegervDelegate>(gl, "glGetIntegerv");
+        _getString = LoadDelegate<GlGetStringDelegate>(gl, "glGetString");
+        _getError = LoadDelegate<GlGetErrorDelegate>(gl, "glGetError");
+        var glVersion = GetString(GlVersion);
+        var contextVersion = ParseGlContextVersion(glVersion);
+        var extensions = contextVersion.IsKnown && contextVersion.Major < 3
+            ? GetString(GlExtensions)
+            : string.Empty;
+
         _blendFunc = LoadDelegate<GlBlendFuncDelegate>(gl, "glBlendFunc");
         _depthMask = LoadDelegate<GlDepthMaskDelegate>(gl, "glDepthMask");
+        _depthFunc = LoadDelegate<GlDepthFuncDelegate>(gl, "glDepthFunc");
         _disable = LoadDelegate<GlDisableDelegate>(gl, "glDisable");
+        _cullFace = LoadDelegate<GlCullFaceDelegate>(gl, "glCullFace");
         _uniform1i = LoadDelegate<GlUniform1iDelegate>(gl, "glUniform1i");
         _uniform1f = LoadDelegate<GlUniform1fDelegate>(gl, "glUniform1f");
         _uniform4f = LoadDelegate<GlUniform4fDelegate>(gl, "glUniform4f");
         _uniform3f = LoadDelegate<GlUniform3fDelegate>(gl, "glUniform3f");
         _uniformMatrix4fv = LoadDelegate<GlUniformMatrix4fvDelegate>(gl, "glUniformMatrix4fv");
-        _vertexAttribDivisor = LoadDelegate<GlVertexAttribDivisorDelegate>(gl, "glVertexAttribDivisor")
-                                ?? LoadDelegate<GlVertexAttribDivisorDelegate>(gl, "glVertexAttribDivisorARB")
-                                ?? LoadDelegate<GlVertexAttribDivisorDelegate>(gl, "glVertexAttribDivisorEXT")
-                                ?? LoadDelegate<GlVertexAttribDivisorDelegate>(gl, "glVertexAttribDivisorANGLE")
-                                ?? LoadDelegate<GlVertexAttribDivisorDelegate>(gl, "glVertexAttribDivisorOES");
-        _drawElementsInstanced = LoadDelegate<GlDrawElementsInstancedDelegate>(gl, "glDrawElementsInstanced")
-                                 ?? LoadDelegate<GlDrawElementsInstancedDelegate>(gl, "glDrawElementsInstancedARB")
-                                 ?? LoadDelegate<GlDrawElementsInstancedDelegate>(gl, "glDrawElementsInstancedEXT")
-                                 ?? LoadDelegate<GlDrawElementsInstancedDelegate>(gl, "glDrawElementsInstancedANGLE")
-                                 ?? LoadDelegate<GlDrawElementsInstancedDelegate>(gl, "glDrawElementsInstancedOES");
+        _vertexAttrib4f = LoadDelegate<GlVertexAttrib4fDelegate>(gl, "glVertexAttrib4f");
+        ResolveInstancingEntryPoints(gl, contextVersion, extensions);
         _bufferSubData = LoadDelegate<GlBufferSubDataDelegate>(gl, "glBufferSubData");
         _genFramebuffers = LoadDelegate<GlGenFramebuffersDelegate>(gl, "glGenFramebuffers")
                            ?? LoadDelegate<GlGenFramebuffersDelegate>(gl, "glGenFramebuffersEXT");
@@ -360,24 +390,44 @@ internal sealed partial class OpenGlSceneRenderer
                                   ?? LoadDelegate<GlCheckFramebufferStatusDelegate>(gl, "glCheckFramebufferStatusEXT");
         _drawBuffer = LoadDelegate<GlDrawBufferDelegate>(gl, "glDrawBuffer");
         _readBuffer = LoadDelegate<GlReadBufferDelegate>(gl, "glReadBuffer");
-        _genVertexArrays = LoadDelegate<GlGenVertexArraysDelegate>(gl, "glGenVertexArrays")
-                           ?? LoadDelegate<GlGenVertexArraysDelegate>(gl, "glGenVertexArraysOES")
-                           ?? LoadDelegate<GlGenVertexArraysDelegate>(gl, "glGenVertexArraysAPPLE");
-        _bindVertexArray = LoadDelegate<GlBindVertexArrayDelegate>(gl, "glBindVertexArray")
-                           ?? LoadDelegate<GlBindVertexArrayDelegate>(gl, "glBindVertexArrayOES")
-                           ?? LoadDelegate<GlBindVertexArrayDelegate>(gl, "glBindVertexArrayAPPLE");
-        _deleteVertexArrays = LoadDelegate<GlDeleteVertexArraysDelegate>(gl, "glDeleteVertexArrays")
-                              ?? LoadDelegate<GlDeleteVertexArraysDelegate>(gl, "glDeleteVertexArraysOES")
-                              ?? LoadDelegate<GlDeleteVertexArraysDelegate>(gl, "glDeleteVertexArraysAPPLE");
+        ResolveVertexArrayEntryPoints(gl, contextVersion, extensions);
         _disableVertexAttribArray = LoadDelegate<GlDisableVertexAttribArrayDelegate>(gl, "glDisableVertexAttribArray");
-        _getIntegerv = LoadDelegate<GlGetIntegervDelegate>(gl, "glGetIntegerv");
-        _getError = LoadDelegate<GlGetErrorDelegate>(gl, "glGetError");
+        _genQueries = LoadDelegate<GlGenQueriesDelegate>(gl, "glGenQueries")
+                      ?? LoadDelegate<GlGenQueriesDelegate>(gl, "glGenQueriesARB");
+        _deleteQueries = LoadDelegate<GlDeleteQueriesDelegate>(gl, "glDeleteQueries")
+                         ?? LoadDelegate<GlDeleteQueriesDelegate>(gl, "glDeleteQueriesARB");
+        _beginQuery = LoadDelegate<GlBeginQueryDelegate>(gl, "glBeginQuery")
+                      ?? LoadDelegate<GlBeginQueryDelegate>(gl, "glBeginQueryARB");
+        _endQuery = LoadDelegate<GlEndQueryDelegate>(gl, "glEndQuery")
+                    ?? LoadDelegate<GlEndQueryDelegate>(gl, "glEndQueryARB");
+        _getQueryObjectiv = LoadDelegate<GlGetQueryObjectivDelegate>(gl, "glGetQueryObjectiv")
+                            ?? LoadDelegate<GlGetQueryObjectivDelegate>(gl, "glGetQueryObjectivARB");
+        _getQueryObjectui64v = LoadDelegate<GlGetQueryObjectui64vDelegate>(gl, "glGetQueryObjectui64v")
+                               ?? LoadDelegate<GlGetQueryObjectui64vDelegate>(gl, "glGetQueryObjectui64vEXT");
         var nativeVertexArraysAvailable = _genVertexArrays is not null && _bindVertexArray is not null && _deleteVertexArrays is not null;
-        _supportsVertexArrays = nativeVertexArraysAvailable && !DisableOpenGlVertexArraysForStability;
+        _supportsVertexArrays = nativeVertexArraysAvailable;
         _supportsInstancing = _vertexAttribDivisor is not null && _drawElementsInstanced is not null;
         _instancedDrawPathBroken = false;
         _instancedDrawValidationBudget = InstancedDrawValidationBudgetInitial;
         _instancedDrawFailureCount = 0;
+        _lastInstancedDrawFailureReason = "none";
+        EngineLog3D.Information(
+            "OpenGL.Capabilities",
+            $"Resolved context '{glVersion}': VAO API={_vertexArrayApi}, instancing API={_instancingApi}.");
+
+        var requiredEntryPoints = new List<string>();
+        if (!_supportsVertexArrays) requiredEntryPoints.Add("vertex array objects");
+        if (!_supportsInstancing) requiredEntryPoints.Add("instanced drawing");
+        if (_vertexAttrib4f is null) requiredEntryPoints.Add("generic vertex attribute constants");
+        if (_bufferSubData is null) requiredEntryPoints.Add("buffer sub-data updates");
+        if (_genFramebuffers is null || _deleteFramebuffers is null || _framebufferTexture2D is null || _checkFramebufferStatus is null) requiredEntryPoints.Add("framebuffer objects");
+        if (_getIntegerv is null) requiredEntryPoints.Add("GPU limit queries");
+        if (_blendFunc is null || _depthMask is null || _depthFunc is null || _disable is null || _cullFace is null) requiredEntryPoints.Add("fixed-function render state");
+        if (_uniform1i is null || _uniform1f is null || _uniform3f is null || _uniform4f is null || _uniformMatrix4fv is null) requiredEntryPoints.Add("shader uniform uploads");
+        if (requiredEntryPoints.Count != 0)
+        {
+            throw new InvalidOperationException($"OpenGL RHI initialization failed; required native GPU entry points are unavailable: {string.Join(", ", requiredEntryPoints)}. Legacy rendering paths are disabled.");
+        }
 
         _meshProgram = CreateProgram(gl, MeshVertexSource, MeshFragmentSource,
             (0, "aPosition"), (1, "aNormal"), (2, "aInstanceModel0"), (3, "aInstanceModel1"),
@@ -452,33 +502,6 @@ internal sealed partial class OpenGlSceneRenderer
         _meshPostProcessParamsLocation = gl.GetUniformLocationString(_meshProgram, "uPostProcessParams");
         _meshSsaoParamsLocation = gl.GetUniformLocationString(_meshProgram, "uSsaoParams");
         _meshDistanceFadeParamsLocation = gl.GetUniformLocationString(_meshProgram, "uDistanceFadeParams");
-        _meshShadowEnabledLocation = gl.GetUniformLocationString(_meshProgram, "uShadowEnabled");
-        _meshShadowMapLocation = gl.GetUniformLocationString(_meshProgram, "uShadowMap");
-        _meshLightViewProjLocation = gl.GetUniformLocationString(_meshProgram, "uLightViewProj");
-        _meshShadowParamsLocation = gl.GetUniformLocationString(_meshProgram, "uShadowParams");
-
-        _shadowProgram = CreateProgram(gl, ShadowVertexSource, ShadowFragmentSource,
-            (0, "aPosition"), (2, "aInstanceModel0"), (3, "aInstanceModel1"), (4, "aInstanceModel2"), (5, "aInstanceModel3"),
-            (12, "aBoneIndices"), (13, "aBoneWeights"));
-        _shadowPositionLocation = gl.GetAttribLocationString(_shadowProgram, "aPosition");
-        _shadowInstanceModel0Location = gl.GetAttribLocationString(_shadowProgram, "aInstanceModel0");
-        _shadowInstanceModel1Location = gl.GetAttribLocationString(_shadowProgram, "aInstanceModel1");
-        _shadowInstanceModel2Location = gl.GetAttribLocationString(_shadowProgram, "aInstanceModel2");
-        _shadowInstanceModel3Location = gl.GetAttribLocationString(_shadowProgram, "aInstanceModel3");
-        _shadowBoneIndicesLocation = gl.GetAttribLocationString(_shadowProgram, "aBoneIndices");
-        _shadowBoneWeightsLocation = gl.GetAttribLocationString(_shadowProgram, "aBoneWeights");
-        _shadowModelLocation = gl.GetUniformLocationString(_shadowProgram, "uModel");
-        _shadowPartLocalLocation = gl.GetUniformLocationString(_shadowProgram, "uPartLocal");
-        _shadowUsePartLocalLocation = gl.GetUniformLocationString(_shadowProgram, "uUsePartLocal");
-        _shadowLightViewProjLocation = gl.GetUniformLocationString(_shadowProgram, "uLightViewProj");
-        _shadowUseInstancingLocation = gl.GetUniformLocationString(_shadowProgram, "uUseInstancing");
-        _shadowSkinningEnabledLocation = gl.GetUniformLocationString(_shadowProgram, "uSkinningEnabled");
-        _shadowBoneTextureLocation = gl.GetUniformLocationString(_shadowProgram, "uBoneTexture");
-        _shadowBoneTextureHeightLocation = gl.GetUniformLocationString(_shadowProgram, "uBoneTextureHeight");
-        _shadowParticleBillboardLocation = gl.GetUniformLocationString(_shadowProgram, "uParticleBillboard");
-        _shadowParticleCameraRightLocation = gl.GetUniformLocationString(_shadowProgram, "uParticleCameraRight");
-        _shadowParticleCameraUpLocation = gl.GetUniformLocationString(_shadowProgram, "uParticleCameraUp");
-
         _supportsBoneTextureSkinning = ProbeBoneTextureSkinningSupport(gl);
 
         _skyboxProgram = CreateProgram(gl, SkyboxVertexSource, SkyboxFragmentSource, (0, "aPosition"));
@@ -491,6 +514,8 @@ internal sealed partial class OpenGlSceneRenderer
         _skyboxCameraRightLocation = gl.GetUniformLocationString(_skyboxProgram, "uCameraRight");
         _skyboxCameraUpLocation = gl.GetUniformLocationString(_skyboxProgram, "uCameraUp");
         _skyboxCameraForwardLocation = gl.GetUniformLocationString(_skyboxProgram, "uCameraForward");
+        _skyboxProjectionScaleXLocation = gl.GetUniformLocationString(_skyboxProgram, "uProjectionScaleX");
+        _skyboxProjectionScaleYLocation = gl.GetUniformLocationString(_skyboxProgram, "uProjectionScaleY");
         _skyboxTextureLocation = gl.GetUniformLocationString(_skyboxProgram, "uSkyboxTexture");
         _skyboxTextureEnabledLocation = gl.GetUniformLocationString(_skyboxProgram, "uSkyboxTextureEnabled");
         _skyboxPXLocation = gl.GetUniformLocationString(_skyboxProgram, "uSkyboxPX");
@@ -507,11 +532,10 @@ internal sealed partial class OpenGlSceneRenderer
         _textureSamplerLocation = gl.GetUniformLocationString(_texturedProgram, "uTexture");
         _textureViewProjLocation = gl.GetUniformLocationString(_texturedProgram, "uViewProj");
 
-        _paletteTexture = gl.GenTexture();
-        _controlVertexBuffer = gl.GenBuffer();
-        _controlIndexBuffer = gl.GenBuffer();
-        _skyboxVertexBuffer = gl.GenBuffer();
-        _skyboxIndexBuffer = gl.GenBuffer();
+        _controlVertexBuffer = GenRequiredBuffer(gl, "utility:control:vertices");
+        _controlIndexBuffer = GenRequiredBuffer(gl, "utility:control:indices");
+        _skyboxVertexBuffer = GenRequiredBuffer(gl, "utility:skybox:vertices");
+        _skyboxIndexBuffer = GenRequiredBuffer(gl, "utility:skybox:indices");
         gl.BindBuffer(GlArrayBuffer, _skyboxVertexBuffer);
         UploadFloats(gl, GlArrayBuffer, new[] { -1f, -1f, 1f, -1f, 1f, 1f, -1f, 1f }, 8, GlStaticDraw);
         gl.BindBuffer(GlElementArrayBuffer, _skyboxIndexBuffer);
@@ -522,6 +546,11 @@ internal sealed partial class OpenGlSceneRenderer
         UploadUShorts(gl, GlElementArrayBuffer, new ushort[] { 0, 1, 2, 0, 2, 3 }, GlStaticDraw);
         gl.BindBuffer(GlElementArrayBuffer, 0);
         ConfigureStaticUtilityVertexArrays(gl);
+        InitializeGpuTimerQueries();
+        var resourceConfiguration = _resourceConfiguration
+            ?? throw new InvalidOperationException("OpenGL renderer resource policy was not configured from the assigned scene engine before initialization.");
+        _rhiDevice ??= new RhiDevice3D(BuildRhiCapabilities(), resourceConfiguration);
+        RegisterStaticRhiResources();
         _initialized = true;
     }
 
@@ -538,24 +567,45 @@ internal sealed partial class OpenGlSceneRenderer
 
     private RenderStats RenderSceneCore(GlInterface gl, int framebuffer, int width, int height, Scene3D scene)
     {
+        // Avalonia owns the GL context outside this callback. Native drivers are allowed to
+        // retain a different VAO between callbacks, so a renderer-side binding cache cannot
+        // cross the host boundary. Every mesh draw below rebinds its exact VAO/EBO and the
+        // first use of each mesh restores its full static layout for this callback.
+        unchecked
+        {
+            _graphicsCallbackSerial++;
+            if (_graphicsCallbackSerial == 0) _graphicsCallbackSerial = 1;
+        }
+        _boundVertexArray = -1;
+        _lastMeshAttributeResource = null;
+        DrainDeferredMaterialTextureReleases(gl, _rhiDevice?.FrameIndex ?? 0);
+        DrainDeferredControlTextureReleases(gl, _rhiDevice?.FrameIndex ?? 0);
         gl.BindFramebuffer(GlFramebuffer, framebuffer);
         gl.Viewport(0, 0, width, height);
         gl.Enable(GlDepthTest);
-        _disable?.Invoke(GlCullFace);
+        _depthFunc!(GlLess);
+        _depthMask!(1);
+        _disable!(GlBlend);
+        _appliedCullMode = (CullMode)(-1);
+        ApplyCullMode(gl, CullMode.None);
         gl.ClearColor(scene.BackgroundColor.R, scene.BackgroundColor.G, scene.BackgroundColor.B, scene.BackgroundColor.A);
 
-        var frame = SceneRenderFrameContext3D.Build(scene, width, height, BackendKind.OpenGlDesktop);
+        using var frame = _renderFrameScratch.Begin(scene, width, height, BackendKind.OpenGlDesktop);
         var viewProjection = frame.ViewProjection;
         var pipeline = frame.Pipeline;
 
         SweepUnusedResources(gl, scene, frame.Snapshot);
         var stats = frame.CreateBaseStats();
+        stats.RetainedOrdinaryPlanRebuildCount = _retainedOrdinaryPlanRebuildCount;
+        stats.RetainedOrdinaryCursorRecoveryCount = _retainedOrdinaryCursorRecoveryCount;
+        stats.RetainedSkinningBatchUpdateCount = _retainedSkinningBatchUpdateCount;
+        stats.RetainedOrdinaryLastFailureReason = _lastRetainedOrdinaryFailureReason;
+        EnsureGpuSkinningAvailable(frame.Snapshot);
         var batchPlanNeeded = RequiresOrdinaryBatchPlan(frame);
         var overlayPlanNeeded = scene.Debug.ShowWireframeOverlay || scene.Debug.ShowSilhouetteOverlay;
         var plan = SceneRenderPlanBuilder3D.Build(
             frame,
             _renderPlanScratch,
-            RequiresCpuSkinFallback,
             batchPlanNeeded ? stats : null,
             includeOrdinary: batchPlanNeeded || overlayPlanNeeded,
             includeParticles: batchPlanNeeded,
@@ -563,45 +613,32 @@ internal sealed partial class OpenGlSceneRenderer
             frustumCullParticles: false);
         if (scene.Debug.ShowPerformanceMetrics)
         {
-            ApplyAnimationStats(stats, scene, gpuSkinningActive: _supportsBoneTextureSkinning, fallbackReason: _supportsBoneTextureSkinning ? string.Empty : "OpenGL bone-texture skinning unavailable; CPU skinned fallback mesh used");
+            ApplyAnimationStats(stats, scene, gpuSkinningActive: _supportsBoneTextureSkinning);
         }
         SceneRenderStats3D.ApplyPipelineStats(stats, scene, pipeline);
-
-        BuildBatches(gl, plan, stats);
-        var shadow = plan.Shadow;
-        RenderDirectionalShadowMap(gl, plan, stats);
-
-        gl.BindFramebuffer(GlFramebuffer, framebuffer);
-        gl.Viewport(0, 0, width, height);
-        gl.ClearColor(scene.BackgroundColor.R, scene.BackgroundColor.G, scene.BackgroundColor.B, scene.BackgroundColor.A);
-        gl.Clear(GlColorBufferBit | GlDepthBufferBit);
-        DrawSkybox(gl, scene, stats);
-        DrawMeshes(gl, plan, stats, shadow, pipeline);
-        DrawSurfaceOverlays(gl, plan, stats);
-        DrawControlPlanes(gl, plan, stats);
-
-        BindVertexArray(0);
-        gl.BindBuffer(GlArrayBuffer, 0);
-        gl.BindBuffer(GlElementArrayBuffer, 0);
-        gl.BindTexture(GlTexture2D, 0);
-        gl.UseProgram(0);
+        var device = _rhiDevice ?? throw new InvalidOperationException("OpenGL RHI device is not initialized.");
+        device.BeginFrame(plan.RhiSubmission);
+        ExecuteRhiFrame(gl, framebuffer, width, height, scene, frame, plan, stats, pipeline, device);
+        device.ApplyStats(stats);
         return stats;
     }
 
     public void Deinitialize(GlInterface gl)
     {
-        foreach (var resource in _meshResources.Values) DisposeMeshResource(gl, resource);
-        foreach (var texture in _controlTextures.Values) texture.Dispose(gl);
-        foreach (var texture in _materialTextures.Values) texture.Dispose(gl);
+        foreach (var pair in _meshResources) DisposeMeshResource(gl, pair.Key, pair.Value);
+        _deferredControlTextureReleases.DrainAll(texture => ReleaseControlTextureNow(gl, texture));
+        foreach (var texture in _controlTextures.Values) ReleaseControlTextureNow(gl, texture);
+        _deferredMaterialTextureReleases.DrainAll(texture => ReleaseMaterialTextureNow(gl, texture));
+        foreach (var texture in _materialTextures.Values) ReleaseMaterialTextureNow(gl, texture);
         foreach (var texture in _highScalePaletteTextures.Values) texture.Dispose(gl);
         foreach (var batch in _meshBatches.Values) batch.Dispose(gl);
         foreach (var batch in _particleBatches.Values) batch.Dispose(gl);
         foreach (var batch in _highScaleGpuBatches.Values) batch.Dispose(gl);
-        _directionalShadowMap?.Dispose(gl, _deleteFramebuffers);
-        _directionalShadowMap = null;
         _meshResources.Clear();
         _controlTextures.Clear();
         _materialTextures.Clear();
+        _deferredMaterialTextureReleases.ClearWithoutRelease();
+        _deferredControlTextureReleases.ClearWithoutRelease();
         _highScalePaletteTextures.Clear();
         _meshBatches.Clear();
         _particleBatches.Clear();
@@ -610,7 +647,8 @@ internal sealed partial class OpenGlSceneRenderer
         _frameDrawCommandScratch.Clear();
         _ordinarySlotByObjectId.Clear();
         _ordinaryTransformDirtyScratch.Clear();
-        if (_paletteTexture != 0) gl.DeleteTexture(_paletteTexture);
+        _ordinaryInterpolationDirtyScratch.Clear();
+        _ordinaryDirtySeen.Clear();
         DeleteVertexArray(_controlVertexArray);
         DeleteVertexArray(_skyboxVertexArray);
         if (_controlVertexBuffer != 0) gl.DeleteBuffer(_controlVertexBuffer);
@@ -619,14 +657,12 @@ internal sealed partial class OpenGlSceneRenderer
         if (_skyboxIndexBuffer != 0) gl.DeleteBuffer(_skyboxIndexBuffer);
         if (_meshProgram != 0) gl.DeleteProgram(_meshProgram);
         if (_texturedProgram != 0) gl.DeleteProgram(_texturedProgram);
-        if (_shadowProgram != 0) gl.DeleteProgram(_shadowProgram);
         if (_skyboxProgram != 0) gl.DeleteProgram(_skyboxProgram);
+        DeleteGpuTimerQueries();
         _controlVertexArray = _skyboxVertexArray = 0;
-        _controlVertexBuffer = _controlIndexBuffer = _meshProgram = _texturedProgram = _shadowProgram = _skyboxProgram = 0;
+        _controlVertexBuffer = _controlIndexBuffer = _meshProgram = _texturedProgram = _skyboxProgram = 0;
         _skyboxVertexBuffer = _skyboxIndexBuffer = 0;
-        _paletteTexture = 0;
         _lastMeshAttributeResource = null;
-        _lastShadowAttributeResource = null;
         _boundVertexArray = 0;
         _lastBuiltOrdinarySceneChangeVersion = -1;
         _lastBuiltOrdinaryTransformVersion = -1;
@@ -634,7 +670,7 @@ internal sealed partial class OpenGlSceneRenderer
         _lastBuiltOrdinaryRegistryVersion = -1;
         _lastBuiltOrdinaryInterpolationVersion = -1;
         _lastBuiltOrdinaryCameraVersion = -1;
-        _hasTransparentOrdinaryBatches = false;
+        _hasAdaptiveTransparentOrdinaryBatches = false;
         _hasCameraDependentParticleBatches = false;
         _ordinaryBatchStatsCache.Reset();
         _supportsBoneTextureSkinning = false;
@@ -642,6 +678,15 @@ internal sealed partial class OpenGlSceneRenderer
         _instancedDrawPathBroken = false;
         _instancedDrawValidationBudget = InstancedDrawValidationBudgetInitial;
         _instancedDrawFailureCount = 0;
+        _lastInstancedDrawFailureReason = "none";
+        _instancingApi = "unresolved";
+        _vertexArrayApi = "unresolved";
+        if (_rhiDevice is not null)
+        {
+            _rhiDevice.InvalidateContext("OpenGL native resources deinitialized");
+            _rhiDevice.Dispose();
+        }
+        _rhiDevice = null;
         _initialized = false;
     }
 
@@ -669,10 +714,18 @@ internal sealed partial class OpenGlSceneRenderer
 
     private void ResetManagedGlState()
     {
+        if (_rhiDevice is not null && !_rhiDevice.IsDisposed)
+        {
+            _rhiDevice.InvalidateContext("OpenGL context lost before native resource teardown");
+            _rhiDevice.Dispose();
+            _rhiDevice = null;
+        }
         _initialized = false;
         _meshResources.Clear();
         _controlTextures.Clear();
         _materialTextures.Clear();
+        _deferredMaterialTextureReleases.ClearWithoutRelease();
+        _deferredControlTextureReleases.ClearWithoutRelease();
         _highScalePaletteTextures.Clear();
         _meshBatches.Clear();
         _particleBatches.Clear();
@@ -681,14 +734,13 @@ internal sealed partial class OpenGlSceneRenderer
         _frameDrawCommandScratch.Clear();
         _ordinarySlotByObjectId.Clear();
         _ordinaryTransformDirtyScratch.Clear();
-        _directionalShadowMap = null;
+        _ordinaryInterpolationDirtyScratch.Clear();
+        _ordinaryDirtySeen.Clear();
         _lastMeshAttributeResource = null;
-        _lastShadowAttributeResource = null;
         _boundVertexArray = 0;
         _controlVertexArray = _skyboxVertexArray = 0;
-        _controlVertexBuffer = _controlIndexBuffer = _meshProgram = _texturedProgram = _shadowProgram = _skyboxProgram = 0;
+        _controlVertexBuffer = _controlIndexBuffer = _meshProgram = _texturedProgram = _skyboxProgram = 0;
         _skyboxVertexBuffer = _skyboxIndexBuffer = 0;
-        _paletteTexture = 0;
         _lastSweptRegistryVersion = -1;
         _lastSweptBatchContentVersion = -1;
         _lastBuiltOrdinarySceneChangeVersion = -1;
@@ -697,17 +749,21 @@ internal sealed partial class OpenGlSceneRenderer
         _lastBuiltOrdinaryRegistryVersion = -1;
         _lastBuiltOrdinaryInterpolationVersion = -1;
         _lastBuiltOrdinaryCameraVersion = -1;
-        _hasTransparentOrdinaryBatches = false;
+        _hasAdaptiveTransparentOrdinaryBatches = false;
         _hasCameraDependentParticleBatches = false;
         _ordinaryBatchStatsCache.Reset();
         _supportsInstancing = false;
         _instancedDrawPathBroken = false;
         _instancedDrawValidationBudget = InstancedDrawValidationBudgetInitial;
         _instancedDrawFailureCount = 0;
+        _lastInstancedDrawFailureReason = "none";
+        _instancingApi = "unresolved";
+        _vertexArrayApi = "unresolved";
         _supportsVertexArrays = false;
         _supportsBoneTextureSkinning = false;
         _gpuSkinTextureBoneLimit = 0;
         _vertexAttribDivisor = null;
+        _vertexAttrib4f = null;
         _drawElementsInstanced = null;
         _bufferSubData = null;
         _genVertexArrays = null;
@@ -715,7 +771,22 @@ internal sealed partial class OpenGlSceneRenderer
         _deleteVertexArrays = null;
         _disableVertexAttribArray = null;
         _getIntegerv = null;
+        _getString = null;
         _getError = null;
+        _genQueries = null;
+        _deleteQueries = null;
+        _beginQuery = null;
+        _endQuery = null;
+        _getQueryObjectiv = null;
+        _getQueryObjectui64v = null;
+        Array.Clear(_gpuTimerQueries, 0, _gpuTimerQueries.Length);
+        Array.Clear(_gpuTimerPending, 0, _gpuTimerPending.Length);
+        _gpuTimerActiveSlot = -1;
+        _gpuTimerNextSlot = 0;
+        _lastGpuFrameMilliseconds = double.NaN;
+        _cullFace = null;
+        _depthFunc = null;
+        _appliedCullMode = (CullMode)(-1);
     }
 
     private void SweepUnusedResources(GlInterface gl, Scene3D scene, SceneFrameSnapshot3D snapshot)
@@ -731,15 +802,8 @@ internal sealed partial class OpenGlSceneRenderer
         liveControlPlanes.Clear();
         liveMaterialTextures.Clear();
 
-        foreach (var obj in snapshot.Renderables)
-        {
-            if (obj is ParticleSystem3D liveParticles)
-            {
-                liveParticles.SetBillboardBasis(scene.Camera.Right, scene.Camera.SafeUp, scene.Camera.Forward);
-            }
-        }
-        SceneRenderResourceCollector3D.CollectLiveMeshesAndTextures(scene, snapshot, liveMeshes, liveMaterialTextures, RequiresCpuSkinFallback);
-        foreach (var obj in snapshot.AllObjects)
+        SceneRenderResourceCollector3D.CollectLiveMeshesAndTextures(scene, snapshot, liveMeshes, liveMaterialTextures);
+        foreach (var obj in snapshot.AllObjectsInternal)
         {
             if (obj is ControlPlane3D plane && plane.IsVisible && plane.Snapshot is not null) liveControlPlanes.Add(plane.Id);
         }
@@ -750,7 +814,7 @@ internal sealed partial class OpenGlSceneRenderer
         }
         foreach (var key in _meshSweepScratch)
         {
-            DisposeMeshResource(gl, _meshResources[key]);
+            DisposeMeshResource(gl, key, _meshResources[key]);
             _meshResources.Remove(key);
         }
 
@@ -761,8 +825,9 @@ internal sealed partial class OpenGlSceneRenderer
         }
         foreach (var key in _textureSweepScratch)
         {
-            _controlTextures[key].Dispose(gl);
+            var texture = _controlTextures[key];
             _controlTextures.Remove(key);
+            _deferredControlTextureReleases.Enqueue(texture, _rhiDevice?.FrameIndex ?? 0, _resourceConfiguration?.DeferredReleaseFrames ?? 0);
         }
 
         _textureSweepScratch.Clear();
@@ -772,46 +837,40 @@ internal sealed partial class OpenGlSceneRenderer
         }
         foreach (var key in _textureSweepScratch)
         {
-            _materialTextures[key].Dispose(gl);
+            var texture = _materialTextures[key];
             _materialTextures.Remove(key);
+            _deferredMaterialTextureReleases.Enqueue(texture, _rhiDevice?.FrameIndex ?? 0, _resourceConfiguration?.DeferredReleaseFrames ?? 0);
         }
         _lastSweptRegistryVersion = registryVersion;
         _lastSweptBatchContentVersion = batchContentVersion;
     }
 
-    private void DrawSkybox(GlInterface gl, Scene3D scene, RenderStats stats)
+    private void DrawSkybox(GlInterface gl, SceneRenderFrameContext3D frame, RenderStats stats)
     {
+        var scene = frame.Scene;
         var skybox = scene.Environment.Skybox;
         if (skybox.Mode == SkyboxMode3D.None || _skyboxProgram == 0) return;
 
         gl.UseProgram(_skyboxProgram);
-        UploadColor3(_uniform3f, _skyboxTopColorLocation, skybox.TopColor, skybox.Intensity);
-        UploadColor3(_uniform3f, _skyboxHorizonColorLocation, skybox.HorizonColor, skybox.Intensity);
-        UploadColor3(_uniform3f, _skyboxBottomColorLocation, skybox.BottomColor, skybox.Intensity);
+        UploadColor3(_uniform3f, _skyboxTopColorLocation, skybox.TopColor);
+        UploadColor3(_uniform3f, _skyboxHorizonColorLocation, skybox.HorizonColor);
+        UploadColor3(_uniform3f, _skyboxBottomColorLocation, skybox.BottomColor);
         UploadFloat(_uniform1f, _skyboxIntensityLocation, skybox.Intensity);
         _uniform1i?.Invoke(_skyboxModeLocation, (int)skybox.Mode);
         UploadVector3(_uniform3f, _skyboxCameraRightLocation, scene.Camera.Right);
         UploadVector3(_uniform3f, _skyboxCameraUpLocation, scene.Camera.SafeUp);
         UploadVector3(_uniform3f, _skyboxCameraForwardLocation, scene.Camera.Forward);
+        var verticalProjectionScale = MathF.Tan(scene.Camera.FieldOfViewDegrees * (MathF.PI / 360f));
+        UploadFloat(_uniform1f, _skyboxProjectionScaleXLocation, verticalProjectionScale * frame.Aspect);
+        UploadFloat(_uniform1f, _skyboxProjectionScaleYLocation, verticalProjectionScale);
         UploadSkyboxTexture(gl, skybox, stats);
         UploadSkyboxCubemapTextures(gl, skybox, stats);
 
-        _disable?.Invoke(GlDepthTest);
-        _depthMask?.Invoke(0);
-        if (_skyboxVertexArray != 0)
-        {
-            BindVertexArray(_skyboxVertexArray);
-        }
-        else
-        {
-            BindVertexArray(0);
-            gl.BindBuffer(GlArrayBuffer, _skyboxVertexBuffer);
-            gl.EnableVertexAttribArray(_skyboxPositionLocation);
-            gl.VertexAttribPointer(_skyboxPositionLocation, 2, GlFloat, 0, sizeof(float) * 2, IntPtr.Zero);
-            gl.BindBuffer(GlElementArrayBuffer, _skyboxIndexBuffer);
-        }
+        _disable!(GlDepthTest);
+        _depthMask!(0);
+        BindSkyboxGeometry(gl);
         gl.DrawElements(GlTriangles, 6, GlUnsignedShort, IntPtr.Zero);
-        _depthMask?.Invoke(1);
+        _depthMask!(1);
         gl.Enable(GlDepthTest);
 
         stats.SkyboxEnabled = true;
@@ -820,473 +879,16 @@ internal sealed partial class OpenGlSceneRenderer
         stats.DrawCallCount++;
     }
 
-
-    private void RenderDirectionalShadowMap(GlInterface gl, SceneRenderPlan3D plan, RenderStats stats)
+    private void BindSkyboxGeometry(GlInterface gl)
     {
-        var scene = plan.Frame.Scene;
-        var shadow = plan.Shadow;
-        stats.DirectionalShadowEnabled = shadow.IsEnabled;
-        stats.ShadowMapReason = shadow.Reason;
-        if (!shadow.IsEnabled || _shadowProgram == 0) return;
-
-        RebuildFrameShadowCommandScratch(plan);
-        if (!HasShadowCasterCommands())
-        {
-            stats.ShadowMapReason = "no-shadow-casters";
-            return;
-        }
-
-        var resource = EnsureDirectionalShadowMap(gl, shadow.Resolution);
-        if (resource is null)
-        {
-            stats.ShadowMapReason = "shadow-fbo-unavailable";
-            return;
-        }
-
-        var watch = Stopwatch.StartNew();
-        gl.BindFramebuffer(GlFramebuffer, resource.Framebuffer);
-        gl.Viewport(0, 0, resource.Resolution, resource.Resolution);
-        gl.Clear(GlDepthBufferBit);
-        gl.UseProgram(_shadowProgram);
-        _lastShadowAttributeResource = null;
-        _highScaleTransformBatchUploadsThisFrame = 0;
-        UploadMatrix(_uniformMatrix4fv, _shadowLightViewProjLocation, shadow.LightViewProjection, _matrixUploadBuffer);
-        UploadMatrix(_uniformMatrix4fv, _shadowPartLocalLocation, Matrix4x4.Identity, _matrixUploadBuffer);
-        UploadFloat(_uniform1f, _shadowUsePartLocalLocation, 0f);
-        UploadFloat(_uniform1f, _shadowParticleBillboardLocation, 0f);
-        UploadVector3(_uniform3f, _shadowParticleCameraRightLocation, scene.Camera.Right);
-        UploadVector3(_uniform3f, _shadowParticleCameraUpLocation, scene.Camera.SafeUp);
-
-        UploadFloat(_uniform1f, _shadowUseInstancingLocation, CanUseInstancedDrawPath ? 1f : 0f);
-        DrawInstancedShadowCommandStream(gl, scene, plan.Frame.ViewProjection, stats);
-        ResetShadowAttributeDivisors();
-
-        UploadFloat(_uniform1f, _shadowUsePartLocalLocation, 0f);
-        UploadFloat(_uniform1f, _shadowParticleBillboardLocation, 0f);
-        UploadFloat(_uniform1f, _shadowSkinningEnabledLocation, 0f);
-
-        watch.Stop();
-        stats.ShadowMapCount = 1;
-        stats.ShadowMapResolution = resource.Resolution;
-        stats.ShadowMapMilliseconds = watch.Elapsed.TotalMilliseconds;
-        stats.ShadowMapReason = shadow.Reason;
+        ForceBindVertexArray(_skyboxVertexArray);
+        gl.BindBuffer(GlArrayBuffer, _skyboxVertexBuffer);
+        gl.EnableVertexAttribArray(_skyboxPositionLocation);
+        gl.VertexAttribPointer(_skyboxPositionLocation, 2, GlFloat, 0, sizeof(float) * 2, IntPtr.Zero);
+        ResetDivisor(_skyboxPositionLocation);
+        gl.BindBuffer(GlElementArrayBuffer, _skyboxIndexBuffer);
     }
 
-    private bool HasShadowCasterCommands()
-    {
-        for (var i = 0; i < _frameDrawCommandScratch.Count; i++)
-        {
-            var command = _frameDrawCommandScratch[i];
-            if (command.MeshBatch is { InstanceCount: > 0 }) return true;
-            if (command.ParticleBatch is { InstanceCount: > 0 }) return true;
-            if (command.Kind == SceneRenderCommandKind3D.HighScaleLayer && command.HighScaleLayer is not null) return true;
-        }
-
-        return false;
-    }
-
-    private void DrawInstancedShadowCommandStream(GlInterface gl, Scene3D scene, Matrix4x4 viewProjection, RenderStats stats)
-    {
-        for (var i = 0; i < _frameDrawCommandScratch.Count; i++)
-        {
-            var command = _frameDrawCommandScratch[i];
-            switch (command.Kind)
-            {
-                case SceneRenderCommandKind3D.OrdinaryBatch:
-                case SceneRenderCommandKind3D.TransparentOrdinaryItem:
-                case SceneRenderCommandKind3D.TransparentOrdinaryBatch:
-                    if (command.MeshBatch is not null)
-                    {
-                        DrawShadowMeshBatchInstanced(gl, command.MeshBatch, stats);
-                    }
-                    break;
-                case SceneRenderCommandKind3D.ParticleSystem:
-                    if (command.ParticleBatch is not null)
-                    {
-                        DrawShadowParticleBatchInstanced(gl, command.ParticleBatch, stats);
-                    }
-                    break;
-                case SceneRenderCommandKind3D.HighScaleLayer:
-                    if (command.HighScaleLayer is not null)
-                    {
-                        DrawShadowHighScaleLayer(gl, scene, viewProjection, command.HighScaleLayer, scene.Camera.Position, stats);
-                    }
-                    break;
-            }
-        }
-    }
-
-    private void DrawLegacyShadowCommandStream(GlInterface gl, RenderStats stats)
-    {
-        for (var i = 0; i < _frameDrawCommandScratch.Count; i++)
-        {
-            var command = _frameDrawCommandScratch[i];
-            switch (command.Kind)
-            {
-                case SceneRenderCommandKind3D.OrdinaryBatch:
-                case SceneRenderCommandKind3D.TransparentOrdinaryItem:
-                case SceneRenderCommandKind3D.TransparentOrdinaryBatch:
-                    if (command.MeshBatch is not null)
-                    {
-                        DrawShadowMeshBatchLegacy(gl, command.MeshBatch, stats);
-                    }
-                    break;
-                case SceneRenderCommandKind3D.ParticleSystem:
-                    if (command.ParticleBatch is not null)
-                    {
-                        DrawShadowParticleBatchLegacy(gl, command.ParticleBatch, stats);
-                    }
-                    break;
-                case SceneRenderCommandKind3D.HighScaleLayer:
-                    // The legacy non-instanced fallback intentionally does not explode high-scale
-                    // retained layers into per-object shadow draws. Instanced OpenGL covers them.
-                    break;
-            }
-        }
-    }
-
-    private void DrawShadowMeshBatchInstanced(GlInterface gl, MeshBatchData batch, RenderStats stats)
-    {
-        if (batch.InstanceCount == 0) return;
-        if (!CanUseInstancedDrawPath)
-        {
-            UploadFloat(_uniform1f, _shadowUseInstancingLocation, 0f);
-            DrawShadowMeshBatchLegacy(gl, batch, stats);
-            return;
-        }
-
-        var mesh = EnsureMeshResource(gl, batch.Mesh.ResourceKey, batch.Mesh.GeometryVersion, batch.Mesh, stats);
-        BindShadowAttributes(gl, mesh);
-        UploadShadowBatchSkinning(gl, batch);
-        EnsureBatchInstanceBuffer(gl, batch, stats);
-        UploadFloat(_uniform1f, _shadowParticleBillboardLocation, 0f);
-        UploadFloat(_uniform1f, _shadowUsePartLocalLocation, 0f);
-        gl.BindBuffer(GlArrayBuffer, batch.InstanceBuffer);
-        EnableShadowInstanceAttributes(gl);
-        if (!TryDrawElementsInstanced(gl, mesh.IndexCount, mesh.IndexType, batch.InstanceCount, batch.MeshKey, "shadow-mesh"))
-        {
-            DisableShadowInstanceAttributes();
-            UploadFloat(_uniform1f, _shadowUseInstancingLocation, 0f);
-            DrawShadowMeshBatchLegacy(gl, batch, stats);
-            return;
-        }
-
-        DisableShadowInstanceAttributes();
-        stats.ShadowCasterCount += batch.InstanceCount;
-    }
-
-    private void DrawShadowParticleBatchInstanced(GlInterface gl, ParticleBatchData batch, RenderStats stats)
-    {
-        if (batch.InstanceCount == 0) return;
-        if (!CanUseInstancedDrawPath)
-        {
-            UploadFloat(_uniform1f, _shadowUseInstancingLocation, 0f);
-            DrawShadowParticleBatchLegacy(gl, batch, stats);
-            return;
-        }
-
-        var mesh = EnsureMeshResource(gl, batch.Mesh.ResourceKey, batch.Mesh.GeometryVersion, batch.Mesh, stats);
-        UploadFloat(_uniform1f, _shadowSkinningEnabledLocation, 0f);
-        UploadFloat(_uniform1f, _shadowUsePartLocalLocation, 0f);
-        UploadFloat(_uniform1f, _shadowParticleBillboardLocation, batch.Billboard ? 1f : 0f);
-        BindShadowAttributes(gl, mesh);
-        EnsureBatchInstanceBuffer(gl, batch, stats);
-        gl.BindBuffer(GlArrayBuffer, batch.InstanceBuffer);
-        if (batch.Billboard) EnableShadowParticleBillboardInstanceAttributes(gl);
-        else EnableShadowInstanceAttributes(gl);
-        if (!TryDrawElementsInstanced(gl, mesh.IndexCount, mesh.IndexType, batch.InstanceCount, batch.MeshKey, "shadow-particle"))
-        {
-            DisableShadowInstanceAttributes();
-            UploadFloat(_uniform1f, _shadowUseInstancingLocation, 0f);
-            DrawShadowParticleBatchLegacy(gl, batch, stats);
-            return;
-        }
-
-        DisableShadowInstanceAttributes();
-        stats.ShadowCasterCount += batch.InstanceCount;
-    }
-
-    private void DrawShadowMeshBatchLegacy(GlInterface gl, MeshBatchData batch, RenderStats stats)
-    {
-        if (batch.InstanceCount == 0) return;
-        var mesh = EnsureMeshResource(gl, batch.Mesh.ResourceKey, batch.Mesh.GeometryVersion, batch.Mesh, stats);
-        BindShadowAttributes(gl, mesh);
-        UploadShadowBatchSkinning(gl, batch);
-        UploadFloat(_uniform1f, _shadowParticleBillboardLocation, 0f);
-        UploadFloat(_uniform1f, _shadowUsePartLocalLocation, 0f);
-        var data = batch.Data;
-        for (var i = 0; i < batch.InstanceCount; i++)
-        {
-            var offset = i * batch.FloatStride;
-            UploadMatrixFromInstanceData(_uniformMatrix4fv, _shadowModelLocation, data, offset, _matrixUploadBuffer);
-            gl.DrawElements(GlTriangles, mesh.IndexCount, mesh.IndexType, IntPtr.Zero);
-            stats.ShadowCasterCount++;
-        }
-    }
-
-    private void DrawShadowParticleBatchLegacy(GlInterface gl, ParticleBatchData batch, RenderStats stats)
-    {
-        if (batch.InstanceCount == 0) return;
-        var mesh = EnsureMeshResource(gl, batch.Mesh.ResourceKey, batch.Mesh.GeometryVersion, batch.Mesh, stats);
-        UploadFloat(_uniform1f, _shadowSkinningEnabledLocation, 0f);
-        UploadFloat(_uniform1f, _shadowUsePartLocalLocation, 0f);
-        UploadFloat(_uniform1f, _shadowParticleBillboardLocation, batch.Billboard ? 1f : 0f);
-        BindShadowAttributes(gl, mesh);
-        var data = batch.Data;
-        for (var i = 0; i < batch.InstanceCount; i++)
-        {
-            var offset = i * batch.FloatStride;
-            if (batch.Billboard) UploadBillboardParticleMatrix(_uniformMatrix4fv, _shadowModelLocation, data, offset, _matrixUploadBuffer);
-            else UploadMatrixFromInstanceData(_uniformMatrix4fv, _shadowModelLocation, data, offset, _matrixUploadBuffer);
-            gl.DrawElements(GlTriangles, mesh.IndexCount, mesh.IndexType, IntPtr.Zero);
-            stats.ShadowCasterCount++;
-        }
-    }
-
-    private void DrawShadowHighScaleLayer(GlInterface gl, Scene3D scene, Matrix4x4 viewProjection, HighScaleInstanceLayer3D layer, Vector3 cameraPosition, RenderStats stats)
-    {
-        SceneHighScaleRenderPlanner3D.EnsureChunks(layer);
-        var performance = scene.Performance;
-        if (SceneHighScaleRenderPlanner3D.ShouldUseAggregateLayerBatches(layer, performance))
-        {
-            var shadowPlanningStats = ResetShadowHighScalePlanningStats();
-            var lodPlan = SceneHighScaleRenderPlanner3D.BuildLayerLodPlan(layer, cameraPosition, performance, shadowPlanningStats, _highScaleLodPlanScratch);
-            DrawShadowHighScaleLod(gl, layer, AggregateChunkKey, HighScaleLodLevel3D.Detailed, lodPlan.Detailed, cameraPosition, performance, stats);
-            DrawShadowHighScaleLod(gl, layer, AggregateChunkKey, HighScaleLodLevel3D.Simplified, lodPlan.Simplified, cameraPosition, performance, stats);
-            DrawShadowHighScaleLod(gl, layer, AggregateChunkKey, HighScaleLodLevel3D.Proxy, lodPlan.Proxy, cameraPosition, performance, stats);
-            DrawShadowHighScaleLod(gl, layer, AggregateChunkKey, HighScaleLodLevel3D.Billboard, lodPlan.Billboard, cameraPosition, performance, stats);
-            return;
-        }
-
-        var visibleChunks = layer.Chunks.QueryVisible(viewProjection);
-        var visibleChunkLimit = SceneHighScaleRenderPlanner3D.ResolveVisibleChunkLimit(performance, visibleChunks.Count);
-        for (var visibleChunkIndex = 0; visibleChunkIndex < visibleChunkLimit; visibleChunkIndex++)
-        {
-            var chunk = visibleChunks[visibleChunkIndex];
-            var shadowPlanningStats = ResetShadowHighScalePlanningStats();
-            var lodPlan = SceneHighScaleRenderPlanner3D.BuildChunkLodPlan(layer, chunk, cameraPosition, performance, shadowPlanningStats, _highScaleLodPlanScratch);
-            DrawShadowHighScaleLod(gl, layer, chunk.Key, HighScaleLodLevel3D.Detailed, lodPlan.Detailed, cameraPosition, performance, stats, chunk.IsDirty);
-            DrawShadowHighScaleLod(gl, layer, chunk.Key, HighScaleLodLevel3D.Simplified, lodPlan.Simplified, cameraPosition, performance, stats, chunk.IsDirty);
-            DrawShadowHighScaleLod(gl, layer, chunk.Key, HighScaleLodLevel3D.Proxy, lodPlan.Proxy, cameraPosition, performance, stats, chunk.IsDirty);
-            DrawShadowHighScaleLod(gl, layer, chunk.Key, HighScaleLodLevel3D.Billboard, lodPlan.Billboard, cameraPosition, performance, stats, chunk.IsDirty);
-        }
-    }
-
-    private RenderStats ResetShadowHighScalePlanningStats()
-    {
-        var stats = _shadowHighScalePlanningStats;
-        stats.HighScaleInstanceCount = 0;
-        stats.LodDetailedCount = 0;
-        stats.LodSimplifiedCount = 0;
-        stats.LodProxyCount = 0;
-        stats.LodBillboardCount = 0;
-        stats.LodCulledCount = 0;
-        stats.CulledObjectCount = 0;
-        return stats;
-    }
-
-    private void DrawShadowHighScaleLod(
-        GlInterface gl,
-        HighScaleInstanceLayer3D layer,
-        HighScaleChunkKey3D chunkKey,
-        HighScaleLodLevel3D lod,
-        List<int> instanceIndices,
-        Vector3 cameraPosition,
-        ScenePerformanceOptions performance,
-        RenderStats stats,
-        bool structuralDirty = false)
-    {
-        if (instanceIndices.Count == 0) return;
-
-        _highScaleShadowInstanceScratch.Clear();
-        for (var i = 0; i < instanceIndices.Count; i++)
-        {
-            var instanceIndex = instanceIndices[i];
-            if ((uint)instanceIndex < (uint)layer.Instances.Count && IsHighScaleVisible(layer.Instances[instanceIndex]))
-            {
-                _highScaleShadowInstanceScratch.Add(instanceIndex);
-            }
-        }
-
-        if (_highScaleShadowInstanceScratch.Count == 0) return;
-
-        var parts = layer.Template.ResolveParts(lod);
-        if (!CanUseInstancedDrawPath || ShouldUseHighScaleLegacySafePath(_highScaleShadowInstanceScratch.Count))
-        {
-            DrawShadowHighScaleLegacyLod(gl, layer, parts, _highScaleShadowInstanceScratch, stats, startPartIndex: 0);
-            UploadFloat(_uniform1f, _shadowUsePartLocalLocation, 0f);
-            return;
-        }
-
-        for (var partIndex = 0; partIndex < parts.Count; partIndex++)
-        {
-            var part = parts[partIndex];
-            var buildStart = Stopwatch.GetTimestamp();
-            var key = new HighScaleBatchKey(layer.Id, chunkKey, lod, statePartIndex: -2);
-            var batch = EnsureHighScaleGpuBatch(gl, layer, key, structuralDirty, lod, _highScaleShadowInstanceScratch, cameraPosition, performance, stats, part, directStateColor: false);
-            stats.HighScaleBufferBuildMilliseconds += GetElapsedMilliseconds(buildStart);
-            if (batch.InstanceCount == 0) continue;
-
-            var mesh = EnsureMeshResource(gl, part.Mesh.ResourceKey, part.Mesh.GeometryVersion, part.Mesh, stats);
-            BindShadowAttributes(gl, mesh);
-            UploadFloat(_uniform1f, _shadowSkinningEnabledLocation, 0f);
-            UploadFloat(_uniform1f, _shadowParticleBillboardLocation, 0f);
-            UploadFloat(_uniform1f, _shadowUsePartLocalLocation, 1f);
-            UploadMatrix(_uniformMatrix4fv, _shadowPartLocalLocation, part.LocalTransform, _matrixUploadBuffer);
-            gl.BindBuffer(GlArrayBuffer, batch.TransformBuffer);
-            EnableShadowHighScaleInstanceAttributes(gl);
-            var shadowHighScaleDrawn = TryDrawElementsInstanced(gl, mesh.IndexCount, mesh.IndexType, batch.InstanceCount, part.Mesh.ResourceKey, "shadow-highscale");
-            DisableShadowInstanceAttributes();
-            if (!shadowHighScaleDrawn)
-            {
-                DrawShadowHighScaleLegacyLod(gl, layer, parts, _highScaleShadowInstanceScratch, stats, partIndex);
-                break;
-            }
-
-            stats.ShadowCasterCount += batch.InstanceCount;
-        }
-
-        UploadFloat(_uniform1f, _shadowUsePartLocalLocation, 0f);
-    }
-
-    private void DrawShadowHighScaleLegacyLod(
-        GlInterface gl,
-        HighScaleInstanceLayer3D layer,
-        IReadOnlyList<CompositePartTemplate3D> parts,
-        List<int> instanceIndices,
-        RenderStats stats,
-        int startPartIndex)
-    {
-        UploadFloat(_uniform1f, _shadowUseInstancingLocation, 0f);
-        UploadFloat(_uniform1f, _shadowUsePartLocalLocation, 1f);
-        UploadFloat(_uniform1f, _shadowParticleBillboardLocation, 0f);
-        UploadFloat(_uniform1f, _shadowSkinningEnabledLocation, 0f);
-        DisableShadowInstanceAttributes();
-
-        for (var partIndex = System.Math.Max(0, startPartIndex); partIndex < parts.Count; partIndex++)
-        {
-            var part = parts[partIndex];
-            var mesh = EnsureMeshResource(gl, part.Mesh.ResourceKey, part.Mesh.GeometryVersion, part.Mesh, stats);
-            BindShadowAttributes(gl, mesh);
-            UploadMatrix(_uniformMatrix4fv, _shadowPartLocalLocation, part.LocalTransform, _matrixUploadBuffer);
-
-            for (var i = 0; i < instanceIndices.Count; i++)
-            {
-                var instanceIndex = instanceIndices[i];
-                if ((uint)instanceIndex >= (uint)layer.Instances.Count) continue;
-                var record = layer.Instances[instanceIndex];
-                if (!IsHighScaleVisible(record)) continue;
-
-                UploadMatrix(_uniformMatrix4fv, _shadowModelLocation, record.Transform, _matrixUploadBuffer);
-                gl.DrawElements(GlTriangles, mesh.IndexCount, mesh.IndexType, IntPtr.Zero);
-                stats.ShadowCasterCount++;
-            }
-        }
-    }
-
-    private DirectionalShadowMapResource? EnsureDirectionalShadowMap(GlInterface gl, int resolution)
-    {
-        if (_genFramebuffers is null || _framebufferTexture2D is null) return null;
-        if (_directionalShadowMap is not null && _directionalShadowMap.Resolution == resolution) return _directionalShadowMap;
-
-        _directionalShadowMap?.Dispose(gl, _deleteFramebuffers);
-        var texture = gl.GenTexture();
-        gl.BindTexture(GlTexture2D, texture);
-        gl.TexParameteri(GlTexture2D, GlTextureMinFilter, GlNearest);
-        gl.TexParameteri(GlTexture2D, GlTextureMagFilter, GlNearest);
-        gl.TexParameteri(GlTexture2D, GlTextureWrapS, GlClampToEdge);
-        gl.TexParameteri(GlTexture2D, GlTextureWrapT, GlClampToEdge);
-        gl.TexParameteri(GlTexture2D, GlTextureCompareMode, GlNone);
-        gl.TexImage2D(GlTexture2D, 0, GlDepthComponent, resolution, resolution, 0, GlDepthComponent, GlUnsignedByte, IntPtr.Zero);
-
-        var framebuffer = GenFramebuffer();
-        gl.BindFramebuffer(GlFramebuffer, framebuffer);
-        _framebufferTexture2D.Invoke(GlFramebuffer, GlDepthAttachment, GlTexture2D, texture, 0);
-        _drawBuffer?.Invoke(GlNone);
-        _readBuffer?.Invoke(GlNone);
-        var complete = _checkFramebufferStatus?.Invoke(GlFramebuffer) ?? GlFrameBufferComplete;
-        gl.BindFramebuffer(GlFramebuffer, 0);
-        if (complete != GlFrameBufferComplete)
-        {
-            gl.DeleteTexture(texture);
-            DeleteFramebuffer(framebuffer);
-            return null;
-        }
-
-        _directionalShadowMap = new DirectionalShadowMapResource
-        {
-            Texture = texture,
-            Framebuffer = framebuffer,
-            Resolution = resolution
-        };
-        return _directionalShadowMap;
-    }
-
-    private int GenFramebuffer()
-    {
-        if (_genFramebuffers is null) return 0;
-        var ids = new int[1];
-        _genFramebuffers.Invoke(1, ids);
-        return ids[0];
-    }
-
-    private void DeleteFramebuffer(int framebuffer)
-    {
-        if (framebuffer == 0 || _deleteFramebuffers is null) return;
-        var ids = new[] { framebuffer };
-        _deleteFramebuffers.Invoke(1, ids);
-    }
-
-    private void BindShadowAttributes(GlInterface gl, MeshGpuResource resource)
-    {
-        if (_supportsVertexArrays && resource.VertexArray != 0)
-        {
-            BindVertexArray(resource.VertexArray);
-            _lastShadowAttributeResource = resource;
-            _lastMeshAttributeResource = resource;
-            return;
-        }
-
-        BindVertexArray(0);
-        if (ReferenceEquals(_lastShadowAttributeResource, resource))
-        {
-            gl.BindBuffer(GlElementArrayBuffer, resource.IndexBuffer);
-            return;
-        }
-
-        _lastShadowAttributeResource = resource;
-        BindMeshStaticAttributesFallback(gl, resource, meshProgram: false);
-    }
-
-    private void EnableShadowInstanceAttributes(GlInterface gl)
-    {
-        EnableInstanceAttribute(gl, _shadowInstanceModel0Location, 4, InstanceByteStride, 0);
-        EnableInstanceAttribute(gl, _shadowInstanceModel1Location, 4, InstanceByteStride, sizeof(float) * 4);
-        EnableInstanceAttribute(gl, _shadowInstanceModel2Location, 4, InstanceByteStride, sizeof(float) * 8);
-        EnableInstanceAttribute(gl, _shadowInstanceModel3Location, 4, InstanceByteStride, sizeof(float) * 12);
-    }
-
-    private void ResetShadowAttributeDivisors()
-    {
-        if (_vertexAttribDivisor is null) return;
-        if (_shadowInstanceModel0Location >= 0) _vertexAttribDivisor(_shadowInstanceModel0Location, 0);
-        if (_shadowInstanceModel1Location >= 0) _vertexAttribDivisor(_shadowInstanceModel1Location, 0);
-        if (_shadowInstanceModel2Location >= 0) _vertexAttribDivisor(_shadowInstanceModel2Location, 0);
-        if (_shadowInstanceModel3Location >= 0) _vertexAttribDivisor(_shadowInstanceModel3Location, 0);
-    }
-
-    private void ConfigureShadowSampling(GlInterface gl, DirectionalShadowSnapshot3D shadow)
-    {
-        var enabled = shadow.IsEnabled && _directionalShadowMap is not null;
-        UploadFloat(_uniform1f, _meshShadowEnabledLocation, enabled ? 1f : 0f);
-        UploadMatrix(_uniformMatrix4fv, _meshLightViewProjLocation, shadow.LightViewProjection, _matrixUploadBuffer);
-        UploadVector4(_uniform4f, _meshShadowParamsLocation, new Vector4(shadow.Bias, shadow.Strength, shadow.NormalBias, 0f));
-        if (!enabled) return;
-        gl.ActiveTexture(GlTexture1);
-        gl.BindTexture(GlTexture2D, _directionalShadowMap!.Texture);
-        _uniform1i?.Invoke(_meshShadowMapLocation, 1);
-        gl.ActiveTexture(GlTexture0);
-    }
 
     private void ConfigureForwardBlendState(GlInterface gl, bool transparent)
     {
@@ -1301,6 +903,33 @@ internal sealed partial class OpenGlSceneRenderer
             _depthMask?.Invoke(1);
             _disable?.Invoke(GlBlend);
         }
+    }
+
+    private void ApplyCullMode(GlInterface gl, CullMode cullMode)
+    {
+        if (_appliedCullMode == cullMode)
+        {
+            return;
+        }
+
+        switch (cullMode)
+        {
+            case CullMode.None:
+                (_disable ?? throw new InvalidOperationException("OpenGL glDisable is required for material culling state."))(GlCullFace);
+                break;
+            case CullMode.Back:
+                gl.Enable(GlCullFace);
+                (_cullFace ?? throw new InvalidOperationException("OpenGL glCullFace is required for CullMode.Back."))(GlBack);
+                break;
+            case CullMode.Front:
+                gl.Enable(GlCullFace);
+                (_cullFace ?? throw new InvalidOperationException("OpenGL glCullFace is required for CullMode.Front."))(GlFront);
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(cullMode), cullMode, "Unsupported material culling mode.");
+        }
+
+        _appliedCullMode = cullMode;
     }
 
     private static bool IsTransparent(MaterialBinding3D material)
@@ -1342,7 +971,7 @@ internal sealed partial class OpenGlSceneRenderer
             fadeBand > 0.001f ? 1f : 0f));
     }
 
-    private void DrawMeshes(GlInterface gl, SceneRenderPlan3D plan, RenderStats stats, DirectionalShadowSnapshot3D shadow, RenderPipelinePlan3D pipeline)
+    private void DrawMeshes(GlInterface gl, SceneRenderPlan3D plan, RenderStats stats, RenderPipelinePlan3D pipeline)
     {
         var frame = plan.Frame;
         var scene = frame.Scene;
@@ -1368,32 +997,26 @@ internal sealed partial class OpenGlSceneRenderer
         UploadVector3(_uniform3f, _meshParticleCameraRightLocation, scene.Camera.Right);
         UploadVector3(_uniform3f, _meshParticleCameraUpLocation, scene.Camera.SafeUp);
         UploadVector3(_uniform3f, _meshParticleCameraForwardLocation, scene.Camera.Forward);
-        ConfigureShadowSampling(gl, shadow);
         stats.WebGlClientGpuTransformAnimation = scene.Performance.EnableWebGlClientGpuTransformAnimation;
-        UploadClientTransformAnimation(scene, enabled: false);
-
         UploadFloat(_uniform1f, _meshUseInstancingLocation, CanUseInstancedDrawPath ? 1f : 0f);
         UploadClientTransformAnimation(scene, enabled: false);
         DrawInstancedRenderCommandStream(gl, plan, stats);
-        UploadClientTransformAnimation(scene, enabled: false);
     }
 
     private bool RequiresOrdinaryBatchPlan(SceneRenderFrameContext3D frame)
     {
         var scene = frame.Scene;
         var interpolationVersion = scene.FrameInterpolator.RenderVersion;
+        var transformChanged = _lastBuiltOrdinaryTransformVersion != scene.BatchTransformVersion;
+        var interpolationChanged = _lastBuiltOrdinaryInterpolationVersion != interpolationVersion;
 
-        // Stability first: ordinary batch membership and draw commands are rebuilt when
-        // transforms/interpolation change. The previous retained slot-only path could keep
-        // stale draw commands for objects whose effective bucket changed after animation,
-        // physics or selection updates, which matched the "same objects disappear after
-        // the first frame" symptom. Retained slot updates remain available only for
-        // frames where the ordinary plan is provably unchanged.
+        // Opaque and exact-transparent transform/interpolation changes keep batch identity;
+        // the journal patches retained slots and cached commands refresh exact distances.
+        // Only adaptive depth bins need a new Core plan when camera-relative order changes.
         return _lastBuiltOrdinarySceneChangeVersion != scene.BatchContentVersion ||
-               _lastBuiltOrdinaryTransformVersion != scene.BatchTransformVersion ||
-               _lastBuiltOrdinaryInterpolationVersion != interpolationVersion ||
                _lastBuiltOrdinaryParticleVersion != scene.ParticleContentVersion ||
-               (_hasTransparentOrdinaryBatches && _lastBuiltOrdinaryCameraVersion != scene.CameraVersion) ||
+               (_hasAdaptiveTransparentOrdinaryBatches &&
+                (transformChanged || interpolationChanged || _lastBuiltOrdinaryCameraVersion != scene.CameraVersion)) ||
                (_hasCameraDependentParticleBatches && _lastBuiltOrdinaryCameraVersion != scene.CameraVersion);
     }
 
@@ -1418,18 +1041,24 @@ internal sealed partial class OpenGlSceneRenderer
                 return;
             }
 
-            // The retained slot map could not prove that this transform-only change is
-            // safe (for example the bounded dirty log was trimmed). Fall back to a full
-            // ordinary/particle plan rather than silently drawing stale transforms.
+            // Rebuild only when retained slot identity/mesh/material invariants truly changed.
+            // Cursor expiry alone is recovered inside TryApplyRetainedOrdinarySlotUpdates by
+            // refreshing all existing slots, which is substantially cheaper than rebuilding
+            // the render plan on every animated frame.
+            _retainedOrdinaryPlanRebuildCount++;
+            stats.RetainedOrdinaryPlanRebuildCount = _retainedOrdinaryPlanRebuildCount;
+            stats.RetainedOrdinaryLastFailureReason = _lastRetainedOrdinaryFailureReason;
+            LogRetainedPlanRebuildWarning();
             plan = SceneRenderPlanBuilder3D.Build(
                 frame,
-                _fallbackRenderPlanScratch,
-                RequiresCpuSkinFallback,
+                _fullRenderPlanScratch,
                 stats,
                 includeOrdinary: true,
                 includeParticles: true,
                 includeHighScale: false,
                 frustumCullParticles: false);
+            (_rhiDevice ?? throw new InvalidOperationException("OpenGL RHI device is not initialized."))
+                .ValidateSubmission(plan.RhiSubmission);
         }
 
         _ordinaryBatchStatsCache.Reset();
@@ -1447,7 +1076,7 @@ internal sealed partial class OpenGlSceneRenderer
             BuildParticleBatch(item, scene.Camera.Position);
         }
 
-        _hasTransparentOrdinaryBatches = plan.TransparentOrdinaryItems.Count > 0 || plan.TransparentOrdinaryBatches.Count > 0;
+        _hasAdaptiveTransparentOrdinaryBatches = plan.TransparentOrdinaryBatches.Count > 0;
         _hasCameraDependentParticleBatches = hasCameraDependentParticleBatches;
         for (var batchIndex = 0; batchIndex < plan.OrdinaryBatches.Count; batchIndex++)
         {
@@ -1551,21 +1180,79 @@ internal sealed partial class OpenGlSceneRenderer
         var updated = 0;
         if (interpolationChanged)
         {
-            foreach (var slot in _ordinarySlotByObjectId.Values)
+            scene.FrameInterpolator.CopyActiveObjects(_ordinaryTransformDirtyScratch);
+            _ordinaryDirtySeen.Clear();
+            for (var i = 0; i < _ordinaryTransformDirtyScratch.Count; i++)
             {
-                if (!TryUpdateRetainedOrdinarySlot(frame, slot.Owner, slot, interpolationVersion))
-                {
-                    return false;
-                }
-
-                updated++;
+                _ordinaryDirtySeen.Add(_ordinaryTransformDirtyScratch[i]);
             }
+
+            if (transformChanged)
+            {
+                if (!scene.TryCopyBatchTransformChangesSince(_lastBuiltOrdinaryTransformVersion, _ordinaryInterpolationDirtyScratch))
+                {
+                    _ordinaryTransformDirtyScratch.Clear();
+                    _ordinaryInterpolationDirtyScratch.Clear();
+                    _ordinaryDirtySeen.Clear();
+                    _lastRetainedOrdinaryFailureReason = $"transform-journal-cursor-unavailable; retainedVersion={_lastBuiltOrdinaryTransformVersion}; currentVersion={scene.BatchTransformVersion}; interpolationChanged=true";
+                    stats.RetainedOrdinaryLastFailureReason = _lastRetainedOrdinaryFailureReason;
+                    if (!TryRefreshAllRetainedOrdinarySlots(frame, stats, interpolationVersion, ref updated)) return false;
+                    _retainedOrdinaryCursorRecoveryCount++;
+                    stats.RetainedOrdinaryCursorRecoveryCount = _retainedOrdinaryCursorRecoveryCount;
+                    goto Completed;
+                }
+                for (var i = 0; i < _ordinaryInterpolationDirtyScratch.Count; i++)
+                {
+                    var obj = _ordinaryInterpolationDirtyScratch[i];
+                    if (_ordinaryDirtySeen.Add(obj)) _ordinaryTransformDirtyScratch.Add(obj);
+                }
+            }
+
+            if (_ordinaryTransformDirtyScratch.Count == 0)
+            {
+                foreach (var slot in _ordinarySlotByObjectId.Values)
+                {
+                    if (!TryUpdateRetainedOrdinarySlot(frame, slot.Owner, slot, interpolationVersion, stats))
+                    {
+                        _ordinaryTransformDirtyScratch.Clear();
+                        _ordinaryInterpolationDirtyScratch.Clear();
+                        _ordinaryDirtySeen.Clear();
+                        return false;
+                    }
+                    updated++;
+                }
+            }
+            else
+            {
+                for (var i = 0; i < _ordinaryTransformDirtyScratch.Count; i++)
+                {
+                    var obj = _ordinaryTransformDirtyScratch[i];
+                    if (!_ordinarySlotByObjectId.TryGetValue(obj.Id, out var slot)) continue;
+                    if (!TryUpdateRetainedOrdinarySlot(frame, obj, slot, interpolationVersion, stats))
+                    {
+                        _ordinaryTransformDirtyScratch.Clear();
+                        _ordinaryInterpolationDirtyScratch.Clear();
+                        _ordinaryDirtySeen.Clear();
+                        return false;
+                    }
+                    updated++;
+                }
+            }
+
+            _ordinaryTransformDirtyScratch.Clear();
+            _ordinaryInterpolationDirtyScratch.Clear();
+            _ordinaryDirtySeen.Clear();
         }
         else
         {
             if (!scene.TryCopyBatchTransformChangesSince(_lastBuiltOrdinaryTransformVersion, _ordinaryTransformDirtyScratch))
             {
-                return false;
+                _lastRetainedOrdinaryFailureReason = $"transform-journal-cursor-unavailable; retainedVersion={_lastBuiltOrdinaryTransformVersion}; currentVersion={scene.BatchTransformVersion}; interpolationChanged=false";
+                stats.RetainedOrdinaryLastFailureReason = _lastRetainedOrdinaryFailureReason;
+                if (!TryRefreshAllRetainedOrdinarySlots(frame, stats, interpolationVersion, ref updated)) return false;
+                _retainedOrdinaryCursorRecoveryCount++;
+                stats.RetainedOrdinaryCursorRecoveryCount = _retainedOrdinaryCursorRecoveryCount;
+                goto Completed;
             }
 
             for (var i = 0; i < _ordinaryTransformDirtyScratch.Count; i++)
@@ -1575,13 +1262,14 @@ internal sealed partial class OpenGlSceneRenderer
                 {
                     if (ShouldHaveOrdinaryRetainedSlot(obj))
                     {
+                        _lastRetainedOrdinaryFailureReason = $"missing-slot; object={obj.Id}; type={obj.GetType().Name}";
                         return false;
                     }
 
                     continue;
                 }
 
-                if (!TryUpdateRetainedOrdinarySlot(frame, obj, slot, interpolationVersion))
+                if (!TryUpdateRetainedOrdinarySlot(frame, obj, slot, interpolationVersion, stats))
                 {
                     return false;
                 }
@@ -1590,11 +1278,26 @@ internal sealed partial class OpenGlSceneRenderer
             }
         }
 
+Completed:
         if (updated > 0)
         {
             stats.RetainedTransformSlotUpdateCount += updated;
         }
 
+        return true;
+    }
+
+    private bool TryRefreshAllRetainedOrdinarySlots(
+        SceneRenderFrameContext3D frame,
+        RenderStats stats,
+        int interpolationVersion,
+        ref int updated)
+    {
+        foreach (var slot in _ordinarySlotByObjectId.Values)
+        {
+            if (!TryUpdateRetainedOrdinarySlot(frame, slot.Owner, slot, interpolationVersion, stats)) return false;
+            updated++;
+        }
         return true;
     }
 
@@ -1609,32 +1312,38 @@ internal sealed partial class OpenGlSceneRenderer
         return mesh.Positions.Length != 0 && mesh.Indices.Length != 0;
     }
 
-    private bool TryUpdateRetainedOrdinarySlot(SceneRenderFrameContext3D frame, Object3D obj, RetainedOrdinarySlotRef slot, int interpolationVersion)
+    private bool TryUpdateRetainedOrdinarySlot(SceneRenderFrameContext3D frame, Object3D obj, RetainedOrdinarySlotRef slot, int interpolationVersion, RenderStats stats)
     {
         var batch = slot.Batch;
         if (!batch.TryGetSlot(obj.Id, out var currentSlot) || currentSlot != slot.Slot)
         {
+            _lastRetainedOrdinaryFailureReason = $"slot-mismatch; object={obj.Id}; expectedSlot={slot.Slot}; actualSlot={currentSlot}";
             return false;
         }
 
         var skinnedPart = obj as ModelPart3D;
-        if (RequiresCpuSkinFallback(skinnedPart))
-        {
-            // CPU-skinned fallback geometry can change with animation.  Do not patch an
-            // existing mesh slot in place unless a full ordinary plan rebuilt the fallback mesh.
-            return false;
-        }
+        ValidateGpuSkinning(skinnedPart);
 
         var mesh = obj.GetMesh();
         if (!ReferenceEquals(mesh, batch.Mesh) && !string.Equals(mesh.ResourceKey, batch.Mesh.ResourceKey, StringComparison.Ordinal))
         {
+            _lastRetainedOrdinaryFailureReason = $"mesh-changed; object={obj.Id}; retained={batch.Mesh.ResourceKey}; current={mesh.ResourceKey}";
             return false;
         }
 
         var material = MaterialBinding3D.FromMaterial(obj.Material);
         if (!string.Equals(material.Key, batch.Material.Key, StringComparison.Ordinal))
         {
+            _lastRetainedOrdinaryFailureReason = $"material-changed; object={obj.Id}; retained={batch.Material.Key}; current={material.Key}";
             return false;
+        }
+
+        var previousSkinningVersion = batch.SkinningVersion;
+        ConfigureBatchSkinning(batch, skinnedPart);
+        if (batch.SkinningVersion != previousSkinningVersion)
+        {
+            _retainedSkinningBatchUpdateCount++;
+            stats.RetainedSkinningBatchUpdateCount = _retainedSkinningBatchUpdateCount;
         }
 
         var model = frame.Scene.FrameInterpolator.TryGetInterpolatedModel(obj.Id, out var interpolatedModel)
@@ -1692,27 +1401,65 @@ internal sealed partial class OpenGlSceneRenderer
         _batchRemovalScratch.Clear();
     }
 
-    private bool RequiresCpuSkinFallback(ModelPart3D? part)
+    private void ValidateGpuSkinning(ModelPart3D? part)
     {
-        return part is not null &&
-               part.IsSkinned &&
-               part.CurrentGpuSkinMatrices.Length > 0 &&
-               (!_supportsBoneTextureSkinning || part.CurrentGpuSkinMatrices.Length > _gpuSkinTextureBoneLimit);
+        if (part is null || !part.IsSkinned) return;
+        if (part.CurrentGpuSkinMatricesInternal.Length == 0)
+            throw new InvalidOperationException($"Skinned model part '{part.Name}' has no GPU bone matrices; rendering an undeformed bind pose is forbidden.");
+
+        if (!_supportsBoneTextureSkinning || part.CurrentGpuSkinMatricesInternal.Length > _gpuSkinTextureBoneLimit)
+        {
+            throw new InvalidOperationException(
+                $"GPU skinning is required for model part '{part.Name}', but the OpenGL bone-texture path is unavailable " +
+                $"or its {part.CurrentGpuSkinMatricesInternal.Length} bones exceed the GPU limit {_gpuSkinTextureBoneLimit}. CPU skinning fallback is disabled.");
+        }
+
+    }
+
+    private void EnsureGpuSkinningAvailable(SceneFrameSnapshot3D snapshot)
+    {
+        foreach (var obj in snapshot.AllObjectsInternal)
+        {
+            if (obj is ModelPart3D part) ValidateGpuSkinning(part);
+        }
     }
 
     private static void ConfigureBatchSkinning(MeshBatchData batch, OrdinaryRenderItem3D item)
+        => ConfigureBatchSkinning(batch, item.UsesGpuSkinning ? item.SkinnedPart : null);
+
+    private static void ConfigureBatchSkinning(MeshBatchData batch, ModelPart3D? skinnedPart)
     {
-        var skinnedPart = item.SkinnedPart;
-        if (item.UsesGpuSkinning &&
-            skinnedPart is not null &&
-            skinnedPart.CurrentGpuSkinMatrices.Length > 0)
+        if (skinnedPart is not null &&
+            skinnedPart.IsSkinned &&
+            skinnedPart.CurrentGpuSkinMatricesInternal.Length > 0)
         {
-            batch.SetSkinning(skinnedPart.CurrentGpuSkinMatrices, skinnedPart.SkinningVersion);
+            batch.SetSkinning(skinnedPart.CurrentGpuSkinMatricesInternal, skinnedPart.SkinningVersion);
         }
         else
         {
             batch.SetSkinning(Array.Empty<Matrix4x4>(), -1);
         }
+    }
+
+    private void LogRetainedPlanRebuildWarning()
+    {
+        var now = Stopwatch.GetTimestamp();
+        var elapsedMs = _lastRetainedPlanRebuildWarningTicks == 0
+            ? double.PositiveInfinity
+            : (now - _lastRetainedPlanRebuildWarningTicks) * 1000d / Stopwatch.Frequency;
+        if (elapsedMs < 5000d)
+        {
+            _suppressedRetainedPlanRebuildWarnings++;
+            return;
+        }
+
+        var suppressed = _suppressedRetainedPlanRebuildWarnings;
+        _suppressedRetainedPlanRebuildWarnings = 0;
+        _lastRetainedPlanRebuildWarningTicks = now;
+        EngineLog3D.Warning(
+            "OpenGL",
+            $"Retained ordinary invariants changed; rebuilding the ordinary render plan. Reason={_lastRetainedOrdinaryFailureReason}." +
+            (suppressed > 0 ? $" Suppressed equivalent rebuild warnings: {suppressed}." : string.Empty));
     }
 
     private void BuildParticleBatch(ParticleRenderItem3D item, Vector3 cameraPosition)
@@ -1893,67 +1640,6 @@ internal sealed partial class OpenGlSceneRenderer
     }
 
 
-    private void DrawLegacyRenderCommandStream(GlInterface gl, SceneRenderPlan3D plan, RenderStats stats)
-    {
-        var scene = plan.Frame.Scene;
-        if (!plan.HasVisibleOrdinary && !plan.HasVisibleParticles)
-        {
-            // Keep the retained command order even on partial plans.  The legacy path still
-            // cannot execute high-scale, but it must not reorder cached transparent work.
-            DrawLegacyCachedRenderCommandStream(gl, plan, stats);
-            return;
-        }
-
-        var ignoredHighScale = false;
-        for (var commandIndex = 0; commandIndex < plan.DrawCommands.Count; commandIndex++)
-        {
-            var command = plan.DrawCommands[commandIndex];
-            switch (command.Kind)
-            {
-                case SceneRenderCommandKind3D.OrdinaryBatch when command.OrdinaryBatch is not null:
-                {
-                    var batch = GetBatch(command.OrdinaryBatch.BatchId, command.OrdinaryBatch.LogicalMeshBatchKey, command.OrdinaryBatch.Mesh, command.OrdinaryBatch.Material);
-                    DrawMeshBatchLegacy(gl, batch, plan.Frame.ViewProjection, stats);
-                    break;
-                }
-                case SceneRenderCommandKind3D.TransparentOrdinaryItem when command.TransparentOrdinary is { } transparent:
-                {
-                    var item = transparent.Item;
-                    var batch = GetBatch(transparent.DrawId, item.LogicalMeshBatchKey, item.Mesh, item.Material);
-                    DrawMeshBatchLegacy(gl, batch, plan.Frame.ViewProjection, stats);
-                    break;
-                }
-                case SceneRenderCommandKind3D.TransparentOrdinaryBatch when command.TransparentOrdinaryBatch is { } transparentBatch:
-                {
-                    var batch = GetBatch(transparentBatch.BatchId, transparentBatch.LogicalMeshBatchKey, transparentBatch.Mesh, transparentBatch.Material);
-                    DrawMeshBatchLegacy(gl, batch, plan.Frame.ViewProjection, stats);
-                    break;
-                }
-                case SceneRenderCommandKind3D.ParticleSystem when command.Particle is { } particle:
-                {
-                    var batch = GetParticleBatch(particle.RetainedBatchId, particle.Mesh.ResourceKey, particle.Mesh, particle.Material, particle.Billboard, particle.Transparent);
-                    DrawParticleBatchLegacy(gl, batch, stats);
-                    break;
-                }
-                case SceneRenderCommandKind3D.HighScaleLayer:
-                    // The non-instanced OpenGL fallback cannot execute high-scale retained
-                    // chunks without exploding them into per-object draws. Keep the command
-                    // visible to Core, but do not run a divergent legacy implementation here.
-                    ignoredHighScale = true;
-                    break;
-            }
-        }
-
-        if (ignoredHighScale)
-        {
-            stats.HighScaleInstanceCount = 0;
-        }
-
-        ConfigureForwardBlendState(gl, false);
-        UploadFloat(_uniform1f, _meshParticleBillboardLocation, 0f);
-        UploadFloat(_uniform1f, _meshSkinningEnabledLocation, 0f);
-    }
-
     private void DrawInstancedCachedRenderCommandStream(GlInterface gl, SceneRenderPlan3D plan, RenderStats stats)
     {
         var scene = plan.Frame.Scene;
@@ -2030,45 +1716,6 @@ internal sealed partial class OpenGlSceneRenderer
         ResetInstanceAttributeDivisors();
     }
 
-    private void DrawLegacyCachedRenderCommandStream(GlInterface gl, SceneRenderPlan3D plan, RenderStats stats)
-    {
-        RebuildFrameDrawCommandScratch(plan);
-        var ignoredHighScale = false;
-        for (var i = 0; i < _frameDrawCommandScratch.Count; i++)
-        {
-            var command = _frameDrawCommandScratch[i];
-            switch (command.Kind)
-            {
-                case SceneRenderCommandKind3D.OrdinaryBatch:
-                case SceneRenderCommandKind3D.TransparentOrdinaryItem:
-                case SceneRenderCommandKind3D.TransparentOrdinaryBatch:
-                    if (command.MeshBatch is not null)
-                    {
-                        DrawMeshBatchLegacy(gl, command.MeshBatch, plan.Frame.ViewProjection, stats);
-                    }
-                    break;
-                case SceneRenderCommandKind3D.ParticleSystem:
-                    if (command.ParticleBatch is not null)
-                    {
-                        DrawParticleBatchLegacy(gl, command.ParticleBatch, stats);
-                    }
-                    break;
-                case SceneRenderCommandKind3D.HighScaleLayer:
-                    ignoredHighScale = true;
-                    break;
-            }
-        }
-
-        if (ignoredHighScale)
-        {
-            stats.HighScaleInstanceCount = 0;
-        }
-
-        ConfigureForwardBlendState(gl, false);
-        UploadFloat(_uniform1f, _meshParticleBillboardLocation, 0f);
-        UploadFloat(_uniform1f, _meshSkinningEnabledLocation, 0f);
-    }
-
     private void RebuildFrameDrawCommandScratch(SceneRenderPlan3D plan)
     {
         _frameDrawCommandScratch.Clear();
@@ -2114,123 +1761,75 @@ internal sealed partial class OpenGlSceneRenderer
         _frameDrawCommandScratch.Sort(CachedOpenGlDrawCommand.CompareForDraw);
     }
 
-    private void RebuildFrameShadowCommandScratch(SceneRenderPlan3D plan)
-    {
-        _frameDrawCommandScratch.Clear();
-        var sourceOrder = 0;
-        var cameraPosition = plan.Frame.Scene.Camera.Position;
-
-        for (var i = 0; i < plan.ShadowCommands.Count; i++)
-        {
-            var command = plan.ShadowCommands[i];
-            switch (command.Kind)
-            {
-                case SceneRenderCommandKind3D.OrdinaryBatch:
-                case SceneRenderCommandKind3D.TransparentOrdinaryItem:
-                case SceneRenderCommandKind3D.TransparentOrdinaryBatch:
-                {
-                    var cached = FindCachedMeshCommand(command.Id);
-                    if (cached.MeshBatch is not null)
-                    {
-                        _frameDrawCommandScratch.Add(cached.WithSourceOrder(sourceOrder++).RefreshSortDistance(cameraPosition));
-                    }
-                    break;
-                }
-                case SceneRenderCommandKind3D.ParticleSystem:
-                {
-                    var cached = FindCachedParticleCommand(command.Id);
-                    if (cached.ParticleBatch is not null)
-                    {
-                        _frameDrawCommandScratch.Add(cached.WithSourceOrder(sourceOrder++));
-                    }
-                    break;
-                }
-                case SceneRenderCommandKind3D.HighScaleLayer:
-                    if (command.HighScaleLayer is not null)
-                    {
-                        _frameDrawCommandScratch.Add(CachedOpenGlDrawCommand.ForHighScale(command, sourceOrder++));
-                    }
-                    break;
-            }
-        }
-
-        // Partial plans intentionally omit ordinary/particle Core extraction. Retained
-        // shadow casting must still include cached ordinary and particle commands.
-        if (!plan.IncludesOrdinary || !plan.IncludesParticles)
-        {
-            for (var i = 0; i < _cachedDrawCommands.Count; i++)
-            {
-                var cached = _cachedDrawCommands[i];
-                if (ContainsShadowCommand(cached.Id, cached.Kind)) continue;
-                _frameDrawCommandScratch.Add(cached.WithSourceOrder(sourceOrder++).RefreshSortDistance(cameraPosition));
-            }
-        }
-    }
-
-    private CachedOpenGlDrawCommand FindCachedMeshCommand(string id)
-    {
-        for (var i = 0; i < _cachedDrawCommands.Count; i++)
-        {
-            var command = _cachedDrawCommands[i];
-            if ((command.Kind == SceneRenderCommandKind3D.OrdinaryBatch || command.Kind == SceneRenderCommandKind3D.TransparentOrdinaryItem || command.Kind == SceneRenderCommandKind3D.TransparentOrdinaryBatch) &&
-                string.Equals(command.Id, id, StringComparison.Ordinal))
-            {
-                return command;
-            }
-        }
-
-        return default;
-    }
-
-    private CachedOpenGlDrawCommand FindCachedParticleCommand(string id)
-    {
-        for (var i = 0; i < _cachedDrawCommands.Count; i++)
-        {
-            var command = _cachedDrawCommands[i];
-            if (command.Kind == SceneRenderCommandKind3D.ParticleSystem &&
-                string.Equals(command.Id, id, StringComparison.Ordinal))
-            {
-                return command;
-            }
-        }
-
-        return default;
-    }
-
-    private bool ContainsShadowCommand(string id, SceneRenderCommandKind3D kind)
-    {
-        for (var i = 0; i < _frameDrawCommandScratch.Count; i++)
-        {
-            var command = _frameDrawCommandScratch[i];
-            if (command.Kind == kind && string.Equals(command.Id, id, StringComparison.Ordinal))
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
     private bool CanUseInstancedDrawPath => _supportsInstancing && !_instancedDrawPathBroken && _drawElementsInstanced is not null && _vertexAttribDivisor is not null;
+
+    private void RequireInstancedDrawPath(string scope)
+    {
+        if (!CanUseInstancedDrawPath)
+        {
+            throw CreateInstancingFailure(scope);
+        }
+    }
+
+    private InvalidOperationException CreateInstancingFailure(string scope)
+        => new($"OpenGL instanced rendering is required for {scope}; the GPU path is unavailable or failed validation. " +
+               $"supportsInstancing={_supportsInstancing}, validationBroken={_instancedDrawPathBroken}, failures={_instancedDrawFailureCount}, " +
+               $"vaoApi={_vertexArrayApi}, instancingApi={_instancingApi}, reason={_lastInstancedDrawFailureReason}.");
 
     private bool ShouldValidateInstancedDraw => _getError is not null && _instancedDrawValidationBudget > 0;
 
-    private bool TryDrawElementsInstanced(GlInterface gl, int indexCount, int indexType, int instanceCount, string meshKey, string scope)
+    private bool BeginInstancedDrawValidation(string meshKey, string scope)
+    {
+        if (!ShouldValidateInstancedDraw) return false;
+        var queuedError = DrainGlErrors();
+        if (queuedError != GlNoError)
+        {
+            // glGetError is a context-global queue. Establish a clean boundary
+            // immediately before instance-buffer/attribute setup so only setup and
+            // draw errors can invalidate the mandatory instancing path.
+            EngineLog3D.Error(
+                "OpenGL.Validation",
+                $"Queued GL error {DescribeGlError(queuedError)} was isolated before instancing setup; " +
+                $"it is not evidence that instancing failed. scope={scope}, mesh={meshKey}.");
+        }
+        return true;
+    }
+
+    private bool PrepareValidatedInstancedDrawState(
+        GlInterface gl,
+        MeshGpuResource resource,
+        int program,
+        string meshKey,
+        string scope,
+        bool validate)
+    {
+        // This is a permanent draw boundary, not only a startup validation aid. Avalonia
+        // and several Windows GL drivers do not preserve every VAO/divisor binding exactly
+        // as our managed cache expects across context rebinds. Reasserting the native VAO,
+        // EBO and program immediately before instance pointers/draw prevents stale index or
+        // vertex state without introducing a non-instanced/CPU fallback.
+        ForceBindVertexArray(resource.VertexArray);
+        gl.BindBuffer(GlElementArrayBuffer, resource.IndexBuffer);
+        gl.UseProgram(program);
+        return ValidateInstancedOperation("VAO/index/program bind", meshKey, scope, validate);
+    }
+
+    private bool ValidateInstancedOperation(string operation, string meshKey, string scope, bool validate)
+    {
+        if (!validate) return true;
+        var error = DrainGlErrors();
+        if (error == GlNoError) return true;
+        MarkInstancedDrawPathBroken(
+            $"{operation} returned {DescribeGlError(error)} scope={scope} mesh={meshKey} " +
+            $"vaoApi={_vertexArrayApi} instancingApi={_instancingApi}");
+        return false;
+    }
+
+    private bool TryDrawElementsInstanced(int indexCount, int indexType, int instanceCount, string meshKey, string scope, bool validate)
     {
         if (!CanUseInstancedDrawPath || indexCount <= 0 || instanceCount <= 0)
         {
             return false;
-        }
-
-        var validate = ShouldValidateInstancedDraw;
-        if (validate)
-        {
-            var preError = DrainGlErrors();
-            if (preError != 0)
-            {
-                MarkInstancedDrawPathBroken($"pre-draw GL error 0x{preError:X} scope={scope} mesh={meshKey}");
-                return false;
-            }
         }
 
         _drawElementsInstanced!(GlTriangles, indexCount, indexType, IntPtr.Zero, instanceCount);
@@ -2240,10 +1839,12 @@ internal sealed partial class OpenGlSceneRenderer
             return true;
         }
 
-        var drawError = DrainGlErrors();
-        if (drawError != 0)
+        var operationError = DrainGlErrors();
+        if (operationError != GlNoError)
         {
-            MarkInstancedDrawPathBroken($"draw GL error 0x{drawError:X} scope={scope} mesh={meshKey}");
+            MarkInstancedDrawPathBroken(
+                $"glDrawElementsInstanced returned {DescribeGlError(operationError)} scope={scope} mesh={meshKey} " +
+                $"vaoApi={_vertexArrayApi} instancingApi={_instancingApi}");
             return false;
         }
 
@@ -2253,13 +1854,13 @@ internal sealed partial class OpenGlSceneRenderer
 
     private int DrainGlErrors()
     {
-        if (_getError is null) return 0;
-        var first = 0;
+        if (_getError is null) return GlNoError;
+        var first = GlNoError;
         for (var i = 0; i < 16; i++)
         {
             var error = _getError();
-            if (error == 0) break;
-            if (first == 0) first = error;
+            if (error == GlNoError) break;
+            if (first == GlNoError) first = error;
         }
 
         return first;
@@ -2271,18 +1872,27 @@ internal sealed partial class OpenGlSceneRenderer
         _instancedDrawFailureCount++;
         _instancedDrawPathBroken = true;
         _instancedDrawValidationBudget = 0;
-        Debug.WriteLine($"Avalonia3D OpenGL: instanced draw path disabled after validation failure: {reason}");
+        _lastInstancedDrawFailureReason = reason;
+        EngineLog3D.Error("OpenGL.Instancing", $"Instanced draw path was disabled after validation failure: {reason}");
     }
+
+    private static string DescribeGlError(int error)
+        => error switch
+        {
+            GlNoError => "GL_NO_ERROR (0x0000)",
+            GlInvalidEnum => "GL_INVALID_ENUM (0x0500)",
+            GlInvalidValue => "GL_INVALID_VALUE (0x0501)",
+            GlInvalidOperation => "GL_INVALID_OPERATION (0x0502)",
+            GlOutOfMemory => "GL_OUT_OF_MEMORY (0x0505)",
+            GlInvalidFramebufferOperation => "GL_INVALID_FRAMEBUFFER_OPERATION (0x0506)",
+            GlContextLost => "GL_CONTEXT_LOST (0x0507)",
+            _ => $"unknown GL error 0x{error:X4}"
+        };
 
     private void DrawMeshBatchInstanced(GlInterface gl, MeshBatchData batch, Matrix4x4 viewProjection, RenderStats stats)
     {
         if (batch.InstanceCount == 0) return;
-        if (!CanUseInstancedDrawPath)
-        {
-            UploadFloat(_uniform1f, _meshUseInstancingLocation, 0f);
-            DrawMeshBatchLegacy(gl, batch, viewProjection, stats);
-            return;
-        }
+        RequireInstancedDrawPath("ordinary meshes");
 
         var visibleCount = PrepareVisibleMeshBatch(gl, batch, viewProjection, stats, out var instanceBuffer);
         if (visibleCount == 0) return;
@@ -2297,16 +1907,22 @@ internal sealed partial class OpenGlSceneRenderer
             instanceBuffer = batch.InstanceBuffer;
         }
 
-        gl.BindBuffer(GlArrayBuffer, instanceBuffer);
-        EnableInstanceAttributes(gl);
         UploadClassicMaterial(gl, batch.Material, stats);
         UploadBatchSkinning(gl, batch);
-        if (!TryDrawElementsInstanced(gl, resource.IndexCount, resource.IndexType, visibleCount, batch.MeshKey, "mesh"))
+        var validate = BeginInstancedDrawValidation(batch.MeshKey, "mesh");
+        if (!PrepareValidatedInstancedDrawState(gl, resource, _meshProgram, batch.MeshKey, "mesh", validate))
+            throw CreateInstancingFailure("ordinary meshes");
+        gl.BindBuffer(GlArrayBuffer, instanceBuffer);
+        EnableInstanceAttributes(gl);
+        if (!ValidateInstancedOperation("instance attribute setup", batch.MeshKey, "mesh", validate))
         {
             DisableInstanceAttributes();
-            UploadFloat(_uniform1f, _meshUseInstancingLocation, 0f);
-            DrawMeshBatchLegacy(gl, batch, viewProjection, stats);
-            return;
+            throw CreateInstancingFailure("ordinary meshes");
+        }
+        if (!TryDrawElementsInstanced(resource.IndexCount, resource.IndexType, visibleCount, batch.MeshKey, "mesh", validate))
+        {
+            DisableInstanceAttributes();
+            throw CreateInstancingFailure("ordinary meshes");
         }
 
         DisableInstanceAttributes();
@@ -2384,7 +2000,7 @@ internal sealed partial class OpenGlSceneRenderer
 
         if (batch.CulledInstanceBuffer == 0)
         {
-            batch.CulledInstanceBuffer = gl.GenBuffer();
+            batch.CulledInstanceBuffer = GenRequiredBuffer(gl, $"batch:{batch.MeshKey}:culled-instances");
         }
 
         gl.BindBuffer(GlArrayBuffer, batch.CulledInstanceBuffer);
@@ -2399,12 +2015,7 @@ internal sealed partial class OpenGlSceneRenderer
     private void DrawParticleBatchInstanced(GlInterface gl, ParticleBatchData batch, RenderStats stats)
     {
         if (batch.InstanceCount == 0) return;
-        if (!CanUseInstancedDrawPath)
-        {
-            UploadFloat(_uniform1f, _meshUseInstancingLocation, 0f);
-            DrawParticleBatchLegacy(gl, batch, stats);
-            return;
-        }
+        RequireInstancedDrawPath("particles");
 
         ConfigureForwardBlendState(gl, batch.Transparent);
         UploadFloat(_uniform1f, _meshSkinningEnabledLocation, 0f);
@@ -2412,16 +2023,22 @@ internal sealed partial class OpenGlSceneRenderer
         UploadFloat(_uniform1f, _meshParticleBillboardLocation, batch.Billboard ? 1f : 0f);
         BindMeshAttributes(gl, resource);
         EnsureBatchInstanceBuffer(gl, batch, stats);
+        UploadClassicMaterial(gl, batch.Material, stats);
+        var validate = BeginInstancedDrawValidation(batch.MeshKey, "particle");
+        if (!PrepareValidatedInstancedDrawState(gl, resource, _meshProgram, batch.MeshKey, "particle", validate))
+            throw CreateInstancingFailure("particles");
         gl.BindBuffer(GlArrayBuffer, batch.InstanceBuffer);
         if (batch.Billboard) EnableParticleBillboardInstanceAttributes(gl);
         else EnableInstanceAttributes(gl);
-        UploadClassicMaterial(gl, batch.Material, stats);
-        if (!TryDrawElementsInstanced(gl, resource.IndexCount, resource.IndexType, batch.InstanceCount, batch.MeshKey, "particle"))
+        if (!ValidateInstancedOperation("instance attribute setup", batch.MeshKey, "particle", validate))
         {
             DisableInstanceAttributes();
-            UploadFloat(_uniform1f, _meshUseInstancingLocation, 0f);
-            DrawParticleBatchLegacy(gl, batch, stats);
-            return;
+            throw CreateInstancingFailure("particles");
+        }
+        if (!TryDrawElementsInstanced(resource.IndexCount, resource.IndexType, batch.InstanceCount, batch.MeshKey, "particle", validate))
+        {
+            DisableInstanceAttributes();
+            throw CreateInstancingFailure("particles");
         }
 
         DisableInstanceAttributes();
@@ -2430,80 +2047,11 @@ internal sealed partial class OpenGlSceneRenderer
         stats.InstancedBatchCount++;
     }
 
-    private void DrawMeshBatchLegacy(GlInterface gl, MeshBatchData batch, Matrix4x4 viewProjection, RenderStats stats)
-    {
-        if (batch.InstanceCount == 0) return;
-
-        ConfigureForwardBlendState(gl, IsTransparent(batch.Material));
-        UploadFloat(_uniform1f, _meshParticleBillboardLocation, 0f);
-        var resource = EnsureMeshResource(gl, batch.Mesh.ResourceKey, batch.Mesh.GeometryVersion, batch.Mesh, stats);
-        BindMeshAttributes(gl, resource);
-        DisableInstanceAttributes();
-        UploadClassicMaterial(gl, batch.Material, stats);
-        UploadBatchSkinning(gl, batch);
-
-        var frustum = FrustumCuller3D.ExtractClipFrustum(viewProjection);
-        var canCull = !batch.HasSkinning && batch.Mesh.LocalBounds.IsValid;
-        var data = batch.Data;
-        for (var i = 0; i < batch.InstanceCount; i++)
-        {
-            var offset = i * batch.FloatStride;
-            if (canCull && !FrustumCuller3D.IntersectsLocalBounds(batch.Mesh.LocalBounds, data, offset, frustum))
-            {
-                stats.CulledObjectCount++;
-                continue;
-            }
-
-            UploadMatrixFromInstanceData(_uniformMatrix4fv, _meshModelLocation, data, offset, _matrixUploadBuffer);
-            UploadColorFromInstanceData(_uniform4f, _meshColorLocation, data, offset + 16);
-            gl.DrawElements(GlTriangles, resource.IndexCount, resource.IndexType, IntPtr.Zero);
-            stats.DrawCallCount++;
-            stats.EstimatedDrawCallCount++;
-        }
-
-        UploadFloat(_uniform1f, _meshSkinningEnabledLocation, 0f);
-    }
-
-    private void DrawParticleBatchLegacy(GlInterface gl, ParticleBatchData batch, RenderStats stats)
-    {
-        if (batch.InstanceCount == 0) return;
-
-        ConfigureForwardBlendState(gl, batch.Transparent);
-        UploadFloat(_uniform1f, _meshSkinningEnabledLocation, 0f);
-        UploadFloat(_uniform1f, _meshParticleBillboardLocation, batch.Billboard ? 1f : 0f);
-        var resource = EnsureMeshResource(gl, batch.Mesh.ResourceKey, batch.Mesh.GeometryVersion, batch.Mesh, stats);
-        BindMeshAttributes(gl, resource);
-        DisableInstanceAttributes();
-        UploadClassicMaterial(gl, batch.Material, stats);
-
-        var data = batch.Data;
-        for (var i = 0; i < batch.InstanceCount; i++)
-        {
-            var offset = i * batch.FloatStride;
-            if (batch.Billboard)
-            {
-                UploadBillboardParticleMatrix(_uniformMatrix4fv, _meshModelLocation, data, offset, _matrixUploadBuffer);
-                UploadColorFromInstanceData(_uniform4f, _meshColorLocation, data, offset + 4);
-            }
-            else
-            {
-                UploadMatrixFromInstanceData(_uniformMatrix4fv, _meshModelLocation, data, offset, _matrixUploadBuffer);
-                UploadColorFromInstanceData(_uniform4f, _meshColorLocation, data, offset + 16);
-            }
-
-            gl.DrawElements(GlTriangles, resource.IndexCount, resource.IndexType, IntPtr.Zero);
-            stats.DrawCallCount++;
-            stats.EstimatedDrawCallCount++;
-        }
-
-        UploadFloat(_uniform1f, _meshParticleBillboardLocation, 0f);
-    }
-
     private void EnsureBatchInstanceBuffer(GlInterface gl, InstanceBatchData batch, RenderStats stats)
     {
         if (batch.InstanceBuffer == 0)
         {
-            batch.InstanceBuffer = gl.GenBuffer();
+            batch.InstanceBuffer = GenRequiredBuffer(gl, $"batch:{batch.MeshKey}:instances");
             batch.UploadedVersion = -1;
             batch.UploadedCapacityFloats = 0;
         }
@@ -2514,21 +2062,26 @@ internal sealed partial class OpenGlSceneRenderer
         }
 
         gl.BindBuffer(GlArrayBuffer, batch.InstanceBuffer);
+        var dirtyRatio = batch.InstanceCount == 0
+            ? 1f
+            : batch.DirtyInstanceOffsets.Count / (float)batch.InstanceCount;
+        var sparseRangeCount = batch.CanUploadDirtyInstanceRanges
+            ? PrepareDirtyInstanceRanges(batch.DirtyInstanceOffsets)
+            : int.MaxValue;
         if (_bufferSubData is not null &&
             batch.CanUploadDirtyInstanceRanges &&
+            dirtyRatio <= SparseInstanceUploadMaxDirtyRatio &&
+            sparseRangeCount <= MaxSparseInstanceUploadRanges &&
             batch.UploadedCapacityFloats >= batch.FloatCount &&
             batch.FloatCount > 0)
         {
             UploadDirtyInstanceRanges(batch, stats);
         }
-        else if (_bufferSubData is not null && batch.UploadedCapacityFloats >= batch.FloatCount && batch.FloatCount > 0)
-        {
-            UploadFloatsSubData(GlArrayBuffer, 0, batch.Data, 0, batch.FloatCount);
-            stats.InstanceBufferUploads++;
-            stats.InstanceUploadBytes += batch.FloatCount * sizeof(float);
-        }
         else
         {
+            // glBufferData replaces (orphans) the store. Rewriting most/all of a buffer with
+            // glBufferSubData forces the CPU to wait for the previous frame's GPU reads on
+            // native drivers and was the source of periodic 20 FPS hitches under animation.
             UploadFloats(gl, GlArrayBuffer, batch.Data, batch.FloatCount, GlDynamicDraw);
             batch.UploadedCapacityFloats = batch.FloatCount;
             stats.InstanceBufferUploads++;
@@ -2542,7 +2095,6 @@ internal sealed partial class OpenGlSceneRenderer
     {
         var dirty = batch.DirtyInstanceOffsets;
         if (dirty.Count == 0) return;
-        dirty.Sort();
 
         var uploadedFloats = 0;
         var rangeStart = dirty[0];
@@ -2573,127 +2125,319 @@ internal sealed partial class OpenGlSceneRenderer
         stats.TransformUploadBytes += uploadedFloats * sizeof(float);
     }
 
-    private void BindMeshAttributes(GlInterface gl, MeshGpuResource resource)
+    private static int PrepareDirtyInstanceRanges(List<int> dirty)
     {
-        if (_supportsVertexArrays && resource.VertexArray != 0)
+        if (dirty.Count == 0) return 0;
+        dirty.Sort();
+        var ranges = 1;
+        var previous = dirty[0];
+        for (var i = 1; i < dirty.Count; i++)
         {
-            BindVertexArray(resource.VertexArray);
-            _lastMeshAttributeResource = resource;
-            _lastShadowAttributeResource = resource;
-            return;
+            var current = dirty[i];
+            if (current == previous) continue;
+            if (current != previous + 1 && ++ranges > MaxSparseInstanceUploadRanges) return ranges;
+            previous = current;
         }
-
-        BindVertexArray(0);
-        if (ReferenceEquals(_lastMeshAttributeResource, resource))
-        {
-            gl.BindBuffer(GlElementArrayBuffer, resource.IndexBuffer);
-            return;
-        }
-
-        _lastMeshAttributeResource = resource;
-        BindMeshStaticAttributesFallback(gl, resource, meshProgram: true);
+        return ranges;
     }
 
-    private void BindMeshStaticAttributesFallback(GlInterface gl, MeshGpuResource resource, bool meshProgram)
+    private void BindMeshAttributes(GlInterface gl, MeshGpuResource resource)
     {
+        if (resource.VertexArray == 0) throw new InvalidOperationException("OpenGL mesh has no RHI vertex-array resource.");
+        ForceBindVertexArray(resource.VertexArray);
+        // VAO remains mandatory, but no state inside it is trusted after the host may have
+        // rebound the context. Rebuild the compact static layout once per mesh per graphics
+        // callback. Generic constants are not VAO state, so missing-stream defaults are
+        // restored on every bind.
+        if (resource.StaticLayoutCallbackSerial != _graphicsCallbackSerial)
+        {
+            ConfigureMeshStaticAttributes(gl, resource);
+            resource.StaticLayoutCallbackSerial = _graphicsCallbackSerial;
+        }
+        else
+        {
+            gl.BindBuffer(GlElementArrayBuffer, resource.IndexBuffer);
+        }
+        ApplyMissingMeshAttributeDefaults(resource.Layout);
+        _lastMeshAttributeResource = resource;
+    }
+
+    private void ConfigureMeshStaticAttributes(GlInterface gl, MeshGpuResource resource)
+    {
+        var layout = resource.Layout ?? throw new InvalidOperationException($"OpenGL mesh '{resource.LogicalKey}' has no vertex layout.");
         gl.BindBuffer(GlArrayBuffer, resource.VertexBuffer);
-        var positionLocation = meshProgram ? _meshPositionLocation : _shadowPositionLocation;
-        gl.EnableVertexAttribArray(positionLocation);
-        gl.VertexAttribPointer(positionLocation, 3, GlFloat, 0, MeshVertexByteStride, new IntPtr(MeshPositionOffsetBytes));
-
-        if (meshProgram)
-        {
-            gl.EnableVertexAttribArray(_meshNormalLocation);
-            gl.VertexAttribPointer(_meshNormalLocation, 3, GlFloat, 0, MeshVertexByteStride, new IntPtr(MeshNormalOffsetBytes));
-            if (_meshTexCoordLocation >= 0)
-            {
-                gl.EnableVertexAttribArray(_meshTexCoordLocation);
-                gl.VertexAttribPointer(_meshTexCoordLocation, 2, GlFloat, 0, MeshVertexByteStride, new IntPtr(MeshTexCoordOffsetBytes));
-            }
-            if (_meshTangentLocation >= 0)
-            {
-                gl.EnableVertexAttribArray(_meshTangentLocation);
-                gl.VertexAttribPointer(_meshTangentLocation, 4, GlFloat, 0, MeshVertexByteStride, new IntPtr(MeshTangentOffsetBytes));
-            }
-            if (_meshVertexColorLocation >= 0)
-            {
-                gl.EnableVertexAttribArray(_meshVertexColorLocation);
-                gl.VertexAttribPointer(_meshVertexColorLocation, 4, GlFloat, 0, MeshVertexByteStride, new IntPtr(MeshVertexColorOffsetBytes));
-            }
-            if (_meshMaterialSlotLocation >= 0)
-            {
-                gl.EnableVertexAttribArray(_meshMaterialSlotLocation);
-                gl.VertexAttribPointer(_meshMaterialSlotLocation, 1, GlFloat, 0, MeshVertexByteStride, new IntPtr(MeshMaterialSlotOffsetBytes));
-                _vertexAttribDivisor?.Invoke(_meshMaterialSlotLocation, 0);
-            }
-        }
-
-        var boneIndexLocation = meshProgram ? _meshBoneIndicesLocation : _shadowBoneIndicesLocation;
-        if (boneIndexLocation >= 0)
-        {
-            gl.EnableVertexAttribArray(boneIndexLocation);
-            gl.VertexAttribPointer(boneIndexLocation, 4, GlFloat, 0, MeshVertexByteStride, new IntPtr(MeshBoneIndexOffsetBytes));
-        }
-        var boneWeightLocation = meshProgram ? _meshBoneWeightsLocation : _shadowBoneWeightsLocation;
-        if (boneWeightLocation >= 0)
-        {
-            gl.EnableVertexAttribArray(boneWeightLocation);
-            gl.VertexAttribPointer(boneWeightLocation, 4, GlFloat, 0, MeshVertexByteStride, new IntPtr(MeshBoneWeightOffsetBytes));
-        }
-
+        ConfigureMeshAttribute(gl, layout, VertexAttributeKind3D.Position, _meshPositionLocation, required: true, defaultValue: Vector4.Zero);
+        ConfigureMeshAttribute(gl, layout, VertexAttributeKind3D.Normal, _meshNormalLocation, required: true, defaultValue: new Vector4(0f, 1f, 0f, 0f));
+        ConfigureMeshAttribute(gl, layout, VertexAttributeKind3D.TexCoord0, _meshTexCoordLocation, required: false, defaultValue: new Vector4(0f, 0f, 0f, 1f));
+        ConfigureMeshAttribute(gl, layout, VertexAttributeKind3D.Tangent, _meshTangentLocation, required: false, defaultValue: new Vector4(1f, 0f, 0f, 1f));
+        ConfigureMeshAttribute(gl, layout, VertexAttributeKind3D.Color0, _meshVertexColorLocation, required: false, defaultValue: Vector4.One);
+        ConfigureMeshAttribute(gl, layout, VertexAttributeKind3D.MaterialSlot, _meshMaterialSlotLocation, required: false, defaultValue: new Vector4(0f, 0f, 0f, 1f));
+        ConfigureMeshAttribute(gl, layout, VertexAttributeKind3D.BoneIndices, _meshBoneIndicesLocation, required: false, defaultValue: Vector4.Zero);
+        ConfigureMeshAttribute(gl, layout, VertexAttributeKind3D.BoneWeights, _meshBoneWeightsLocation, required: false, defaultValue: new Vector4(1f, 0f, 0f, 0f));
         gl.BindBuffer(GlElementArrayBuffer, resource.IndexBuffer);
     }
 
+    private void ConfigureMeshAttribute(
+        GlInterface gl,
+        VertexLayout3D layout,
+        VertexAttributeKind3D kind,
+        int location,
+        bool required,
+        Vector4 defaultValue)
+    {
+        if (location < 0) return;
+        var descriptor = layout.Find(kind);
+        if (descriptor.HasValue)
+        {
+            var attribute = descriptor.Value;
+            gl.EnableVertexAttribArray(location);
+            gl.VertexAttribPointer(
+                location,
+                attribute.ComponentCount,
+                ResolveGlVertexType(attribute.Format),
+                attribute.Normalized ? 1 : 0,
+                layout.StrideBytes,
+                new IntPtr(attribute.OffsetBytes));
+            ResetDivisor(location);
+            return;
+        }
+        if (required) throw new InvalidOperationException($"Vertex layout '{layout}' is missing required attribute '{kind}'.");
+        _disableVertexAttribArray?.Invoke(location);
+        ResetDivisor(location);
+        SetVertexAttributeConstant(location, defaultValue);
+    }
+
+    private void ApplyMissingMeshAttributeDefaults(VertexLayout3D? layout)
+    {
+        if (layout is null) return;
+        Apply(VertexAttributeKind3D.TexCoord0, _meshTexCoordLocation, new Vector4(0f, 0f, 0f, 1f));
+        Apply(VertexAttributeKind3D.Tangent, _meshTangentLocation, new Vector4(1f, 0f, 0f, 1f));
+        Apply(VertexAttributeKind3D.Color0, _meshVertexColorLocation, Vector4.One);
+        Apply(VertexAttributeKind3D.MaterialSlot, _meshMaterialSlotLocation, new Vector4(0f, 0f, 0f, 1f));
+        Apply(VertexAttributeKind3D.BoneIndices, _meshBoneIndicesLocation, Vector4.Zero);
+        Apply(VertexAttributeKind3D.BoneWeights, _meshBoneWeightsLocation, new Vector4(1f, 0f, 0f, 0f));
+
+        void Apply(VertexAttributeKind3D kind, int location, Vector4 value)
+        {
+            if (location >= 0 && !layout.Has(kind)) SetVertexAttributeConstant(location, value);
+        }
+    }
+
+    private void SetVertexAttributeConstant(int location, Vector4 value)
+    {
+        if (_vertexAttrib4f is null)
+            throw new InvalidOperationException("OpenGL glVertexAttrib4f is required for compact layouts with omitted optional streams.");
+        _vertexAttrib4f(location, value.X, value.Y, value.Z, value.W);
+    }
+
+    private static int ResolveGlVertexType(VertexAttributeFormat3D format)
+        => format switch
+        {
+            VertexAttributeFormat3D.Float1 or VertexAttributeFormat3D.Float2 or VertexAttributeFormat3D.Float3 or VertexAttributeFormat3D.Float4 => GlFloat,
+            VertexAttributeFormat3D.Half2 => GlHalfFloat,
+            VertexAttributeFormat3D.SNorm16x4 => GlShort,
+            VertexAttributeFormat3D.UNorm8x4 => GlUnsignedByte,
+            VertexAttributeFormat3D.UInt16x1 or VertexAttributeFormat3D.UInt16x4 or VertexAttributeFormat3D.UNorm16x4 => GlUnsignedShort,
+            _ => throw new NotSupportedException($"OpenGL vertex format '{format}' is not supported by the mesh pipeline.")
+        };
+
     private void ConfigureMeshVertexArray(GlInterface gl, MeshGpuResource resource)
     {
-        if (!_supportsVertexArrays || resource.VertexArray == 0) return;
+        if (resource.VertexArray == 0)
+            throw new InvalidOperationException("OpenGL failed to create the required mesh vertex-array resource.");
         BindVertexArray(resource.VertexArray);
-        BindMeshStaticAttributesFallback(gl, resource, meshProgram: true);
+        ConfigureMeshStaticAttributes(gl, resource);
         BindVertexArray(0);
         _lastMeshAttributeResource = null;
-        _lastShadowAttributeResource = null;
     }
 
     private void ConfigureStaticUtilityVertexArrays(GlInterface gl)
     {
-        if (!_supportsVertexArrays) return;
-
         _skyboxVertexArray = CreateVertexArray();
-        if (_skyboxVertexArray != 0)
-        {
-            BindVertexArray(_skyboxVertexArray);
-            gl.BindBuffer(GlArrayBuffer, _skyboxVertexBuffer);
-            gl.EnableVertexAttribArray(_skyboxPositionLocation);
-            gl.VertexAttribPointer(_skyboxPositionLocation, 2, GlFloat, 0, sizeof(float) * 2, IntPtr.Zero);
-            gl.BindBuffer(GlElementArrayBuffer, _skyboxIndexBuffer);
-        }
+        BindVertexArray(_skyboxVertexArray);
+        gl.BindBuffer(GlArrayBuffer, _skyboxVertexBuffer);
+        gl.EnableVertexAttribArray(_skyboxPositionLocation);
+        gl.VertexAttribPointer(_skyboxPositionLocation, 2, GlFloat, 0, sizeof(float) * 2, IntPtr.Zero);
+        gl.BindBuffer(GlElementArrayBuffer, _skyboxIndexBuffer);
 
         _controlVertexArray = CreateVertexArray();
-        if (_controlVertexArray != 0)
-        {
-            BindVertexArray(_controlVertexArray);
-            gl.BindBuffer(GlArrayBuffer, _controlVertexBuffer);
-            gl.EnableVertexAttribArray(_texturePositionLocation);
-            gl.VertexAttribPointer(_texturePositionLocation, 3, GlFloat, 0, sizeof(float) * 5, IntPtr.Zero);
-            gl.EnableVertexAttribArray(_textureUvLocation);
-            gl.VertexAttribPointer(_textureUvLocation, 2, GlFloat, 0, sizeof(float) * 5, new IntPtr(sizeof(float) * 3));
-            gl.BindBuffer(GlElementArrayBuffer, _controlIndexBuffer);
-        }
+        BindVertexArray(_controlVertexArray);
+        gl.BindBuffer(GlArrayBuffer, _controlVertexBuffer);
+        gl.EnableVertexAttribArray(_texturePositionLocation);
+        gl.VertexAttribPointer(_texturePositionLocation, 3, GlFloat, 0, sizeof(float) * 5, IntPtr.Zero);
+        gl.EnableVertexAttribArray(_textureUvLocation);
+        gl.VertexAttribPointer(_textureUvLocation, 2, GlFloat, 0, sizeof(float) * 5, new IntPtr(sizeof(float) * 3));
+        gl.BindBuffer(GlElementArrayBuffer, _controlIndexBuffer);
 
         BindVertexArray(0);
     }
 
     private void BindVertexArray(int vertexArray)
     {
-        if (!_supportsVertexArrays || _bindVertexArray is null) return;
+        if (!_supportsVertexArrays || _bindVertexArray is null) throw new InvalidOperationException("Required OpenGL vertex-array support is unavailable.");
         if (_boundVertexArray == vertexArray) return;
         _bindVertexArray(vertexArray);
         _boundVertexArray = vertexArray;
         if (vertexArray == 0)
         {
             _lastMeshAttributeResource = null;
-            _lastShadowAttributeResource = null;
         }
+    }
+
+    private void ForceBindVertexArray(int vertexArray)
+    {
+        if (!_supportsVertexArrays || _bindVertexArray is null) throw new InvalidOperationException("Required OpenGL vertex-array support is unavailable.");
+        _bindVertexArray(vertexArray);
+        _boundVertexArray = vertexArray;
+        if (vertexArray == 0)
+        {
+            _lastMeshAttributeResource = null;
+        }
+    }
+
+    private void ResolveInstancingEntryPoints(GlInterface gl, GlContextVersionInfo context, string extensions)
+    {
+        _vertexAttribDivisor = null;
+        _drawElementsInstanced = null;
+        _instancingApi = "unavailable";
+
+        var coreSupported = context.IsKnown &&
+            (context.IsOpenGlEs
+                ? context.Major >= 3
+                : context.Major > 3 || context.Major == 3 && context.Minor >= 3);
+        if (coreSupported && TrySelectInstancingApi(gl, "core", "glVertexAttribDivisor", "glDrawElementsInstanced")) return;
+
+        if (HasExtension(extensions, "GL_ANGLE_instanced_arrays") &&
+            TrySelectInstancingApi(gl, "ANGLE", "glVertexAttribDivisorANGLE", "glDrawElementsInstancedANGLE")) return;
+        if (HasExtension(extensions, "GL_EXT_instanced_arrays") &&
+            TrySelectInstancingApi(gl, "EXT", "glVertexAttribDivisorEXT", "glDrawElementsInstancedEXT")) return;
+        if (HasExtension(extensions, "GL_NV_instanced_arrays") && HasExtension(extensions, "GL_NV_draw_instanced") &&
+            TrySelectInstancingApi(gl, "NV", "glVertexAttribDivisorNV", "glDrawElementsInstancedNV")) return;
+        if (HasExtension(extensions, "GL_ARB_instanced_arrays") && HasExtension(extensions, "GL_ARB_draw_instanced") &&
+            TrySelectInstancingApi(gl, "ARB", "glVertexAttribDivisorARB", "glDrawElementsInstancedARB")) return;
+        if (HasExtension(extensions, "GL_EXT_instanced_arrays") && HasExtension(extensions, "GL_EXT_draw_instanced") &&
+            TrySelectInstancingApi(gl, "EXT", "glVertexAttribDivisorEXT", "glDrawElementsInstancedEXT")) return;
+
+        // Desktop OpenGL 3.1/3.2 exposes instancing through the paired ARB
+        // extensions. Core-profile extension enumeration requires glGetStringi,
+        // so the coherent pair itself is the authoritative capability here.
+        if (!context.IsOpenGlEs && context.IsKnown && context.Major >= 3 &&
+            TrySelectInstancingApi(gl, "ARB", "glVertexAttribDivisorARB", "glDrawElementsInstancedARB")) return;
+
+        if (!context.IsKnown)
+        {
+            TrySelectInstancingApi(gl, "core-unversioned", "glVertexAttribDivisor", "glDrawElementsInstanced");
+        }
+    }
+
+    private bool TrySelectInstancingApi(GlInterface gl, string label, string divisorName, string drawName)
+    {
+        var divisor = LoadDelegate<GlVertexAttribDivisorDelegate>(gl, divisorName);
+        var draw = LoadDelegate<GlDrawElementsInstancedDelegate>(gl, drawName);
+        if (divisor is null || draw is null) return false;
+        _vertexAttribDivisor = divisor;
+        _drawElementsInstanced = draw;
+        _instancingApi = label;
+        return true;
+    }
+
+    private void ResolveVertexArrayEntryPoints(GlInterface gl, GlContextVersionInfo context, string extensions)
+    {
+        _genVertexArrays = null;
+        _bindVertexArray = null;
+        _deleteVertexArrays = null;
+        _vertexArrayApi = "unavailable";
+
+        var coreSupported = context.IsKnown &&
+            (context.IsOpenGlEs ? context.Major >= 3 : context.Major >= 3);
+        if (coreSupported && TrySelectVertexArrayApi(gl, "core", "glGenVertexArrays", "glBindVertexArray", "glDeleteVertexArrays")) return;
+
+        if (HasExtension(extensions, "GL_OES_vertex_array_object") &&
+            TrySelectVertexArrayApi(gl, "OES", "glGenVertexArraysOES", "glBindVertexArrayOES", "glDeleteVertexArraysOES")) return;
+        if (HasExtension(extensions, "GL_APPLE_vertex_array_object") &&
+            TrySelectVertexArrayApi(gl, "APPLE", "glGenVertexArraysAPPLE", "glBindVertexArrayAPPLE", "glDeleteVertexArraysAPPLE")) return;
+        if (HasExtension(extensions, "GL_ARB_vertex_array_object") &&
+            TrySelectVertexArrayApi(gl, "ARB", "glGenVertexArrays", "glBindVertexArray", "glDeleteVertexArrays")) return;
+
+        if (!context.IsKnown)
+        {
+            TrySelectVertexArrayApi(gl, "core-unversioned", "glGenVertexArrays", "glBindVertexArray", "glDeleteVertexArrays");
+        }
+    }
+
+    private bool TrySelectVertexArrayApi(GlInterface gl, string label, string genName, string bindName, string deleteName)
+    {
+        var gen = LoadDelegate<GlGenVertexArraysDelegate>(gl, genName);
+        var bind = LoadDelegate<GlBindVertexArrayDelegate>(gl, bindName);
+        var delete = LoadDelegate<GlDeleteVertexArraysDelegate>(gl, deleteName);
+        if (gen is null || bind is null || delete is null) return false;
+
+        var arrays = new int[1];
+        DrainGlErrors();
+        try
+        {
+            gen(1, arrays);
+            var generateError = DrainGlErrors();
+            if (generateError != GlNoError || arrays[0] == 0)
+            {
+                EngineLog3D.Warning(
+                    "OpenGL.Capabilities",
+                    $"Rejected VAO API {label}: generation returned {DescribeGlError(generateError)}, handle={arrays[0]}.");
+                return false;
+            }
+
+            bind(arrays[0]);
+            var bindError = DrainGlErrors();
+            bind(0);
+            var unbindError = DrainGlErrors();
+            if (bindError != GlNoError || unbindError != GlNoError)
+            {
+                EngineLog3D.Warning(
+                    "OpenGL.Capabilities",
+                    $"Rejected VAO API {label}: bind={DescribeGlError(bindError)}, unbind={DescribeGlError(unbindError)}.");
+                return false;
+            }
+
+            _genVertexArrays = gen;
+            _bindVertexArray = bind;
+            _deleteVertexArrays = delete;
+            _vertexArrayApi = label;
+            _boundVertexArray = 0;
+            return true;
+        }
+        finally
+        {
+            if (arrays[0] != 0)
+            {
+                try { delete(1, arrays); }
+                catch { /* The candidate is rejected by the capability result above. */ }
+                DrainGlErrors();
+            }
+        }
+    }
+
+    private static GlContextVersionInfo ParseGlContextVersion(string version)
+    {
+        if (string.IsNullOrWhiteSpace(version)) return default;
+        var esIndex = version.IndexOf("OpenGL ES", StringComparison.OrdinalIgnoreCase);
+        var isOpenGlEs = esIndex >= 0;
+        var start = isOpenGlEs ? esIndex + "OpenGL ES".Length : 0;
+        while (start < version.Length && !char.IsDigit(version[start])) start++;
+        if (start >= version.Length) return new GlContextVersionInfo(isOpenGlEs, 0, 0, false);
+
+        var major = 0;
+        while (start < version.Length && char.IsDigit(version[start])) major = checked(major * 10 + version[start++] - '0');
+        if (start >= version.Length || version[start] != '.') return new GlContextVersionInfo(isOpenGlEs, major, 0, true);
+        start++;
+        var minor = 0;
+        while (start < version.Length && char.IsDigit(version[start])) minor = checked(minor * 10 + version[start++] - '0');
+        return new GlContextVersionInfo(isOpenGlEs, major, minor, true);
+    }
+
+    private static bool HasExtension(string extensions, string extension)
+    {
+        if (string.IsNullOrWhiteSpace(extensions) || string.IsNullOrWhiteSpace(extension)) return false;
+        return (" " + extensions + " ").Contains(" " + extension + " ", StringComparison.Ordinal);
     }
 
 
@@ -2702,15 +2446,20 @@ internal sealed partial class OpenGlSceneRenderer
         _gpuSkinTextureBoneLimit = 0;
         var uniformsAvailable = _meshSkinningEnabledLocation >= 0 &&
                                 _meshBoneTextureLocation >= 0 &&
-                                _meshBoneTextureHeightLocation >= 0 &&
-                                _shadowSkinningEnabledLocation >= 0 &&
-                                _shadowBoneTextureLocation >= 0 &&
-                                _shadowBoneTextureHeightLocation >= 0;
+                                _meshBoneTextureHeightLocation >= 0;
         if (!uniformsAvailable || _getIntegerv is null) return false;
 
         var vertexTextureUnits = GetInteger(0x8B4C); // GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS
         var maxTextureSize = GetInteger(0x0D33); // GL_MAX_TEXTURE_SIZE
         if (vertexTextureUnits <= 0 || maxTextureSize < 1) return false;
+
+        var queuedError = DrainGlErrors();
+        if (queuedError != GlNoError)
+        {
+            EngineLog3D.Warning(
+                "OpenGL.Skinning",
+                $"Queued GL error {DescribeGlError(queuedError)} was isolated before the float-texture capability probe.");
+        }
 
         var texture = 0;
         try
@@ -2729,8 +2478,14 @@ internal sealed partial class OpenGlSceneRenderer
                 gl.TexImage2D(GlTexture2D, 0, GlRgba, 4, 1, 0, GlRgba, GlFloat, (IntPtr)probe);
             }
 
-            var error = _getError?.Invoke() ?? 0;
-            if (error != 0) return false;
+            var error = DrainGlErrors();
+            if (error != GlNoError)
+            {
+                EngineLog3D.Information(
+                    "OpenGL.Skinning",
+                    $"GPU bone texture probe returned {DescribeGlError(error)}; float-texture skinning is unavailable for this context.");
+                return false;
+            }
             _gpuSkinTextureBoneLimit = Math.Min(MaxGpuSkinTextureBones, maxTextureSize);
             return _gpuSkinTextureBoneLimit > 0;
         }
@@ -2756,11 +2511,234 @@ internal sealed partial class OpenGlSceneRenderer
         }
     }
 
+    private RhiDeviceCapabilities3D BuildRhiCapabilities()
+    {
+        var features = RhiDeviceCapabilities3D.RequiredRasterFeatures;
+        if (_supportsBoneTextureSkinning)
+        {
+            features |= RhiFeature3D.VertexTextureFetch | RhiFeature3D.FloatTextures;
+        }
+        if (GpuTimerQueriesInitialized) features |= RhiFeature3D.TimerQueries;
+
+        var vendor = GetString(GlVendor);
+        var renderer = GetString(GlRenderer);
+        var adapter = string.IsNullOrWhiteSpace(vendor) ? renderer : string.IsNullOrWhiteSpace(renderer) ? vendor : vendor + " " + renderer;
+        return new RhiDeviceCapabilities3D(
+            RhiBackendApi3D.OpenGl,
+            adapter,
+            GetString(GlVersion),
+            features,
+            new RhiDeviceLimits3D(
+                GetInteger(0x0D33), // GL_MAX_TEXTURE_SIZE
+                GetInteger(0x8B4D), // GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS
+                GetInteger(0x8B4C), // GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS
+                GetInteger(0x8869), // GL_MAX_VERTEX_ATTRIBS
+                GetInteger(0x84E8), // GL_MAX_RENDERBUFFER_SIZE
+                GetInteger(0x8D57))); // GL_MAX_SAMPLES
+    }
+
+    private void RegisterStaticRhiResources()
+    {
+        var resources = _rhiDevice?.Resources ?? throw new InvalidOperationException("OpenGL RHI device is not initialized.");
+        resources.RegisterBuffer("utility:skybox:vertices", new RhiBufferDescriptor3D(8L * sizeof(float), RhiBufferUsage3D.Vertex, sizeof(float) * 2), 1);
+        resources.RegisterBuffer("utility:skybox:indices", new RhiBufferDescriptor3D(6L * sizeof(ushort), RhiBufferUsage3D.Index, sizeof(ushort)), 1);
+        resources.RegisterBuffer("utility:control:indices", new RhiBufferDescriptor3D(6L * sizeof(ushort), RhiBufferUsage3D.Index, sizeof(ushort)), 1);
+        resources.RegisterAllocation("utility:skybox:vao", RhiResourceKind3D.VertexArray, 0, 1);
+        resources.RegisterAllocation("utility:control:vao", RhiResourceKind3D.VertexArray, 0, 1);
+        resources.RegisterAllocation("pipeline:mesh", RhiResourceKind3D.Pipeline, 0, 1);
+        resources.RegisterAllocation("pipeline:skybox", RhiResourceKind3D.Pipeline, 0, 1);
+        resources.RegisterAllocation("pipeline:textured", RhiResourceKind3D.Pipeline, 0, 1);
+    }
+
+    private string GetString(int name)
+    {
+        if (_getString is null) return "unknown";
+        var pointer = _getString(name);
+        return pointer == IntPtr.Zero ? "unknown" : Marshal.PtrToStringAnsi(pointer) ?? "unknown";
+    }
+
+    private bool GpuTimerQueriesInitialized
+    {
+        get
+        {
+            for (var i = 0; i < _gpuTimerQueries.Length; i++) if (_gpuTimerQueries[i] == 0) return false;
+            return true;
+        }
+    }
+
+    private void InitializeGpuTimerQueries()
+    {
+        Array.Clear(_gpuTimerQueries, 0, _gpuTimerQueries.Length);
+        Array.Clear(_gpuTimerPending, 0, _gpuTimerPending.Length);
+        _gpuTimerActiveSlot = -1;
+        _gpuTimerNextSlot = 0;
+        _lastGpuFrameMilliseconds = double.NaN;
+        if (_genQueries is null || _deleteQueries is null || _beginQuery is null || _endQuery is null ||
+            _getQueryObjectiv is null || _getQueryObjectui64v is null || _getError is null)
+        {
+            EngineLog3D.Information("OpenGL", "GPU timer queries are unavailable; RHI timing telemetry is disabled for this context.");
+            return;
+        }
+
+        try
+        {
+            _genQueries(_gpuTimerQueries.Length, _gpuTimerQueries);
+            if (!GpuTimerQueriesInitialized)
+            {
+                DeleteGpuTimerQueries();
+                EngineLog3D.Warning("OpenGL", "GPU timer query allocation returned an invalid native handle; timing telemetry is disabled.");
+            }
+            else if (!ValidateGpuTimerQueryTarget())
+            {
+                DeleteGpuTimerQueries();
+            }
+        }
+        catch (Exception exception)
+        {
+            DeleteGpuTimerQueries();
+            EngineLog3D.Warning("OpenGL", "GPU timer query initialization failed; timing telemetry is disabled.", exception);
+        }
+    }
+
+    private bool ValidateGpuTimerQueryTarget()
+    {
+        if (!GpuTimerQueriesInitialized || _beginQuery is null || _endQuery is null || _getError is null)
+        {
+            return false;
+        }
+
+        var queuedError = DrainGlErrors();
+        if (queuedError != GlNoError)
+        {
+            EngineLog3D.Warning(
+                "OpenGL.TimerQuery",
+                $"Queued GL error {DescribeGlError(queuedError)} was isolated before the timer-query capability probe.");
+        }
+
+        var query = _gpuTimerQueries[0];
+        _beginQuery(GlTimeElapsed, query);
+        var beginError = DrainGlErrors();
+        if (beginError != GlNoError)
+        {
+            EngineLog3D.Information(
+                "OpenGL.TimerQuery",
+                $"GL_TIME_ELAPSED is not supported by this context ({DescribeGlError(beginError)} at glBeginQuery); GPU timing telemetry is disabled.");
+            return false;
+        }
+
+        _endQuery(GlTimeElapsed);
+        var endError = DrainGlErrors();
+        if (endError != GlNoError)
+        {
+            EngineLog3D.Warning(
+                "OpenGL.TimerQuery",
+                $"GL_TIME_ELAPSED probe failed at glEndQuery with {DescribeGlError(endError)}; GPU timing telemetry is disabled.");
+            return false;
+        }
+
+        _gpuTimerPending[0] = true;
+        _gpuTimerNextSlot = 1;
+        EngineLog3D.Information("OpenGL.TimerQuery", "GL_TIME_ELAPSED capability probe succeeded; asynchronous GPU timing is enabled.");
+        return true;
+    }
+
+    private void BeginGpuFrameTimer()
+    {
+        ResolveGpuFrameTimers();
+        if (!GpuTimerQueriesInitialized || _beginQuery is null || _gpuTimerActiveSlot >= 0) return;
+        for (var attempt = 0; attempt < _gpuTimerQueries.Length; attempt++)
+        {
+            var slot = (_gpuTimerNextSlot + attempt) % _gpuTimerQueries.Length;
+            if (_gpuTimerPending[slot]) continue;
+            try
+            {
+                _beginQuery(GlTimeElapsed, _gpuTimerQueries[slot]);
+                _gpuTimerActiveSlot = slot;
+                _gpuTimerNextSlot = (slot + 1) % _gpuTimerQueries.Length;
+            }
+            catch (Exception exception)
+            {
+                DisableGpuTimerQueries("begin query failed", exception);
+            }
+            return;
+        }
+    }
+
+    private void EndGpuFrameTimer()
+    {
+        var slot = _gpuTimerActiveSlot;
+        if (slot < 0) return;
+        _gpuTimerActiveSlot = -1;
+        try
+        {
+            _endQuery?.Invoke(GlTimeElapsed);
+            _gpuTimerPending[slot] = true;
+        }
+        catch (Exception exception)
+        {
+            DisableGpuTimerQueries("end query failed", exception);
+        }
+    }
+
+    private void ResolveGpuFrameTimers()
+    {
+        if (!GpuTimerQueriesInitialized || _getQueryObjectiv is null || _getQueryObjectui64v is null) return;
+        for (var slot = 0; slot < _gpuTimerQueries.Length; slot++)
+        {
+            if (!_gpuTimerPending[slot]) continue;
+            try
+            {
+                _getQueryObjectiv(_gpuTimerQueries[slot], GlQueryResultAvailable, out var available);
+                if (available == 0) continue;
+                _getQueryObjectui64v(_gpuTimerQueries[slot], GlQueryResult, out var nanoseconds);
+                _gpuTimerPending[slot] = false;
+                _lastGpuFrameMilliseconds = nanoseconds / 1_000_000d;
+            }
+            catch (Exception exception)
+            {
+                DisableGpuTimerQueries("query result read failed", exception);
+                return;
+            }
+        }
+    }
+
+    private void DisableGpuTimerQueries(string reason, Exception? exception = null)
+    {
+        DeleteGpuTimerQueries();
+        EngineLog3D.Warning("OpenGL", $"GPU timer telemetry disabled because {reason}.", exception);
+    }
+
+    private void DeleteGpuTimerQueries()
+    {
+        var hasAllocatedQuery = false;
+        for (var i = 0; i < _gpuTimerQueries.Length; i++)
+        {
+            if (_gpuTimerQueries[i] != 0) { hasAllocatedQuery = true; break; }
+        }
+        if (hasAllocatedQuery && _deleteQueries is not null)
+        {
+            try
+            {
+                _deleteQueries(_gpuTimerQueries.Length, _gpuTimerQueries);
+            }
+            catch (Exception exception)
+            {
+                EngineLog3D.Warning("OpenGL", "GPU timer-query deletion failed during telemetry shutdown.", exception);
+            }
+        }
+        Array.Clear(_gpuTimerQueries, 0, _gpuTimerQueries.Length);
+        Array.Clear(_gpuTimerPending, 0, _gpuTimerPending.Length);
+        _gpuTimerActiveSlot = -1;
+        _gpuTimerNextSlot = 0;
+        _lastGpuFrameMilliseconds = double.NaN;
+    }
+
     private int CreateVertexArray()
     {
-        if (!_supportsVertexArrays || _genVertexArrays is null) return 0;
+        if (!_supportsVertexArrays || _genVertexArrays is null) throw new InvalidOperationException("Required OpenGL vertex-array support is unavailable.");
         var arrays = new int[1];
         _genVertexArrays(1, arrays);
+        if (arrays[0] == 0) throw new InvalidOperationException("OpenGL failed to allocate a required vertex array.");
         return arrays[0];
     }
 
@@ -2792,22 +2770,6 @@ internal sealed partial class OpenGlSceneRenderer
         EnableInstanceAttribute(gl, _meshInstanceModel3Location, 4, ParticleBillboardByteStride, 0);
         EnableInstanceAttribute(gl, _meshInstanceColorLocation, 4, ParticleBillboardByteStride, sizeof(float) * 4);
         EnableInstanceAttribute(gl, _meshInstanceStateColorLocation, 4, ParticleBillboardByteStride, sizeof(float) * 4);
-    }
-
-    private void EnableShadowParticleBillboardInstanceAttributes(GlInterface gl)
-    {
-        EnableInstanceAttribute(gl, _shadowInstanceModel0Location, 4, ParticleBillboardByteStride, 0);
-        EnableInstanceAttribute(gl, _shadowInstanceModel1Location, 4, ParticleBillboardByteStride, 0);
-        EnableInstanceAttribute(gl, _shadowInstanceModel2Location, 4, ParticleBillboardByteStride, 0);
-        EnableInstanceAttribute(gl, _shadowInstanceModel3Location, 4, ParticleBillboardByteStride, 0);
-    }
-
-    private void EnableShadowHighScaleInstanceAttributes(GlInterface gl)
-    {
-        EnableInstanceAttribute(gl, _shadowInstanceModel0Location, 4, HighScaleTransformByteStride, 0);
-        EnableInstanceAttribute(gl, _shadowInstanceModel1Location, 4, HighScaleTransformByteStride, sizeof(float) * 4);
-        EnableInstanceAttribute(gl, _shadowInstanceModel2Location, 4, HighScaleTransformByteStride, sizeof(float) * 8);
-        EnableInstanceAttribute(gl, _shadowInstanceModel3Location, 4, HighScaleTransformByteStride, sizeof(float) * 12);
     }
 
     private void EnableHighScaleInstanceAttributes(GlInterface gl, HighScaleGpuBatchData batch)
@@ -2857,15 +2819,6 @@ internal sealed partial class OpenGlSceneRenderer
         ResetInstanceAttributeDivisors();
     }
 
-    private void DisableShadowInstanceAttributes()
-    {
-        DisableAttribute(_shadowInstanceModel0Location);
-        DisableAttribute(_shadowInstanceModel1Location);
-        DisableAttribute(_shadowInstanceModel2Location);
-        DisableAttribute(_shadowInstanceModel3Location);
-        ResetShadowAttributeDivisors();
-    }
-
     private void DisableAttribute(int location)
     {
         if (location < 0 || _disableVertexAttribArray is null) return;
@@ -2891,7 +2844,6 @@ internal sealed partial class OpenGlSceneRenderer
         ConfigureForwardBlendState(gl, false);
         UploadFloat(_uniform1f, _meshUsePartLocalLocation, 1f);
         UploadFloat(_uniform1f, _meshUseHighScaleStateLocation, 1f);
-        UploadFloat(_uniform1f, _meshShadowEnabledLocation, 0f);
     }
 
     private void EndHighScaleDrawState()
@@ -2914,7 +2866,7 @@ internal sealed partial class OpenGlSceneRenderer
             return;
         }
 
-        var visibleChunks = layer.Chunks.QueryVisible(viewProjection);
+        var visibleChunks = layer.QueryVisibleChunks(viewProjection);
         stats.TotalChunkCount += layer.Chunks.Chunks.Count;
         var visibleChunkLimit = SceneHighScaleRenderPlanner3D.ResolveVisibleChunkLimit(scene.Performance, visibleChunks.Count);
         stats.VisibleChunkCount += visibleChunkLimit;
@@ -2961,9 +2913,6 @@ internal sealed partial class OpenGlSceneRenderer
     private static bool UsesDirectHighScaleStateColor(HighScaleInstanceLayer3D layer, CompositePartTemplate3D part, ScenePerformanceOptions performance)
         => !(performance.EnableHighScalePaletteTexture && part.UsesVertexMaterialSlots && layer.ColorResolver is null);
 
-    private static bool ShouldUseHighScaleLegacySafePath(int instanceCount)
-        => instanceCount > 0 && instanceCount <= StableHighScaleLegacyInstanceThreshold;
-
     private void DrawHighScaleAggregateLod(
         GlInterface gl,
         HighScaleInstanceLayer3D layer,
@@ -2976,11 +2925,7 @@ internal sealed partial class OpenGlSceneRenderer
         if (instanceIndices.Count == 0) return;
 
         var parts = layer.Template.ResolveParts(lod);
-        if (!CanUseInstancedDrawPath || ShouldUseHighScaleLegacySafePath(instanceIndices.Count))
-        {
-            DrawHighScaleLegacyLod(gl, layer, parts, instanceIndices, cameraPosition, performance, stats, startPartIndex: 0);
-            return;
-        }
+        RequireInstancedDrawPath("aggregate high-scale meshes");
 
         for (var partIndex = 0; partIndex < parts.Count; partIndex++)
         {
@@ -2994,16 +2939,23 @@ internal sealed partial class OpenGlSceneRenderer
 
             var meshResource = EnsureMeshResource(gl, part.Mesh.ResourceKey, part.Mesh.GeometryVersion, part.Mesh, stats);
             BindMeshAttributes(gl, meshResource);
-            EnableHighScaleInstanceAttributes(gl, batch);
             UploadHighScalePalette(gl, layer, part, performance, directStateColor, stats);
             UploadMatrix(_uniformMatrix4fv, _meshPartLocalLocation, part.LocalTransform, _matrixUploadBuffer);
-            UploadHighScaleMaterial(part.LightingMode);
-            var highScaleDrawn = TryDrawElementsInstanced(gl, meshResource.IndexCount, meshResource.IndexType, batch.InstanceCount, part.Mesh.ResourceKey, "highscale-aggregate");
+            UploadHighScaleMaterial(gl, part.LightingMode);
+            var validate = BeginInstancedDrawValidation(part.Mesh.ResourceKey, "highscale-aggregate");
+            if (!PrepareValidatedInstancedDrawState(gl, meshResource, _meshProgram, part.Mesh.ResourceKey, "highscale-aggregate", validate))
+                throw CreateInstancingFailure("aggregate high-scale meshes");
+            EnableHighScaleInstanceAttributes(gl, batch);
+            if (!ValidateInstancedOperation("instance attribute setup", part.Mesh.ResourceKey, "highscale-aggregate", validate))
+            {
+                DisableInstanceAttributes();
+                throw CreateInstancingFailure("aggregate high-scale meshes");
+            }
+            var highScaleDrawn = TryDrawElementsInstanced(meshResource.IndexCount, meshResource.IndexType, batch.InstanceCount, part.Mesh.ResourceKey, "highscale-aggregate", validate);
             DisableInstanceAttributes();
             if (!highScaleDrawn)
             {
-                DrawHighScaleLegacyLod(gl, layer, parts, instanceIndices, cameraPosition, performance, stats, partIndex);
-                return;
+                throw CreateInstancingFailure("aggregate high-scale meshes");
             }
 
             stats.DrawCallCount++;
@@ -3029,11 +2981,7 @@ internal sealed partial class OpenGlSceneRenderer
         if (instanceIndices.Count == 0) return;
 
         var parts = layer.Template.ResolveParts(lod);
-        if (!CanUseInstancedDrawPath || ShouldUseHighScaleLegacySafePath(instanceIndices.Count))
-        {
-            DrawHighScaleLegacyLod(gl, layer, parts, instanceIndices, cameraPosition, performance, stats, startPartIndex: 0);
-            return;
-        }
+        RequireInstancedDrawPath("high-scale meshes");
 
         for (var partIndex = 0; partIndex < parts.Count; partIndex++)
         {
@@ -3047,16 +2995,23 @@ internal sealed partial class OpenGlSceneRenderer
 
             var meshResource = EnsureMeshResource(gl, part.Mesh.ResourceKey, part.Mesh.GeometryVersion, part.Mesh, stats);
             BindMeshAttributes(gl, meshResource);
-            EnableHighScaleInstanceAttributes(gl, batch);
             UploadHighScalePalette(gl, layer, part, performance, directStateColor, stats);
             UploadMatrix(_uniformMatrix4fv, _meshPartLocalLocation, part.LocalTransform, _matrixUploadBuffer);
-            UploadHighScaleMaterial(part.LightingMode);
-            var highScaleDrawn = TryDrawElementsInstanced(gl, meshResource.IndexCount, meshResource.IndexType, batch.InstanceCount, part.Mesh.ResourceKey, "highscale");
+            UploadHighScaleMaterial(gl, part.LightingMode);
+            var validate = BeginInstancedDrawValidation(part.Mesh.ResourceKey, "highscale");
+            if (!PrepareValidatedInstancedDrawState(gl, meshResource, _meshProgram, part.Mesh.ResourceKey, "highscale", validate))
+                throw CreateInstancingFailure("high-scale meshes");
+            EnableHighScaleInstanceAttributes(gl, batch);
+            if (!ValidateInstancedOperation("instance attribute setup", part.Mesh.ResourceKey, "highscale", validate))
+            {
+                DisableInstanceAttributes();
+                throw CreateInstancingFailure("high-scale meshes");
+            }
+            var highScaleDrawn = TryDrawElementsInstanced(meshResource.IndexCount, meshResource.IndexType, batch.InstanceCount, part.Mesh.ResourceKey, "highscale", validate);
             DisableInstanceAttributes();
             if (!highScaleDrawn)
             {
-                DrawHighScaleLegacyLod(gl, layer, parts, instanceIndices, cameraPosition, performance, stats, partIndex);
-                return;
+                throw CreateInstancingFailure("high-scale meshes");
             }
 
             stats.DrawCallCount++;
@@ -3066,59 +3021,6 @@ internal sealed partial class OpenGlSceneRenderer
             stats.HighScaleVisiblePartInstanceCount += batch.InstanceCount;
             if (part.UsesVertexMaterialSlots) stats.BakedHighScalePartDraws++;
             stats.TriangleCount += (part.Mesh.Indices.Length / 3) * batch.InstanceCount;
-        }
-    }
-
-    private void DrawHighScaleLegacyLod(
-        GlInterface gl,
-        HighScaleInstanceLayer3D layer,
-        IReadOnlyList<CompositePartTemplate3D> parts,
-        List<int> instanceIndices,
-        Vector3 cameraPosition,
-        ScenePerformanceOptions performance,
-        RenderStats stats,
-        int startPartIndex)
-    {
-        UploadFloat(_uniform1f, _meshUseInstancingLocation, 0f);
-        UploadFloat(_uniform1f, _meshUseHighScaleStateLocation, 0f);
-        UploadFloat(_uniform1f, _meshUsePaletteTextureLocation, 0f);
-        UploadFloat(_uniform1f, _meshUseDirectStateColorLocation, 0f);
-        UploadFloat(_uniform1f, _meshUsePartLocalLocation, 1f);
-        UploadFloat(_uniform1f, _meshParticleBillboardLocation, 0f);
-        UploadFloat(_uniform1f, _meshSkinningEnabledLocation, 0f);
-        DisableInstanceAttributes();
-
-        var dynamicFadeState = performance.EnableHighScaleDynamicFadeState;
-        for (var partIndex = System.Math.Max(0, startPartIndex); partIndex < parts.Count; partIndex++)
-        {
-            var part = parts[partIndex];
-            var meshResource = EnsureMeshResource(gl, part.Mesh.ResourceKey, part.Mesh.GeometryVersion, part.Mesh, stats);
-            BindMeshAttributes(gl, meshResource);
-            UploadMatrix(_uniformMatrix4fv, _meshPartLocalLocation, part.LocalTransform, _matrixUploadBuffer);
-            UploadHighScaleMaterial(part.LightingMode);
-
-            for (var i = 0; i < instanceIndices.Count; i++)
-            {
-                var instanceIndex = instanceIndices[i];
-                if ((uint)instanceIndex >= (uint)layer.Instances.Count) continue;
-                var record = layer.Instances[instanceIndex];
-                if (!IsHighScaleVisible(record)) continue;
-
-                var alpha = ResolveHighScaleStateAlpha(layer, record, cameraPosition, dynamicFadeState);
-                if (alpha <= 0f) continue;
-
-                var color = layer.ResolveColor(part, record);
-                UploadMatrix(_uniformMatrix4fv, _meshModelLocation, record.Transform, _matrixUploadBuffer);
-                UploadColor(_uniform4f, _meshColorLocation, new ColorRgba(color.R, color.G, color.B, color.A * alpha));
-                gl.DrawElements(GlTriangles, meshResource.IndexCount, meshResource.IndexType, IntPtr.Zero);
-
-                stats.DrawCallCount++;
-                stats.EstimatedDrawCallCount++;
-                stats.VisibleMeshCount++;
-                stats.HighScaleVisiblePartInstanceCount++;
-                stats.TriangleCount += part.Mesh.Indices.Length / 3;
-                if (part.UsesVertexMaterialSlots) stats.BakedHighScalePartDraws++;
-            }
         }
     }
 
@@ -3139,8 +3041,8 @@ internal sealed partial class OpenGlSceneRenderer
         {
             batch = new HighScaleGpuBatchData
             {
-                TransformBuffer = gl.GenBuffer(),
-                StateBuffer = gl.GenBuffer()
+                TransformBuffer = GenRequiredBuffer(gl, $"high-scale:{layer.Id}:transforms"),
+                StateBuffer = GenRequiredBuffer(gl, $"high-scale:{layer.Id}:state")
             };
             _highScaleGpuBatches[key] = batch;
         }
@@ -3168,16 +3070,11 @@ internal sealed partial class OpenGlSceneRenderer
             if (changed > 0)
             {
                 gl.BindBuffer(GlArrayBuffer, batch.TransformBuffer);
-                if (_bufferSubData is not null && batch.TransformBufferCapacityBytes >= batch.TransformFloatCount * sizeof(float))
-                {
-                    UploadFloatsSubData(GlArrayBuffer, 0, batch.TransformData, 0, batch.TransformFloatCount);
-                }
-                else
-                {
-                    UploadFloats(gl, GlArrayBuffer, batch.TransformData, batch.TransformFloatCount, GlDynamicDraw);
-                    batch.TransformBufferCapacityBytes = batch.TransformFloatCount * sizeof(float);
-                    stats.InstanceBufferUploads++;
-                }
+                // Every transform in this retained batch was rewritten. Orphaning the store
+                // avoids waiting for native GPU reads from the previous frame.
+                UploadFloats(gl, GlArrayBuffer, batch.TransformData, batch.TransformFloatCount, GlDynamicDraw);
+                batch.TransformBufferCapacityBytes = batch.TransformFloatCount * sizeof(float);
+                stats.InstanceBufferUploads++;
 
                 stats.InstanceUploadBytes += batch.TransformFloatCount * sizeof(float);
                 stats.TransformUploadBytes += batch.TransformFloatCount * sizeof(float);
@@ -3298,6 +3195,12 @@ internal sealed partial class OpenGlSceneRenderer
             // Decide full-vs-partial per batch after we know how many dirty instances
             // actually belong to this batch. This is the core fix for 10k/50k telemetry.
             forceFullUpdate = batch.DirtyOffsetCount > System.Math.Max(32, batch.InstanceCount / 3);
+            if (!forceFullUpdate && batch.DirtyOffsetCount > 0)
+            {
+                batch.SortDirtyOffsets();
+                var mergeGap = System.Math.Max(0, performance.HighScalePartialStateMergeGap);
+                forceFullUpdate = CountHighScaleDirtyRanges(batch, mergeGap) > MaxPartialHighScaleUploadRanges;
+            }
         }
 
         if (forceFullUpdate)
@@ -3310,24 +3213,15 @@ internal sealed partial class OpenGlSceneRenderer
             }
 
             gl.BindBuffer(GlArrayBuffer, batch.StateBuffer);
-            if (_bufferSubData is not null && batch.StateBufferCapacityBytes >= batch.StateFloatCount * sizeof(float))
-            {
-                UploadFloatsSubData(GlArrayBuffer, 0, batch.StateData, 0, batch.StateFloatCount);
-                stats.StateBufferSubDataUploads++;
-            }
-            else
-            {
-                UploadFloats(gl, GlArrayBuffer, batch.StateData, batch.StateFloatCount, GlDynamicDraw);
-                batch.StateBufferCapacityBytes = batch.StateFloatCount * sizeof(float);
-                stats.StateBufferUploads++;
-            }
+            UploadFloats(gl, GlArrayBuffer, batch.StateData, batch.StateFloatCount, GlDynamicDraw);
+            batch.StateBufferCapacityBytes = batch.StateFloatCount * sizeof(float);
+            stats.StateBufferUploads++;
 
             stats.StateUploadBytes += batch.StateFloatCount * sizeof(float);
         }
         else if (batch.DirtyOffsetCount > 0)
         {
             gl.BindBuffer(GlArrayBuffer, batch.StateBuffer);
-            batch.SortDirtyOffsets();
 
             var mergeGap = System.Math.Max(0, performance.HighScalePartialStateMergeGap);
             var rangeStart = batch.GetDirtyOffsetAt(0);
@@ -3357,6 +3251,25 @@ internal sealed partial class OpenGlSceneRenderer
         batch.FadeVersion = fadeVersion;
     }
 
+    private static int CountHighScaleDirtyRanges(HighScaleGpuBatchData batch, int mergeGap)
+    {
+        if (batch.DirtyOffsetCount == 0) return 0;
+        var rangeCount = 1;
+        var previous = batch.GetDirtyOffsetAt(0);
+        for (var i = 1; i < batch.DirtyOffsetCount; i++)
+        {
+            var current = batch.GetDirtyOffsetAt(i);
+            if (current <= previous + 1 + mergeGap)
+            {
+                previous = current;
+                continue;
+            }
+            if (++rangeCount > MaxPartialHighScaleUploadRanges) return rangeCount;
+            previous = current;
+        }
+        return rangeCount;
+    }
+
     private void UploadHighScalePalette(GlInterface gl, HighScaleInstanceLayer3D layer, CompositePartTemplate3D part, ScenePerformanceOptions performance, bool directStateColor, RenderStats stats)
     {
         UploadFloat(_uniform1f, _meshUseDirectStateColorLocation, directStateColor ? 1f : 0f);
@@ -3364,9 +3277,9 @@ internal sealed partial class OpenGlSceneRenderer
         {
             var palette = EnsureHighScalePaletteTexture(gl, layer, part);
             UploadFloat(_uniform1f, _meshUsePaletteTextureLocation, 1f);
-            gl.ActiveTexture(GlTexture1);
+            gl.ActiveTexture(GlTexture0);
             gl.BindTexture(GlTexture2D, palette.TextureId);
-            if (_meshPaletteTextureLocation >= 0) _uniform1i?.Invoke(_meshPaletteTextureLocation, 1);
+            if (_meshPaletteTextureLocation >= 0) _uniform1i?.Invoke(_meshPaletteTextureLocation, 0);
             UploadFloat(_uniform1f, _meshPaletteWidthLocation, palette.Width);
             UploadFloat(_uniform1f, _meshPaletteHeightLocation, palette.Height);
             gl.ActiveTexture(GlTexture0);
@@ -3399,7 +3312,7 @@ internal sealed partial class OpenGlSceneRenderer
 
         if (cached is null)
         {
-            cached = new HighScalePaletteTextureResource { TextureId = gl.GenTexture() };
+            cached = new HighScalePaletteTextureResource { TextureId = GenRequiredTexture(gl, $"high-scale:{layer.Id}:palette") };
             _highScalePaletteTextures[key] = cached;
         }
 
@@ -3425,7 +3338,7 @@ internal sealed partial class OpenGlSceneRenderer
 
         fixed (byte* ptr = _paletteUploadBuffer)
         {
-            gl.ActiveTexture(GlTexture1);
+            gl.ActiveTexture(GlTexture0);
             gl.BindTexture(GlTexture2D, cached.TextureId);
             gl.TexParameteri(GlTexture2D, GlTextureMinFilter, GlNearest);
             gl.TexParameteri(GlTexture2D, GlTextureMagFilter, GlNearest);
@@ -3498,6 +3411,8 @@ internal sealed partial class OpenGlSceneRenderer
         var scene = plan.Frame.Scene;
         if (!scene.Debug.ShowWireframeOverlay && !scene.Debug.ShowSilhouetteOverlay) return;
 
+        ApplyCullMode(gl, CullMode.None);
+
         var viewProjection = plan.Frame.ViewProjection;
         gl.UseProgram(_meshProgram);
         UploadMatrix(_uniformMatrix4fv, _meshViewProjLocation, viewProjection, _matrixUploadBuffer);
@@ -3505,7 +3420,6 @@ internal sealed partial class OpenGlSceneRenderer
         UploadFloat(_uniform1f, _meshUsePartLocalLocation, 0f);
         UploadFloat(_uniform1f, _meshUseHighScaleStateLocation, 0f);
         UploadFloat(_uniform1f, _meshUsePaletteTextureLocation, 0f);
-        UploadFloat(_uniform1f, _meshShadowEnabledLocation, 0f);
         UploadFloat(_uniform1f, _meshLightingEnabledLocation, 0f);
         UploadFloat(_uniform1f, _meshNormalMapStrengthLocation, 0f);
         UploadVector4(_uniform4f, _meshPostProcessParamsLocation, Vector4.Zero);
@@ -3524,6 +3438,7 @@ internal sealed partial class OpenGlSceneRenderer
 
                 var resource = EnsureMeshResource(gl, mesh.ResourceKey, mesh.GeometryVersion, mesh, stats);
                 BindMeshAttributes(gl, resource);
+                EnsureWireframeResource(gl, resource, mesh.RenderGeometry, mesh.GeometryVersion, stats);
                 gl.BindBuffer(GlElementArrayBuffer, resource.WireframeIndexBuffer);
                 UploadMatrix(_uniformMatrix4fv, _meshModelLocation, item.Model, _matrixUploadBuffer);
                 if (scene.Debug.ShowWireframeOverlay)
@@ -3541,6 +3456,10 @@ internal sealed partial class OpenGlSceneRenderer
                     stats.SilhouetteOverlayDrawCalls++;
                     stats.DrawCallCount++;
                 }
+
+                // Element-array binding is VAO state. Restore the triangle buffer so enabling
+                // an overlay cannot make the next retained frame draw line indices as triangles.
+                gl.BindBuffer(GlElementArrayBuffer, resource.IndexBuffer);
             }
         }
     }
@@ -3553,8 +3472,9 @@ internal sealed partial class OpenGlSceneRenderer
         ControlPlaneRenderPlanner3D.Build(plan.Frame.Snapshot, scene.Camera, planes);
         if (planes.Count == 0) return;
 
-        if (_controlVertexArray != 0) BindVertexArray(_controlVertexArray);
-        else BindVertexArray(0);
+        ApplyCullMode(gl, CullMode.None);
+
+        BindVertexArray(_controlVertexArray);
         gl.Enable(GlBlend);
         _blendFunc?.Invoke(GlSrcAlpha, GlOneMinusSrcAlpha);
         _depthMask?.Invoke(0);
@@ -3574,14 +3494,10 @@ internal sealed partial class OpenGlSceneRenderer
             gl.BindTexture(GlTexture2D, texture.TextureId);
             gl.BindBuffer(GlArrayBuffer, _controlVertexBuffer);
             UploadFloats(gl, GlArrayBuffer, _controlVertexData, _controlVertexData.Length, GlDynamicDraw);
-            if (_controlVertexArray == 0)
-            {
-                gl.BindBuffer(GlElementArrayBuffer, _controlIndexBuffer);
-                gl.EnableVertexAttribArray(_texturePositionLocation);
-                gl.VertexAttribPointer(_texturePositionLocation, 3, GlFloat, 0, sizeof(float) * 5, IntPtr.Zero);
-                gl.EnableVertexAttribArray(_textureUvLocation);
-                gl.VertexAttribPointer(_textureUvLocation, 2, GlFloat, 0, sizeof(float) * 5, new IntPtr(sizeof(float) * 3));
-            }
+            _rhiDevice?.Resources.RegisterBuffer(
+                "utility:control:vertices",
+                new RhiBufferDescriptor3D(_controlVertexData.LongLength * sizeof(float), RhiBufferUsage3D.Vertex | RhiBufferUsage3D.Dynamic, sizeof(float) * 5),
+                _rhiDevice.FrameIndex);
             gl.DrawElements(GlTriangles, 6, GlUnsignedShort, IntPtr.Zero);
             stats.ControlPlaneCount++;
             stats.DrawCallCount++;
@@ -3590,49 +3506,72 @@ internal sealed partial class OpenGlSceneRenderer
         _disable?.Invoke(GlBlend);
     }
 
-    private MeshGpuResource EnsureMeshResource(GlInterface gl, string id, int geometryVersion, Mesh3D mesh, RenderStats stats)
+    private MeshGpuResource EnsureMeshResource(GlInterface gl, string id, long geometryVersion, Mesh3D mesh, RenderStats stats)
     {
         var geometry = mesh.RenderGeometry;
-        var uploadUsage = geometry.HasSkinWeights || id.Contains(":cpu-skin:", StringComparison.Ordinal) ? GlDynamicDraw : GlStaticDraw;
+        const int uploadUsage = GlStaticDraw;
         if (_meshResources.TryGetValue(id, out var resource))
         {
             if (resource.GeometryVersion == geometryVersion) return resource;
-            if (resource.VertexCount == geometry.Positions.Length &&
-                resource.IndexCount == geometry.Indices.Length &&
-                resource.WireframeIndexCount == geometry.WireframeIndices.Length)
+            if (resource.VertexCount == geometry.VertexCount &&
+                resource.IndexCount == geometry.IndexCount)
             {
+                if (resource.WireframeIndexBuffer != 0)
+                {
+                    gl.DeleteBuffer(resource.WireframeIndexBuffer);
+                    resource.WireframeIndexBuffer = 0;
+                }
                 UploadMeshResourceData(gl, resource, mesh, uploadUsage);
                 ConfigureMeshVertexArray(gl, resource);
                 UpdateMeshResourceCounters(resource, geometry, geometryVersion);
+                RegisterMeshResources(id, geometry);
                 AddMeshUploadStats(stats, geometry);
                 return resource;
             }
 
-            DisposeMeshResource(gl, resource);
+            DisposeMeshResource(gl, id, resource);
         }
 
         resource = new MeshGpuResource
         {
+            LogicalKey = id,
             GeometryVersion = geometryVersion,
             VertexArray = CreateVertexArray(),
-            VertexBuffer = gl.GenBuffer(),
-            IndexBuffer = gl.GenBuffer(),
-            WireframeIndexBuffer = gl.GenBuffer()
+            VertexBuffer = GenRequiredBuffer(gl, $"mesh:{id}:vertices"),
+            IndexBuffer = GenRequiredBuffer(gl, $"mesh:{id}:indices")
         };
         UploadMeshResourceData(gl, resource, mesh, uploadUsage);
         ConfigureMeshVertexArray(gl, resource);
         UpdateMeshResourceCounters(resource, geometry, geometryVersion);
+        RegisterMeshResources(id, geometry);
         _meshResources[id] = resource;
         AddMeshUploadStats(stats, geometry);
         return resource;
     }
 
-    private static void UpdateMeshResourceCounters(MeshGpuResource resource, RenderGeometry3D geometry, int geometryVersion)
+    private void RegisterMeshResources(string id, RenderGeometry3D geometry)
+    {
+        var resources = _rhiDevice?.Resources ?? throw new InvalidOperationException("OpenGL RHI device is not initialized.");
+        var vertexBytes = EstimateInterleavedVertexUploadBytes(geometry);
+        resources.RegisterBuffer(
+            $"mesh:{id}:vertex",
+            new RhiBufferDescriptor3D(vertexBytes, RhiBufferUsage3D.Vertex, geometry.Layout.StrideBytes),
+            geometry.GeometryVersion);
+        resources.RegisterBuffer(
+            $"mesh:{id}:index",
+            new RhiBufferDescriptor3D(geometry.EstimatedIndexUploadBytes, RhiBufferUsage3D.Index, geometry.Indices.ElementSizeBytes),
+            geometry.GeometryVersion);
+        resources.Release($"mesh:{id}:wireframe-index", RhiResourceKind3D.Buffer);
+        resources.RegisterAllocation($"mesh:{id}:vao-main", RhiResourceKind3D.VertexArray, 0, geometry.GeometryVersion);
+    }
+
+    private static void UpdateMeshResourceCounters(MeshGpuResource resource, RenderGeometry3D geometry, long geometryVersion)
     {
         resource.GeometryVersion = geometryVersion;
-        resource.VertexCount = geometry.Positions.Length;
-        resource.IndexCount = geometry.Indices.Length;
-        resource.WireframeIndexCount = geometry.WireframeIndices.Length;
+        resource.VertexCount = geometry.VertexCount;
+        resource.IndexCount = geometry.IndexCount;
+        resource.WireframeGeometryVersion = 0;
+        resource.WireframeIndexCount = 0;
         resource.VertexUploadBytes = EstimateInterleavedVertexUploadBytes(geometry);
         resource.IndexUploadBytes = geometry.EstimatedIndexUploadBytes;
     }
@@ -3642,171 +3581,226 @@ internal sealed partial class OpenGlSceneRenderer
         stats.DirtyMeshUploads++;
         stats.RenderGeometryCount++;
         stats.VertexBufferUploadCount += 1;
-        stats.IndexBufferUploadCount += 2;
+        stats.IndexBufferUploadCount += 1;
         var vertexUploadBytes = EstimateInterleavedVertexUploadBytes(geometry);
         stats.VertexBufferUploadBytes += vertexUploadBytes;
         stats.IndexBufferUploadBytes += geometry.EstimatedIndexUploadBytes;
         stats.MeshUploadBytes += vertexUploadBytes + geometry.EstimatedIndexUploadBytes;
-        stats.TangentUploadBytes += geometry.HasTangents ? geometry.Tangents.LongLength * sizeof(float) * 4L : 0L;
-        stats.WireframeIndexUploadBytes += geometry.EstimatedWireframeIndexUploadBytes;
+        var tangentAttribute = geometry.Layout.Find(VertexAttributeKind3D.Tangent);
+        stats.TangentUploadBytes += tangentAttribute.HasValue ? (long)geometry.VertexCount * tangentAttribute.Value.ByteCount : 0L;
         if (geometry.HasTangentSpace) stats.TangentSpaceMeshCount++;
     }
 
     private static void UploadMeshResourceData(GlInterface gl, MeshGpuResource resource, Mesh3D mesh, int usage)
     {
         var geometry = mesh.RenderGeometry;
-        var vertexFloatCount = geometry.Positions.Length * MeshVertexFloatStride;
-        var interleaved = ArrayPool<float>.Shared.Rent(vertexFloatCount);
-        try
-        {
-            BuildInterleavedVertexData(mesh, interleaved);
-            gl.BindBuffer(GlArrayBuffer, resource.VertexBuffer);
-            UploadFloats(gl, GlArrayBuffer, interleaved, vertexFloatCount, usage);
-            gl.BindBuffer(GlElementArrayBuffer, resource.IndexBuffer);
-            UploadIndices(gl, GlElementArrayBuffer, geometry.Indices, usage, out var indexType);
-            resource.IndexType = indexType;
-            gl.BindBuffer(GlElementArrayBuffer, resource.WireframeIndexBuffer);
-            UploadIndices(gl, GlElementArrayBuffer, geometry.WireframeIndices, usage, out var wireframeIndexType);
-            resource.WireframeIndexType = wireframeIndexType;
-        }
-        finally
-        {
-            ArrayPool<float>.Shared.Return(interleaved);
-        }
+        var interleaved = geometry.GetInterleavedVertexBuffer();
+        gl.BindBuffer(GlArrayBuffer, resource.VertexBuffer);
+        UploadBytes(gl, GlArrayBuffer, interleaved.Storage, usage);
+        resource.Layout = interleaved.Layout;
+        gl.BindBuffer(GlElementArrayBuffer, resource.IndexBuffer);
+        UploadIndices(gl, GlElementArrayBuffer, geometry.Indices, usage, out var indexType);
+        resource.IndexType = indexType;
     }
 
     private static long EstimateInterleavedVertexUploadBytes(RenderGeometry3D geometry)
-        => geometry.Positions.LongLength * MeshVertexFloatStride * sizeof(float);
+        => geometry.GetInterleavedVertexBuffer().ByteCount;
 
-    private static void BuildInterleavedVertexData(Mesh3D mesh, float[] data)
+    private void EnsureWireframeResource(GlInterface gl, MeshGpuResource resource, RenderGeometry3D geometry, long geometryVersion, RenderStats stats)
     {
-        var geometry = mesh.RenderGeometry;
-        var vertexCount = geometry.Positions.Length;
-        var normals = geometry.HasNormals ? geometry.Normals : GetNormalsOrDefault(mesh);
-        var texCoords = geometry.HasTexCoords0 ? geometry.TexCoords0 : null;
-        var tangents = geometry.HasTangents ? geometry.Tangents : null;
-        var colors = geometry.HasColors0 ? geometry.Colors0 : null;
-        var materialSlots = geometry.HasMaterialSlots ? geometry.MaterialSlots : null;
-        var boneIndices = geometry.HasSkinWeights ? geometry.BoneIndices0 : null;
-        var boneWeights = geometry.HasSkinWeights ? geometry.BoneWeights0 : null;
-
-        for (var i = 0; i < vertexCount; i++)
-        {
-            var offset = i * MeshVertexFloatStride;
-            var position = geometry.Positions[i];
-            var normal = normals[i];
-            var texCoord = texCoords is not null ? texCoords[i] : Vector2.Zero;
-            var tangent = tangents is not null ? tangents[i] : new Vector4(1f, 0f, 0f, 1f);
-            var color = colors is not null ? colors[i] : ColorRgba.White;
-            var materialSlot = materialSlots is not null ? materialSlots[i] : 0f;
-            var boneIndex = boneIndices is not null ? boneIndices[i] : Vector4.Zero;
-            var boneWeight = boneWeights is not null ? boneWeights[i] : new Vector4(1f, 0f, 0f, 0f);
-
-            data[offset] = position.X;
-            data[offset + 1] = position.Y;
-            data[offset + 2] = position.Z;
-            data[offset + 3] = normal.X;
-            data[offset + 4] = normal.Y;
-            data[offset + 5] = normal.Z;
-            data[offset + 6] = texCoord.X;
-            data[offset + 7] = texCoord.Y;
-            data[offset + 8] = tangent.X;
-            data[offset + 9] = tangent.Y;
-            data[offset + 10] = tangent.Z;
-            data[offset + 11] = tangent.W;
-            data[offset + 12] = color.R;
-            data[offset + 13] = color.G;
-            data[offset + 14] = color.B;
-            data[offset + 15] = color.A;
-            data[offset + 16] = materialSlot;
-            data[offset + 17] = boneIndex.X;
-            data[offset + 18] = boneIndex.Y;
-            data[offset + 19] = boneIndex.Z;
-            data[offset + 20] = boneIndex.W;
-            data[offset + 21] = boneWeight.X;
-            data[offset + 22] = boneWeight.Y;
-            data[offset + 23] = boneWeight.Z;
-            data[offset + 24] = boneWeight.W;
-        }
-
+        if (resource.WireframeGeometryVersion == geometryVersion && resource.WireframeIndexCount > 0) return;
+        if (resource.WireframeIndexBuffer == 0) resource.WireframeIndexBuffer = GenRequiredBuffer(gl, $"mesh:{resource.LogicalKey}:wireframe-indices");
+        var wireframe = geometry.WireframeIndices;
+        gl.BindBuffer(GlElementArrayBuffer, resource.WireframeIndexBuffer);
+        UploadIndices(gl, GlElementArrayBuffer, wireframe, GlStaticDraw, out var indexType);
+        resource.WireframeGeometryVersion = geometryVersion;
+        resource.WireframeIndexCount = wireframe.Count;
+        resource.WireframeIndexType = indexType;
+        _rhiDevice?.Resources.RegisterBuffer(
+            $"mesh:{resource.LogicalKey}:wireframe-index",
+            new RhiBufferDescriptor3D(wireframe.ByteCount, RhiBufferUsage3D.Index, wireframe.ElementSizeBytes),
+            geometryVersion);
+        stats.IndexBufferUploadCount++;
+        stats.WireframeIndexUploadBytes += wireframe.ByteCount;
     }
 
-    private unsafe MaterialTextureResource? EnsureMaterialTexture(GlInterface gl, string? key, byte[]? data, int version, int textureUnit, RenderStats stats)
+    private unsafe MaterialTextureResource? EnsureMaterialTexture(GlInterface gl, TextureResource3D? texture, int textureUnit, RenderStats stats)
     {
-        if (string.IsNullOrWhiteSpace(key) || data is not { Length: > 0 }) return null;
-        if (_materialTextures.TryGetValue(key, out var resource) && resource.Version == version) return resource;
-
-        if (!TextureDecodeHelper3D.TryDecodeRgba(data, out var decoded, out _)) return null;
-        if (resource is null)
+        if (texture is null) return null;
+        var key = texture.ResourceKey;
+        if (_materialTextures.TryGetValue(key, out var resource))
         {
-            resource = new MaterialTextureResource { TextureId = gl.GenTexture(), Version = -1 };
-            _materialTextures[key] = resource;
+            if (resource.ContentVersion != texture.ContentVersion)
+                throw new InvalidOperationException($"Immutable texture identity collision for '{key}'.");
+            return resource;
+        }
+        if (_deferredMaterialTextureReleases.TryCancel(candidate => string.Equals(candidate.PhysicalKey, key, StringComparison.Ordinal), out resource))
+        {
+            if (resource.ContentVersion != texture.ContentVersion)
+                throw new InvalidOperationException($"Deferred immutable texture identity collision for '{key}'.");
+            _materialTextures.Add(key, resource);
+            return resource;
         }
 
-        fixed (byte* ptr = decoded.RgbaPixels)
+        if (!TextureDecodeHelper3D.TryDecodeRgba(texture.EncodedDataInternal, out var decoded, out var error))
+            throw new InvalidOperationException($"Texture '{texture.LogicalKey}' ({texture.ContentHash}) could not be decoded: {error}. Missing GPU texture data is not rendered through a fallback material.");
+        var descriptor = new RhiTextureDescriptor3D(decoded.Width, decoded.Height, RhiTextureFormat3D.Rgba8Unorm, RhiTextureUsage3D.Sampled);
+        var device = _rhiDevice ?? throw new InvalidOperationException("OpenGL RHI device is not initialized.");
+        device.ValidateTexture(descriptor, $"texture '{texture.LogicalKey}'");
+        device.Resources.ValidateTextureRegistration(key, descriptor, texture.ContentVersion);
+        resource = new MaterialTextureResource
         {
-            gl.ActiveTexture(textureUnit);
-            gl.BindTexture(GlTexture2D, resource.TextureId);
-            gl.TexParameteri(GlTexture2D, GlTextureMinFilter, GlLinear);
-            gl.TexParameteri(GlTexture2D, GlTextureMagFilter, GlLinear);
-            gl.TexParameteri(GlTexture2D, GlTextureWrapS, GlClampToEdge);
-            gl.TexParameteri(GlTexture2D, GlTextureWrapT, GlClampToEdge);
-            gl.TexImage2D(GlTexture2D, 0, GlRgba, decoded.Width, decoded.Height, 0, GlRgba, GlUnsignedByte, (IntPtr)ptr);
-            gl.ActiveTexture(GlTexture0);
-            resource.Version = version;
-            resource.Width = decoded.Width;
-            resource.Height = decoded.Height;
-            stats.DirtyTextureUploads++;
-            stats.TextureUploadBytes += decoded.ByteLength;
-        }
+            ContentVersion = texture.ContentVersion,
+            PhysicalKey = key
+        };
+        RhiResourceHandle3D handle = default;
 
-        return resource;
+        try
+        {
+            resource.TextureId = GenRequiredTexture(gl, key);
+            fixed (byte* ptr = decoded.RgbaPixels)
+            {
+                gl.ActiveTexture(textureUnit);
+                gl.BindTexture(GlTexture2D, resource.TextureId);
+                gl.TexParameteri(GlTexture2D, GlTextureMinFilter, GlLinear);
+                gl.TexParameteri(GlTexture2D, GlTextureMagFilter, GlLinear);
+                gl.TexParameteri(GlTexture2D, GlTextureWrapS, GlClampToEdge);
+                gl.TexParameteri(GlTexture2D, GlTextureWrapT, GlClampToEdge);
+                gl.TexImage2D(GlTexture2D, 0, GlRgba, decoded.Width, decoded.Height, 0, GlRgba, GlUnsignedByte, (IntPtr)ptr);
+                gl.ActiveTexture(GlTexture0);
+                resource.Width = decoded.Width;
+                resource.Height = decoded.Height;
+                stats.DirtyTextureUploads++;
+                stats.TextureUploadBytes += decoded.ByteLength;
+            }
+            handle = device.Resources.RegisterTexture(key, descriptor, texture.ContentVersion, _rhiResourceOwnerId);
+            resource.RhiHandle = handle;
+            _materialTextures.Add(key, resource);
+            return resource;
+        }
+        catch
+        {
+            if (resource.TextureId != 0) resource.Dispose(gl);
+            if (handle.IsValid) device.Resources.ReleaseOwner(handle, _rhiResourceOwnerId);
+            throw;
+        }
+    }
+
+    private void DrainDeferredMaterialTextureReleases(GlInterface gl, long completedFrame)
+        => _deferredMaterialTextureReleases.DrainReady(completedFrame, texture => ReleaseMaterialTextureNow(gl, texture));
+
+    private void ReleaseMaterialTextureNow(GlInterface gl, MaterialTextureResource texture)
+    {
+        texture.Dispose(gl);
+        if (texture.RhiHandle.IsValid) _rhiDevice?.Resources.ReleaseOwner(texture.RhiHandle, _rhiResourceOwnerId);
+    }
+
+    private void DrainDeferredControlTextureReleases(GlInterface gl, long completedFrame)
+        => _deferredControlTextureReleases.DrainReady(completedFrame, texture => ReleaseControlTextureNow(gl, texture));
+
+    private void ReleaseControlTextureNow(GlInterface gl, ControlTextureResource texture)
+    {
+        texture.Dispose(gl);
+        if (texture.RhiHandle.IsValid) _rhiDevice?.Resources.ReleaseOwner(texture.RhiHandle, _rhiResourceOwnerId);
     }
 
     private unsafe ControlTextureResource? EnsureControlTexture(GlInterface gl, ControlPlane3D plane, RenderStats stats)
     {
         var snapshot = plane.Snapshot;
         if (snapshot is null) return null;
+
+        var restoredFromDeferred = false;
+        var created = false;
         if (!_controlTextures.TryGetValue(plane.Id, out var resource))
         {
-            resource = new ControlTextureResource { TextureId = gl.GenTexture(), SnapshotVersion = -1 };
-            _controlTextures[plane.Id] = resource;
+            if (_deferredControlTextureReleases.TryCancel(candidate => string.Equals(candidate.LogicalKey, plane.Id, StringComparison.Ordinal), out resource))
+            {
+                restoredFromDeferred = true;
+                _controlTextures.Add(plane.Id, resource);
+            }
         }
-        if (resource.SnapshotVersion == plane.SnapshotVersion) return resource;
+        if (resource is not null && resource.SnapshotVersion == plane.SnapshotVersion) return resource;
 
         var pixelWidth = System.Math.Max(plane.RenderPixelWidth, 1);
         var pixelHeight = System.Math.Max(plane.RenderPixelHeight, 1);
-        var stride = pixelWidth * 4;
-        var bufferSize = stride * pixelHeight;
-        if (_controlBgraUploadBuffer.Length < bufferSize) _controlBgraUploadBuffer = new byte[bufferSize];
-        if (_controlRgbaUploadBuffer.Length < bufferSize) _controlRgbaUploadBuffer = new byte[bufferSize];
-        fixed (byte* bgraPtr = _controlBgraUploadBuffer)
+        var stride = checked(pixelWidth * 4);
+        var bufferSize = checked(stride * pixelHeight);
+        var resourceKey = $"control:{plane.Id}";
+        var descriptor = new RhiTextureDescriptor3D(pixelWidth, pixelHeight, RhiTextureFormat3D.Rgba8Unorm, RhiTextureUsage3D.Sampled);
+        var device = _rhiDevice ?? throw new InvalidOperationException("OpenGL RHI device is not initialized.");
+        device.ValidateTexture(descriptor, $"control-plane texture '{plane.Id}'");
+        device.Resources.ValidateTextureRegistration(resourceKey, descriptor, plane.SnapshotVersion);
+
+        if (resource is null)
         {
-            snapshot.CopyPixels(new PixelRect(0, 0, pixelWidth, pixelHeight), (IntPtr)bgraPtr, bufferSize, stride);
+            resource = new ControlTextureResource
+            {
+                LogicalKey = plane.Id,
+                TextureId = GenRequiredTexture(gl, resourceKey),
+                SnapshotVersion = -1
+            };
+            created = true;
         }
 
-        for (var i = 0; i < bufferSize; i += 4)
+        if (_controlBgraUploadBuffer.Length < bufferSize) _controlBgraUploadBuffer = new byte[bufferSize];
+        if (_controlRgbaUploadBuffer.Length < bufferSize) _controlRgbaUploadBuffer = new byte[bufferSize];
+
+        RhiResourceHandle3D handle = default;
+        try
         {
-            _controlRgbaUploadBuffer[i] = _controlBgraUploadBuffer[i + 2];
-            _controlRgbaUploadBuffer[i + 1] = _controlBgraUploadBuffer[i + 1];
-            _controlRgbaUploadBuffer[i + 2] = _controlBgraUploadBuffer[i];
-            _controlRgbaUploadBuffer[i + 3] = _controlBgraUploadBuffer[i + 3];
-        }
-        fixed (byte* rgbaPtr = _controlRgbaUploadBuffer)
-        {
-            gl.BindTexture(GlTexture2D, resource.TextureId);
-            gl.TexParameteri(GlTexture2D, GlTextureMinFilter, GlLinear);
-            gl.TexParameteri(GlTexture2D, GlTextureMagFilter, GlLinear);
-            gl.TexParameteri(GlTexture2D, GlTextureWrapS, GlClampToEdge);
-            gl.TexParameteri(GlTexture2D, GlTextureWrapT, GlClampToEdge);
-            gl.TexImage2D(GlTexture2D, 0, GlRgba, pixelWidth, pixelHeight, 0, GlRgba, GlUnsignedByte, (IntPtr)rgbaPtr);
+            fixed (byte* bgraPtr = _controlBgraUploadBuffer)
+            {
+                snapshot.CopyPixels(new PixelRect(0, 0, pixelWidth, pixelHeight), (IntPtr)bgraPtr, bufferSize, stride);
+            }
+
+            for (var i = 0; i < bufferSize; i += 4)
+            {
+                _controlRgbaUploadBuffer[i] = _controlBgraUploadBuffer[i + 2];
+                _controlRgbaUploadBuffer[i + 1] = _controlBgraUploadBuffer[i + 1];
+                _controlRgbaUploadBuffer[i + 2] = _controlBgraUploadBuffer[i];
+                _controlRgbaUploadBuffer[i + 3] = _controlBgraUploadBuffer[i + 3];
+            }
+            fixed (byte* rgbaPtr = _controlRgbaUploadBuffer)
+            {
+                gl.BindTexture(GlTexture2D, resource.TextureId);
+                gl.TexParameteri(GlTexture2D, GlTextureMinFilter, GlLinear);
+                gl.TexParameteri(GlTexture2D, GlTextureMagFilter, GlLinear);
+                gl.TexParameteri(GlTexture2D, GlTextureWrapS, GlClampToEdge);
+                gl.TexParameteri(GlTexture2D, GlTextureWrapT, GlClampToEdge);
+                gl.TexImage2D(GlTexture2D, 0, GlRgba, pixelWidth, pixelHeight, 0, GlRgba, GlUnsignedByte, (IntPtr)rgbaPtr);
+            }
+
+            handle = device.Resources.RegisterTexture(
+                resourceKey,
+                descriptor,
+                plane.SnapshotVersion,
+                _rhiResourceOwnerId);
             resource.SnapshotVersion = plane.SnapshotVersion;
             resource.Width = pixelWidth;
             resource.Height = pixelHeight;
+            resource.RhiHandle = handle;
+            if (created) _controlTextures.Add(plane.Id, resource);
             stats.DirtyTextureUploads++;
             stats.TextureUploadBytes += bufferSize;
+            return resource;
         }
-        return resource;
+        catch
+        {
+            if (created)
+            {
+                resource.Dispose(gl);
+                if (handle.IsValid) device.Resources.ReleaseOwner(handle, _rhiResourceOwnerId);
+            }
+            else if (restoredFromDeferred)
+            {
+                _controlTextures.Remove(plane.Id);
+                _deferredControlTextureReleases.Enqueue(
+                    resource,
+                    _rhiDevice?.FrameIndex ?? 0,
+                    _resourceConfiguration?.DeferredReleaseFrames ?? 0);
+            }
+            throw;
+        }
     }
 
     private static void BuildWorldControlVertices(Vector3[] worldCorners, float[] vertexData)
@@ -3827,6 +3821,15 @@ internal sealed partial class OpenGlSceneRenderer
         vertexData[18] = 0f; vertexData[19] = 1f;
     }
 
+    private static unsafe void UploadBytes(GlInterface gl, int target, byte[] data, int usage)
+    {
+        if (data is null || data.Length == 0) return;
+        fixed (byte* ptr = data)
+        {
+            gl.BufferData(target, new IntPtr(data.Length), (IntPtr)ptr, usage);
+        }
+    }
+
     private static unsafe void UploadFloats(GlInterface gl, int target, float[] data, int count, int usage)
     {
         if (count <= 0) return;
@@ -3836,9 +3839,56 @@ internal sealed partial class OpenGlSceneRenderer
         }
     }
 
+    private static int GenRequiredBuffer(GlInterface gl, string label)
+    {
+        ArgumentNullException.ThrowIfNull(gl);
+        label = string.IsNullOrWhiteSpace(label) ? "unnamed" : label;
+
+        int buffer;
+        try
+        {
+            buffer = gl.GenBuffer();
+        }
+        catch (Exception exception)
+        {
+            var message = $"OpenGL failed to allocate required GPU buffer '{label}'. No CPU or legacy rendering fallback is permitted.";
+            EngineLog3D.Error("OpenGL.Resources", message, exception);
+            throw new InvalidOperationException(message, exception);
+        }
+
+        if (buffer != 0) return buffer;
+        var zeroHandleMessage = $"OpenGL returned buffer handle 0 for required GPU resource '{label}'. No CPU or legacy rendering fallback is permitted.";
+        EngineLog3D.Error("OpenGL.Resources", zeroHandleMessage);
+        throw new InvalidOperationException(zeroHandleMessage);
+    }
+
+    private static int GenRequiredTexture(GlInterface gl, string label)
+    {
+        ArgumentNullException.ThrowIfNull(gl);
+        label = string.IsNullOrWhiteSpace(label) ? "unnamed" : label;
+
+        int texture;
+        try
+        {
+            texture = gl.GenTexture();
+        }
+        catch (Exception exception)
+        {
+            var message = $"OpenGL failed to allocate required GPU texture '{label}'. No CPU or legacy rendering fallback is permitted.";
+            EngineLog3D.Error("OpenGL.Resources", message, exception);
+            throw new InvalidOperationException(message, exception);
+        }
+
+        if (texture != 0) return texture;
+        var zeroHandleMessage = $"OpenGL returned texture handle 0 for required GPU resource '{label}'. No CPU or legacy rendering fallback is permitted.";
+        EngineLog3D.Error("OpenGL.Resources", zeroHandleMessage);
+        throw new InvalidOperationException(zeroHandleMessage);
+    }
+
     private unsafe void UploadFloatsSubData(int target, int byteOffset, float[] data, int floatOffset, int count)
     {
-        if (count <= 0 || _bufferSubData is null) return;
+        if (count <= 0) return;
+        if (_bufferSubData is null) throw new InvalidOperationException("Required OpenGL buffer sub-data support is unavailable.");
         fixed (float* ptr = &data[floatOffset])
         {
             _bufferSubData(target, new IntPtr(byteOffset), new IntPtr(count * sizeof(float)), (IntPtr)ptr);
@@ -3881,37 +3931,17 @@ internal sealed partial class OpenGlSceneRenderer
         }
     }
 
-    private static void UploadIndices(GlInterface gl, int target, int[] data, int usage, out int indexType)
+    private static void UploadIndices(GlInterface gl, int target, GeometryIndexBuffer3D data, int usage, out int indexType)
     {
-        if (CanUseUShortIndices(data))
+        if (data.Format == IndexFormat3D.UInt16)
         {
-            var packed = ArrayPool<ushort>.Shared.Rent(data.Length);
-            try
-            {
-                for (var i = 0; i < data.Length; i++) packed[i] = (ushort)data[i];
-                UploadUShorts(gl, target, packed, data.Length, usage);
-                indexType = GlUnsignedShort;
-            }
-            finally
-            {
-                ArrayPool<ushort>.Shared.Return(packed);
-            }
+            UploadUShorts(gl, target, data.UInt16Storage!, usage);
+            indexType = GlUnsignedShort;
             return;
         }
 
-        UploadInts(gl, target, data, usage);
+        UploadInts(gl, target, data.UInt32Storage!, usage);
         indexType = GlUnsignedInt;
-    }
-
-    private static bool CanUseUShortIndices(int[] data)
-    {
-        if (data is null || data.Length == 0) return false;
-        for (var i = 0; i < data.Length; i++)
-        {
-            var value = data[i];
-            if ((uint)value > ushort.MaxValue) return false;
-        }
-        return true;
     }
 
     private static unsafe void UploadUShorts(GlInterface gl, int target, ushort[] data, int usage)
@@ -3936,7 +3966,7 @@ internal sealed partial class OpenGlSceneRenderer
     }
 
 
-    private static void ApplyAnimationStats(RenderStats stats, Scene3D scene, bool gpuSkinningActive, string fallbackReason)
+    private static void ApplyAnimationStats(RenderStats stats, Scene3D scene, bool gpuSkinningActive)
     {
         var imported = 0;
         var skinned = 0;
@@ -3971,14 +4001,13 @@ internal sealed partial class OpenGlSceneRenderer
         stats.SkinningVertexPayloadBytes = skinPayloadBytes;
         stats.GpuSkinningRequested = skinned > 0;
         stats.GpuSkinningActive = gpuSkinningActive && skinned > 0;
-        stats.SkinningFallbackReason = stats.GpuSkinningActive || skinned == 0 ? string.Empty : fallbackReason;
     }
 
     private void UploadClientTransformAnimation(Scene3D scene, bool enabled)
     {
         var active = enabled && scene.Performance.EnableWebGlClientGpuTransformAnimation;
         UploadFloat(_uniform1f, _meshClientAnimationEnabledLocation, active ? 1f : 0f);
-        UploadFloat(_uniform1f, _meshClientAnimationTimeLocation, active ? (float)_animationClock.Elapsed.TotalSeconds : 0f);
+        UploadFloat(_uniform1f, _meshClientAnimationTimeLocation, active ? (float)scene.UpdateLoop.RenderTimeSeconds : 0f);
         UploadFloat(_uniform1f, _meshClientAnimationAmplitudeLocation, active ? global::System.Math.Max(0f, scene.Performance.WebGlClientGpuTransformAnimationAmplitude) : 0f);
     }
 
@@ -3998,6 +4027,7 @@ internal sealed partial class OpenGlSceneRenderer
 
     private void UploadClassicMaterial(GlInterface gl, MaterialBinding3D material, RenderStats stats)
     {
+        ApplyCullMode(gl, material.CullMode);
         UploadFloat(_uniform1f, _meshLightingEnabledLocation, ToLightingUniform(material.Lighting));
         UploadVector3(_uniform3f, _meshSpecularColorLocation, new Vector3(material.SpecularColor.R, material.SpecularColor.G, material.SpecularColor.B));
         UploadVector4(_uniform4f, _meshSpecularParamsLocation, new Vector4(material.SpecularStrength, material.Shininess, material.Metallic, material.Roughness));
@@ -4005,21 +4035,21 @@ internal sealed partial class OpenGlSceneRenderer
         UploadFloat(_uniform1f, _meshNormalMapStrengthLocation, material.HasNormalMap ? material.NormalMapStrength : 0f);
         UploadVector4(_uniform4f, _meshAlphaParamsLocation, new Vector4(material.AlphaCutoff, material.Surface == SurfaceMode.Transparent ? 1f : 0f, 0f, 0f));
         UploadVector4(_uniform4f, _meshEmissiveColorLocation, new Vector4(material.EmissiveColor.R, material.EmissiveColor.G, material.EmissiveColor.B, material.EmissiveColor.A));
-        UploadMaterialTexture(gl, material.HasBaseColorTexture, material.BaseColorTextureKey, material.BaseColorTextureData, material.BaseColorTextureVersion, GlTexture2, 2, _meshBaseColorTextureLocation, _meshBaseColorTextureEnabledLocation, stats);
-        UploadMaterialTexture(gl, material.HasNormalMap, material.NormalMapTextureKey, material.NormalMapTextureData, material.NormalMapTextureVersion, GlTexture3, 3, _meshNormalTextureLocation, _meshNormalTextureEnabledLocation, stats);
-        UploadMaterialTexture(gl, material.HasMetallicRoughnessTexture, material.MetallicRoughnessTextureKey, material.MetallicRoughnessTextureData, material.MetallicRoughnessTextureVersion, GlTexture4, 4, _meshMetallicRoughnessTextureLocation, _meshMetallicRoughnessTextureEnabledLocation, stats);
-        UploadMaterialTexture(gl, material.HasEmissiveTexture, material.EmissiveTextureKey, material.EmissiveTextureData, material.EmissiveTextureVersion, GlTexture5, 5, _meshEmissiveTextureLocation, _meshEmissiveTextureEnabledLocation, stats);
+        UploadMaterialTexture(gl, material.HasBaseColorTexture ? material.BaseColorTextureResource : null, GlTexture2, 2, _meshBaseColorTextureLocation, _meshBaseColorTextureEnabledLocation, stats);
+        UploadMaterialTexture(gl, material.HasNormalMap ? material.NormalMapTextureResource : null, GlTexture3, 3, _meshNormalTextureLocation, _meshNormalTextureEnabledLocation, stats);
+        UploadMaterialTexture(gl, material.HasMetallicRoughnessTexture ? material.MetallicRoughnessTextureResource : null, GlTexture4, 4, _meshMetallicRoughnessTextureLocation, _meshMetallicRoughnessTextureEnabledLocation, stats);
+        UploadMaterialTexture(gl, material.HasEmissiveTexture ? material.EmissiveTextureResource : null, GlTexture5, 5, _meshEmissiveTextureLocation, _meshEmissiveTextureEnabledLocation, stats);
     }
 
-    private void UploadMaterialTexture(GlInterface gl, bool enabled, string? key, byte[]? data, int version, int glTextureUnit, int samplerSlot, int samplerLocation, int enabledLocation, RenderStats stats)
+    private void UploadMaterialTexture(GlInterface gl, TextureResource3D? texture, int glTextureUnit, int samplerSlot, int samplerLocation, int enabledLocation, RenderStats stats)
     {
-        if (!enabled || string.IsNullOrWhiteSpace(key) || data is not { Length: > 0 })
+        if (texture is null)
         {
             UploadFloat(_uniform1f, enabledLocation, 0f);
             return;
         }
 
-        var resource = EnsureMaterialTexture(gl, key, data, version, glTextureUnit, stats);
+        var resource = EnsureMaterialTexture(gl, texture, glTextureUnit, stats);
         if (resource is null)
         {
             UploadFloat(_uniform1f, enabledLocation, 0f);
@@ -4033,8 +4063,9 @@ internal sealed partial class OpenGlSceneRenderer
         gl.ActiveTexture(GlTexture0);
     }
 
-    private void UploadHighScaleMaterial(LightingMode lightingMode)
+    private void UploadHighScaleMaterial(GlInterface gl, LightingMode lightingMode)
     {
+        ApplyCullMode(gl, CullMode.None);
         UploadFloat(_uniform1f, _meshLightingEnabledLocation, ToLightingUniform(lightingMode));
         UploadVector3(_uniform3f, _meshSpecularColorLocation, new Vector3(1f, 1f, 1f));
         UploadVector4(_uniform4f, _meshSpecularParamsLocation, new Vector4(0.2f, 32f, 0f, 1f));
@@ -4050,56 +4081,6 @@ internal sealed partial class OpenGlSceneRenderer
 
     private static float ToLightingUniform(LightingMode mode)
         => mode == LightingMode.Unlit ? 0f : mode == LightingMode.Lambert ? 1f : mode == LightingMode.Phong ? 2f : 3f;
-
-    private static float[] GetMaterialSlotsOrDefault(Mesh3D mesh)
-    {
-        if (mesh.MaterialSlots.Length == mesh.Positions.Length) return mesh.MaterialSlots;
-        return new float[mesh.Positions.Length];
-    }
-
-    private static Vector3[] GetNormalsOrDefault(Mesh3D mesh)
-    {
-        if (mesh.Normals.Length == mesh.Positions.Length) return mesh.Normals;
-        var normals = new Vector3[mesh.Positions.Length];
-        for (var i = 0; i < normals.Length; i++) normals[i] = Vector3.UnitZ;
-        return normals;
-    }
-
-    private static Vector2[] GetTexCoordsOrDefault(Mesh3D mesh)
-    {
-        if (mesh.TexCoords0.Length == mesh.Positions.Length) return mesh.TexCoords0;
-        return new Vector2[mesh.Positions.Length];
-    }
-
-    private static Vector4[] GetTangentsOrDefault(Mesh3D mesh)
-    {
-        if (mesh.Tangents.Length == mesh.Positions.Length) return mesh.Tangents;
-        var tangents = new Vector4[mesh.Positions.Length];
-        for (var i = 0; i < tangents.Length; i++) tangents[i] = new Vector4(1f, 0f, 0f, 1f);
-        return tangents;
-    }
-
-    private static ColorRgba[] GetVertexColorsOrDefault(Mesh3D mesh)
-    {
-        if (mesh.VertexColors0.Length == mesh.Positions.Length) return mesh.VertexColors0;
-        var colors = new ColorRgba[mesh.Positions.Length];
-        for (var i = 0; i < colors.Length; i++) colors[i] = ColorRgba.White;
-        return colors;
-    }
-
-    private static Vector4[] GetBoneIndicesOrDefault(Mesh3D mesh)
-    {
-        if (mesh.BoneIndices0.Length == mesh.Positions.Length) return mesh.BoneIndices0;
-        return new Vector4[mesh.Positions.Length];
-    }
-
-    private static Vector4[] GetBoneWeightsOrDefault(Mesh3D mesh)
-    {
-        if (mesh.BoneWeights0.Length == mesh.Positions.Length) return mesh.BoneWeights0;
-        var weights = new Vector4[mesh.Positions.Length];
-        for (var i = 0; i < weights.Length; i++) weights[i] = new Vector4(1f, 0f, 0f, 0f);
-        return weights;
-    }
 
     private static void UploadVector3(GlUniform3fDelegate? uniform3f, int location, Vector3 value)
     {
@@ -4151,48 +4132,32 @@ internal sealed partial class OpenGlSceneRenderer
         }
     }
 
-    private static void UploadBillboardParticleMatrix(GlUniformMatrix4fvDelegate? uniformMatrix4fv, int location, float[] data, int offset, float[] buffer)
-    {
-        if (location < 0 || uniformMatrix4fv is null) return;
-        var size = MathF.Max(data[offset + 3], 0.0001f);
-        var matrix = Matrix4x4.Identity;
-        matrix.M11 = size;
-        matrix.M22 = size;
-        matrix.M33 = size;
-        matrix.M41 = data[offset];
-        matrix.M42 = data[offset + 1];
-        matrix.M43 = data[offset + 2];
-        UploadMatrix(uniformMatrix4fv, location, matrix, buffer);
-    }
-
     private void UploadBatchSkinning(GlInterface gl, MeshBatchData batch)
     {
         UploadSkinning(gl, batch, _meshSkinningEnabledLocation, _meshBoneTextureLocation, _meshBoneTextureHeightLocation);
     }
 
-    private void UploadShadowBatchSkinning(GlInterface gl, MeshBatchData batch)
-    {
-        UploadSkinning(gl, batch, _shadowSkinningEnabledLocation, _shadowBoneTextureLocation, _shadowBoneTextureHeightLocation);
-    }
-
     private unsafe void UploadSkinning(GlInterface gl, MeshBatchData batch, int enabledLocation, int textureLocation, int heightLocation)
     {
-        if (!_supportsBoneTextureSkinning || !batch.HasSkinning || batch.SkinMatrices.Length == 0)
+        if (!batch.HasSkinning)
         {
             UploadFloat(_uniform1f, enabledLocation, 0f);
             return;
         }
 
+        var rhiDevice = _rhiDevice ?? throw new InvalidOperationException("OpenGL RHI device is not initialized.");
+        if (!_supportsBoneTextureSkinning)
+            throw new RhiCapabilityException3D(RhiBackendApi3D.OpenGl, "GPU skinning upload", RhiFeature3D.VertexTextureFetch | RhiFeature3D.FloatTextures, rhiDevice.Capabilities);
+
         var matrices = batch.SkinMatrices;
+        if (matrices.Length == 0)
+            throw new InvalidOperationException("A skinned OpenGL batch has no bone matrices; rendering the bind pose as a fallback is forbidden.");
         if (matrices.Length > _gpuSkinTextureBoneLimit)
-        {
-            UploadFloat(_uniform1f, enabledLocation, 0f);
-            return;
-        }
+            throw new RhiDeviceLimitException3D(RhiBackendApi3D.OpenGl, "GPU skinning upload", $"bone count <= {_gpuSkinTextureBoneLimit}", rhiDevice.Capabilities);
 
         if (batch.BoneTexture == 0)
         {
-            batch.BoneTexture = gl.GenTexture();
+            batch.BoneTexture = GenRequiredTexture(gl, "skinning:bone-matrices");
             batch.BoneTextureVersion = -1;
         }
 
@@ -4282,13 +4247,16 @@ internal sealed partial class OpenGlSceneRenderer
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlBlendFuncDelegate(int sfactor, int dfactor);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlDepthMaskDelegate(byte flag);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlDepthFuncDelegate(int func);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlDisableDelegate(int cap);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlCullFaceDelegate(int mode);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlUniform1iDelegate(int location, int value);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlUniform1fDelegate(int location, float value);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlUniform3fDelegate(int location, float x, float y, float z);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlUniform4fDelegate(int location, float x, float y, float z, float w);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlUniformMatrix4fvDelegate(int location, int count, byte transpose, IntPtr value);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlVertexAttribDivisorDelegate(int index, int divisor);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlVertexAttrib4fDelegate(int index, float x, float y, float z, float w);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlDrawElementsInstancedDelegate(int mode, int count, int type, IntPtr indices, int instanceCount);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlBufferSubDataDelegate(int target, IntPtr offset, IntPtr size, IntPtr data);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlGenFramebuffersDelegate(int n, int[] framebuffers);
@@ -4302,13 +4270,27 @@ internal sealed partial class OpenGlSceneRenderer
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlDeleteVertexArraysDelegate(int n, int[] arrays);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlDisableVertexAttribArrayDelegate(int index);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlGetIntegervDelegate(int pname, IntPtr data);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate IntPtr GlGetStringDelegate(int name);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate int GlGetErrorDelegate();
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlGenQueriesDelegate(int count, [Out] int[] queries);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlDeleteQueriesDelegate(int count, int[] queries);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlBeginQueryDelegate(int target, int query);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlEndQueryDelegate(int target);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlGetQueryObjectivDelegate(int query, int parameter, out int value);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void GlGetQueryObjectui64vDelegate(int query, int parameter, out ulong value);
+
+    private readonly record struct GlContextVersionInfo(bool IsOpenGlEs, int Major, int Minor, bool IsKnown);
 
 
 
 
-    private void DisposeMeshResource(GlInterface gl, MeshGpuResource resource)
+    private void DisposeMeshResource(GlInterface gl, string key, MeshGpuResource resource)
     {
+        var resources = _rhiDevice?.Resources;
+        resources?.Release($"mesh:{key}:vertex", RhiResourceKind3D.Buffer);
+        resources?.Release($"mesh:{key}:index", RhiResourceKind3D.Buffer);
+        resources?.Release($"mesh:{key}:wireframe-index", RhiResourceKind3D.Buffer);
+        resources?.Release($"mesh:{key}:vao-main", RhiResourceKind3D.VertexArray);
         DeleteVertexArray(resource.VertexArray);
         resource.Dispose(gl);
     }
@@ -4367,9 +4349,11 @@ internal sealed partial class OpenGlSceneRenderer
 
     private sealed class MeshGpuResource
     {
-        public int GeometryVersion { get; set; }
+        public string LogicalKey { get; init; } = string.Empty;
+        public long GeometryVersion { get; set; }
         public int VertexArray { get; init; }
         public int VertexBuffer { get; init; }
+        public VertexLayout3D? Layout { get; set; }
         public int NormalBuffer { get; init; }
         public int TexCoordBuffer { get; init; }
         public int TangentBuffer { get; init; }
@@ -4378,14 +4362,16 @@ internal sealed partial class OpenGlSceneRenderer
         public int BoneWeightBuffer { get; init; }
         public int MaterialSlotBuffer { get; init; }
         public int IndexBuffer { get; init; }
-        public int WireframeIndexBuffer { get; init; }
+        public int WireframeIndexBuffer { get; set; }
         public int VertexCount { get; set; }
         public int IndexCount { get; set; }
         public int WireframeIndexCount { get; set; }
+        public long WireframeGeometryVersion { get; set; }
         public int IndexType { get; set; } = GlUnsignedInt;
         public int WireframeIndexType { get; set; } = GlUnsignedInt;
         public long VertexUploadBytes { get; set; }
         public long IndexUploadBytes { get; set; }
+        public long StaticLayoutCallbackSerial { get; set; } = -1;
         public void Dispose(GlInterface gl)
         {
             if (NormalBuffer != 0) gl.DeleteBuffer(NormalBuffer);
@@ -4721,16 +4707,16 @@ internal sealed partial class OpenGlSceneRenderer
             if (InstanceCount == 0) return 0f;
             if (!Mesh.LocalBounds.IsValid)
             {
-                var fallbackMax = 0f;
+                var conservativeMax = 0f;
                 for (var i = 0; i < InstanceCount; i++)
                 {
                     var offset = i * FloatStride;
                     var position = new Vector3(Data[offset + 12], Data[offset + 13], Data[offset + 14]);
                     var distanceSquared = Vector3.DistanceSquared(cameraPosition, position);
-                    if (distanceSquared > fallbackMax) fallbackMax = distanceSquared;
+                    if (distanceSquared > conservativeMax) conservativeMax = distanceSquared;
                 }
 
-                return fallbackMax;
+                return conservativeMax;
             }
 
             var center = Mesh.LocalBounds.Center;
@@ -4755,7 +4741,15 @@ internal sealed partial class OpenGlSceneRenderer
         public void SetSkinning(Matrix4x4[] matrices, int version)
         {
             if (SkinningVersion == version && _skinMatrices.Length == matrices.Length) return;
-            _skinMatrices = matrices.Length == 0 ? Array.Empty<Matrix4x4>() : (Matrix4x4[])matrices.Clone();
+            if (matrices.Length == 0)
+            {
+                _skinMatrices = Array.Empty<Matrix4x4>();
+            }
+            else
+            {
+                if (_skinMatrices.Length != matrices.Length) _skinMatrices = new Matrix4x4[matrices.Length];
+                Array.Copy(matrices, _skinMatrices, matrices.Length);
+            }
             SkinningVersion = version;
         }
 
@@ -4968,25 +4962,11 @@ internal sealed partial class OpenGlSceneRenderer
         }
     }
 
-    private sealed class DirectionalShadowMapResource
-    {
-        public int Texture { get; init; }
-        public int Framebuffer { get; init; }
-        public int Resolution { get; init; }
-
-        public void Dispose(GlInterface gl, GlDeleteFramebuffersDelegate? deleteFramebuffers)
-        {
-            if (Texture != 0) gl.DeleteTexture(Texture);
-            if (Framebuffer != 0 && deleteFramebuffers is not null)
-            {
-                deleteFramebuffers(1, new[] { Framebuffer });
-            }
-        }
-    }
-
     private sealed class ControlTextureResource
     {
+        public string LogicalKey { get; init; } = string.Empty;
         public int TextureId { get; init; }
+        public RhiResourceHandle3D RhiHandle { get; set; }
         public int SnapshotVersion { get; set; }
         public int Width { get; set; }
         public int Height { get; set; }
@@ -4995,8 +4975,10 @@ internal sealed partial class OpenGlSceneRenderer
 
     private sealed class MaterialTextureResource
     {
-        public int TextureId { get; init; }
-        public int Version { get; set; }
+        public int TextureId { get; set; }
+        public string PhysicalKey { get; init; } = string.Empty;
+        public long ContentVersion { get; init; }
+        public RhiResourceHandle3D RhiHandle { get; set; }
         public int Width { get; set; }
         public int Height { get; set; }
         public void Dispose(GlInterface gl) { if (TextureId != 0) gl.DeleteTexture(TextureId); }
@@ -5028,7 +5010,6 @@ attribute float aMaterialSlot;
 uniform mat4 uModel;
 uniform mat4 uPartLocal;
 uniform mat4 uViewProj;
-uniform mat4 uLightViewProj;
 uniform vec4 uColor;
 uniform float uUseInstancing;
 uniform float uUsePartLocal;
@@ -5047,7 +5028,6 @@ uniform sampler2D uBoneTexture;
 uniform float uBoneTextureHeight;
 uniform vec4 uVariantColors[32];
 varying vec3 vWorldPos;
-varying vec4 vLightSpace;
 varying vec3 vNormal;
 varying vec3 vTangent;
 varying vec2 vTexCoord0;
@@ -5116,7 +5096,6 @@ void main()
         world.z += cos(uClientAnimationTime * 0.7 + phase * 1.7) * uClientAnimationAmplitude;
     }
     vWorldPos = world.xyz;
-    vLightSpace = uLightViewProj * world;
     vNormal = normalWorld;
     vTangent = tangentWorld;
     vTexCoord0 = aTexCoord0;
@@ -5178,10 +5157,6 @@ uniform float uNormalMapStrength;
 uniform vec4 uPostProcessParams;
 uniform vec4 uSsaoParams;
 uniform vec4 uDistanceFadeParams;
-uniform float uShadowEnabled;
-uniform sampler2D uShadowMap;
-uniform mat4 uLightViewProj;
-uniform vec4 uShadowParams;
 uniform sampler2D uPaletteTexture;
 uniform sampler2D uBaseColorTexture;
 uniform float uBaseColorTextureEnabled;
@@ -5196,7 +5171,6 @@ uniform vec4 uEmissiveColor;
 uniform float uPaletteWidth;
 uniform float uPaletteHeight;
 varying vec3 vWorldPos;
-varying vec4 vLightSpace;
 varying vec3 vNormal;
 varying vec3 vTangent;
 varying vec2 vTexCoord0;
@@ -5205,17 +5179,6 @@ varying vec4 vVertexColor;
 varying float vVariantIndex;
 varying float vMaterialSlot;
 varying float vUsePaletteTexture;
-float ResolveDirectionalShadow()
-{
-    if (uShadowEnabled < 0.5) return 1.0;
-    vec3 proj = vLightSpace.xyz / max(abs(vLightSpace.w), 0.0001);
-    vec3 uvw = proj * 0.5 + 0.5;
-    if (uvw.x < 0.0 || uvw.x > 1.0 || uvw.y < 0.0 || uvw.y > 1.0 || uvw.z < 0.0 || uvw.z > 1.0) return 1.0;
-    float closest = texture2D(uShadowMap, uvw.xy).r;
-    float current = uvw.z - uShadowParams.x;
-    float shadow = current > closest ? uShadowParams.y : 0.0;
-    return 1.0 - shadow;
-}
 void main()
 {
     vec4 materialColor = vColor * vVertexColor;
@@ -5309,9 +5272,6 @@ void main()
                 specular += spec * uSpotLightColor.rgb * att * att;
             }
         }
-        float shadowFactor = ResolveDirectionalShadow();
-        vec3 ambientBase = uAmbientLight * uMaterialStrengths.x;
-        vec3 shadowedLight = ambientBase + (clamp(light, 0.0, 3.0) - ambientBase) * shadowFactor;
         float metallic = uSpecularParams.z;
         float roughness = uSpecularParams.w;
         if (uMetallicRoughnessTextureEnabled > 0.5)
@@ -5323,7 +5283,7 @@ void main()
         vec3 emissive = uEmissiveColor.rgb * uEmissiveColor.a;
         if (uEmissiveTextureEnabled > 0.5) emissive += texture2D(uEmissiveTexture, vTexCoord0).rgb;
         float specScale = mix(1.0, 0.35, clamp(roughness, 0.0, 1.0));
-        outColor = outColor * shadowedLight + uSpecularColor * specular * uSpecularParams.x * specScale * shadowFactor + emissive;
+        outColor = outColor * clamp(light, 0.0, 3.0) + uSpecularColor * specular * uSpecularParams.x * specScale + emissive;
     }
     if (uSsaoParams.x > 0.5)
     {
@@ -5336,83 +5296,26 @@ void main()
     {
         float exposure = max(uPostProcessParams.x, 0.001);
         float gamma = max(uPostProcessParams.y, 0.1);
+        vec3 mapped = max(outColor * exposure, vec3(0.0));
         if (uPostProcessParams.w < 1.5)
         {
-            outColor = outColor / (vec3(1.0) + outColor);
+            outColor = mapped / (vec3(1.0) + mapped);
+        }
+        else if (uPostProcessParams.w < 2.5)
+        {
+            outColor = vec3(1.0) - exp(-mapped);
         }
         else
         {
-            outColor = vec3(1.0) - exp(-outColor * exposure);
+            outColor = clamp(
+                (mapped * (2.51 * mapped + vec3(0.03))) /
+                (mapped * (2.43 * mapped + vec3(0.59)) + vec3(0.14)),
+                0.0,
+                1.0);
         }
         outColor = pow(max(outColor, vec3(0.0)), vec3(1.0 / gamma));
     }
     gl_FragColor = vec4(outColor, materialColor.a);
-}";
-
-    private const string ShadowVertexSource = @"attribute vec3 aPosition;
-attribute vec4 aBoneIndices;
-attribute vec4 aBoneWeights;
-attribute vec4 aInstanceModel0;
-attribute vec4 aInstanceModel1;
-attribute vec4 aInstanceModel2;
-attribute vec4 aInstanceModel3;
-uniform mat4 uModel;
-uniform mat4 uPartLocal;
-uniform mat4 uLightViewProj;
-uniform float uUseInstancing;
-uniform float uUsePartLocal;
-uniform float uSkinningEnabled;
-uniform sampler2D uBoneTexture;
-uniform float uBoneTextureHeight;
-uniform float uParticleBillboard;
-uniform vec3 uParticleCameraRight;
-uniform vec3 uParticleCameraUp;
-mat4 readShadowBoneMatrix(float boneIndex)
-{
-    float y = (floor(boneIndex + 0.5) + 0.5) / max(uBoneTextureHeight, 1.0);
-    vec4 c0 = texture2D(uBoneTexture, vec2(0.125, y));
-    vec4 c1 = texture2D(uBoneTexture, vec2(0.375, y));
-    vec4 c2 = texture2D(uBoneTexture, vec2(0.625, y));
-    vec4 c3 = texture2D(uBoneTexture, vec2(0.875, y));
-    return mat4(c0, c1, c2, c3);
-}
-void main()
-{
-    mat4 instanceModel = mat4(aInstanceModel0, aInstanceModel1, aInstanceModel2, aInstanceModel3);
-    mat4 model = uUseInstancing > 0.5 ? instanceModel : uModel;
-    if (uUsePartLocal > 0.5) model = model * uPartLocal;
-    vec4 world;
-    if (uParticleBillboard > 0.5)
-    {
-        vec4 particleState = uUseInstancing > 0.5 ? aInstanceModel0 : vec4(model[3].xyz, abs(model[0].x));
-        float particleSize = max(abs(particleState.w), 0.0001);
-        vec3 center = particleState.xyz;
-        vec3 billboardOffset = (uParticleCameraRight * aPosition.x + uParticleCameraUp * aPosition.y) * particleSize;
-        world = vec4(center + billboardOffset, 1.0);
-    }
-    else
-    {
-        vec4 localPosition = vec4(aPosition, 1.0);
-        if (uSkinningEnabled > 0.5)
-        {
-            float maxBone = max(uBoneTextureHeight - 1.0, 0.0);
-            mat4 skin = readShadowBoneMatrix(clamp(aBoneIndices.x, 0.0, maxBone)) * aBoneWeights.x +
-                        readShadowBoneMatrix(clamp(aBoneIndices.y, 0.0, maxBone)) * aBoneWeights.y +
-                        readShadowBoneMatrix(clamp(aBoneIndices.z, 0.0, maxBone)) * aBoneWeights.z +
-                        readShadowBoneMatrix(clamp(aBoneIndices.w, 0.0, maxBone)) * aBoneWeights.w;
-            localPosition = skin * localPosition;
-        }
-        world = model * localPosition;
-    }
-    gl_Position = uLightViewProj * world;
-}";
-
-    private const string ShadowFragmentSource = @"#ifdef GL_ES
-precision mediump float;
-#endif
-void main()
-{
-    gl_FragColor = vec4(1.0);
 }";
 
     private const string SkyboxVertexSource = @"attribute vec2 aPosition;
@@ -5434,6 +5337,8 @@ uniform int uSkyboxMode;
 uniform vec3 uCameraRight;
 uniform vec3 uCameraUp;
 uniform vec3 uCameraForward;
+uniform float uProjectionScaleX;
+uniform float uProjectionScaleY;
 uniform sampler2D uSkyboxTexture;
 uniform float uSkyboxTextureEnabled;
 uniform sampler2D uSkyboxPX;
@@ -5452,11 +5357,11 @@ void main()
 {
     if (uSkyboxMode == 1)
     {
-        gl_FragColor = vec4(uHorizonColor, 1.0);
+        gl_FragColor = vec4(uHorizonColor * max(uIntensity, 0.0), 1.0);
         return;
     }
     vec2 screen = vUv * 2.0 - 1.0;
-    vec3 dir = normalize(uCameraForward + uCameraRight * screen.x * 1.35 + uCameraUp * screen.y * 0.78);
+    vec3 dir = normalize(uCameraForward + uCameraRight * screen.x * uProjectionScaleX + uCameraUp * screen.y * uProjectionScaleY);
     const float PI = 3.14159265359;
     vec2 uv = vec2(atan(dir.x, dir.z) / (2.0 * PI) + 0.5, asin(clamp(dir.y, -1.0, 1.0)) / PI + 0.5);
     if (uSkyboxMode == 5 && uSkyboxTextureEnabled > 0.5)
@@ -5494,7 +5399,7 @@ void main()
         gl_FragColor = vec4((baseColor + star) * max(uIntensity, 0.0), 1.0);
         return;
     }
-    float t = clamp(vUv.y, 0.0, 1.0);
+    float t = clamp(uv.y, 0.0, 1.0);
     vec3 lower = mix(uBottomColor, uHorizonColor, smoothstep(0.0, 0.55, t));
     vec3 upper = mix(uHorizonColor, uTopColor, smoothstep(0.45, 1.0, t));
     vec3 color = t < 0.5 ? lower : upper;

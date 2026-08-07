@@ -4,47 +4,170 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
+using ThreeDEngine.Core.Assets.Streaming;
 using ThreeDEngine.Core.Assets.Resolvers;
 using ThreeDEngine.Core.Importers.Gltf;
 
 namespace ThreeDEngine.Core.Assets.Models;
 
-public sealed class ModelAssetCache3D
+public sealed class ModelAssetCache3D : IAsyncModelAssetLoader3D
 {
     private static readonly string[] SidecarTextureExtensions = { ".png", ".jpg", ".jpeg", ".webp", ".ktx2" };
-    private readonly Dictionary<string, CacheEntry> _cache = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly StringComparer PathComparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+    private static readonly StringComparison PathComparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+    private readonly object _gate = new();
+    private readonly Dictionary<string, CacheEntry> _cache = new(PathComparer);
+    private readonly ContentAddressedAssetCache3D? _contentCache;
+    private bool _disposed;
 
-    public static ModelAssetCache3D Shared { get; } = new();
+    public ModelAssetCache3D()
+    {
+    }
+
+    public ModelAssetCache3D(ContentAddressedAssetCache3D contentCache)
+    {
+        _contentCache = contentCache ?? throw new ArgumentNullException(nameof(contentCache));
+    }
+
+    public int Count
+    {
+        get { lock (_gate) return _cache.Count; }
+    }
+
+    public int CachedAssetCount => Count;
+
+    public bool IsDisposed { get { lock (_gate) return _disposed; } }
 
     public ModelAsset3D Load(string path, ModelImportOptions? options = null)
     {
         if (string.IsNullOrWhiteSpace(path)) throw new ArgumentException("Model path cannot be empty.", nameof(path));
-        options ??= new ModelImportOptions();
+        options = (options ?? new ModelImportOptions()).Clone();
         var resolved = ResolvePath(path, options.BaseDirectory);
         var cacheKey = BuildCacheKey(resolved.FullPath, options);
         var fingerprint = BuildDependencyFingerprint(resolved.FullPath, options);
-        if (_cache.TryGetValue(cacheKey, out var cached) && StringComparer.Ordinal.Equals(cached.Fingerprint, fingerprint))
+        lock (_gate)
         {
-            return cached.Asset;
+            ThrowIfDisposed();
+            if (_cache.TryGetValue(cacheKey, out var cached) && StringComparer.Ordinal.Equals(cached.Fingerprint, fingerprint))
+                return cached.Asset;
         }
 
         var asset = GltfModelImporter.Import(resolved.FullPath, options);
-        _cache[cacheKey] = new CacheEntry(asset, fingerprint);
-        return asset;
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            if (_cache.TryGetValue(cacheKey, out var raced) && StringComparer.Ordinal.Equals(raced.Fingerprint, fingerprint))
+                return raced.Asset;
+            _cache[cacheKey] = new CacheEntry(asset, fingerprint);
+            return asset;
+        }
     }
 
-    public void Clear() => _cache.Clear();
+    public async ValueTask<ModelAsset3D> LoadAsync(
+        string path,
+        ModelImportOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(path)) throw new ArgumentException("Model path cannot be empty.", nameof(path));
+        options = (options ?? new ModelImportOptions()).Clone();
+        var resolved = ResolvePath(path, options.BaseDirectory);
+        var cacheKey = BuildCacheKey(resolved.FullPath, options);
+        cancellationToken.ThrowIfCancellationRequested();
+        var fileInfo = new FileInfo(resolved.FullPath);
+        if (!fileInfo.Exists)
+            throw new FileNotFoundException("The asynchronous model cache requires a concrete readable file. Configure an asynchronous resolver/loader for virtual or remote assets.", resolved.FullPath);
+        if (options.MaxFileBytes > 0 && fileInfo.Length > options.MaxFileBytes)
+            throw new InvalidDataException($"Model file '{resolved.FullPath}' contains {fileInfo.Length} bytes, exceeding MaxFileBytes={options.MaxFileBytes}.");
+
+        var fingerprint = OperatingSystem.IsBrowser()
+            ? BuildPrimaryFileFingerprint(fileInfo)
+            : await Task.Run(() => BuildDependencyFingerprint(resolved.FullPath, options), cancellationToken).ConfigureAwait(false);
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            if (_cache.TryGetValue(cacheKey, out var cached) && StringComparer.Ordinal.Equals(cached.Fingerprint, fingerprint))
+                return cached.Asset;
+        }
+
+        var bytes = await File.ReadAllBytesAsync(resolved.FullPath, cancellationToken).ConfigureAwait(false);
+        if (_contentCache is not null)
+        {
+            var blob = await _contentCache.StoreAsync(bytes, cancellationToken).ConfigureAwait(false);
+            bytes = blob.BytesInternal;
+        }
+        cancellationToken.ThrowIfCancellationRequested();
+
+        ModelAsset3D asset;
+        if (OperatingSystem.IsBrowser())
+        {
+            await Task.Yield();
+            cancellationToken.ThrowIfCancellationRequested();
+            asset = ImportLoadedBytes(bytes, resolved.FullPath, options);
+        }
+        else
+        {
+            asset = await Task.Run(() => ImportLoadedBytes(bytes, resolved.FullPath, options), cancellationToken).ConfigureAwait(false);
+        }
+        cancellationToken.ThrowIfCancellationRequested();
+
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            if (_cache.TryGetValue(cacheKey, out var raced) && StringComparer.Ordinal.Equals(raced.Fingerprint, fingerprint))
+                return raced.Asset;
+            _cache[cacheKey] = new CacheEntry(asset, fingerprint);
+            return asset;
+        }
+    }
+
+    private static ModelAsset3D ImportLoadedBytes(byte[] bytes, string sourcePath, ModelImportOptions options)
+    {
+        if (Path.GetExtension(sourcePath).Equals(".gltf", StringComparison.OrdinalIgnoreCase))
+        {
+            using var stream = new MemoryStream(bytes, writable: false);
+            return GltfModelImporter.ImportStream(stream, sourcePath, options);
+        }
+        return GltfModelImporter.ImportBytes(bytes, sourcePath, options);
+    }
+
+    public void Clear()
+    {
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            _cache.Clear();
+        }
+    }
 
     public bool Remove(string path, string? baseDirectory = null)
     {
         var resolved = ResolvePath(path, baseDirectory);
-        var removed = false;
-        foreach (var key in _cache.Keys.Where(k => k.StartsWith(resolved.FullPath + "|", StringComparison.OrdinalIgnoreCase)).ToArray())
+        lock (_gate)
         {
-            removed |= _cache.Remove(key);
+            ThrowIfDisposed();
+            var removed = false;
+            foreach (var key in _cache.Keys.Where(k => k.StartsWith(resolved.FullPath + "|", PathComparison)).ToArray())
+            {
+                removed |= _cache.Remove(key);
+            }
+            return removed;
         }
-        return removed;
     }
+
+    public void Dispose()
+    {
+        lock (_gate)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _cache.Clear();
+        }
+    }
+
+    private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);
 
     private static string BuildCacheKey(string fullPath, ModelImportOptions options)
     {
@@ -59,8 +182,10 @@ public sealed class ModelAssetCache3D
         builder.Append("|strict=").Append(options.StrictValidation);
         builder.Append("|strictGlb=").Append(options.StrictGlbValidation);
         builder.Append("|normals=").Append(options.GenerateMissingNormals);
-        builder.Append("|unit=").Append(options.NormalizeToUnitSize);
+        builder.Append("|warningsAsErrors=").Append(options.TreatWarningsAsErrors);
         builder.Append("|maxFile=").Append(options.MaxFileBytes);
+        builder.Append("|maxJson=").Append(options.MaxJsonBytes);
+        builder.Append("|maxBin=").Append(options.MaxBinaryChunkBytes);
         builder.Append("|maxTex=").Append(options.MaxTextureBytes);
         builder.Append("|maxV=").Append(options.MaxVerticesPerPrimitive);
         builder.Append("|maxI=").Append(options.MaxIndicesPerPrimitive);
@@ -74,12 +199,13 @@ public sealed class ModelAssetCache3D
         {
             return "Composite(" + string.Join(",", composite.Resolvers.Select(GetResolverIdentity)) + ")";
         }
-        return resolver.GetType().AssemblyQualifiedName ?? resolver.GetType().FullName ?? resolver.GetType().Name;
+        var typeName = resolver.GetType().AssemblyQualifiedName ?? resolver.GetType().FullName ?? resolver.GetType().Name;
+        return typeName + "#" + RuntimeHelpers.GetHashCode(resolver).ToString("X8");
     }
 
     private static string BuildDependencyFingerprint(string fullPath, ModelImportOptions options)
     {
-        var files = new SortedSet<string>(StringComparer.OrdinalIgnoreCase) { Path.GetFullPath(fullPath) };
+        var files = new SortedSet<string>(PathComparer) { Path.GetFullPath(fullPath) };
         AddSidecarCandidates(files, fullPath, options);
         AddReferencedFiles(files, fullPath, options);
 
@@ -107,6 +233,9 @@ public sealed class ModelAssetCache3D
         }
         return builder.ToString();
     }
+
+    private static string BuildPrimaryFileFingerprint(FileInfo fileInfo)
+        => fileInfo.FullName + ":" + fileInfo.Length + "@" + fileInfo.LastWriteTimeUtc.Ticks;
 
     private static void AddSidecarCandidates(ISet<string> files, string fullPath, ModelImportOptions options)
     {

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.Numerics;
 using ThreeDEngine.Core.Geometry;
 using ThreeDEngine.Core.Interaction;
@@ -11,13 +12,17 @@ namespace ThreeDEngine.Core.Assets.Models;
 public sealed class ImportedModel3D : CompositeObject3D
 {
     private readonly List<ModelPart3D> _modelParts = new();
+    private readonly ReadOnlyCollection<ModelPart3D> _modelPartsView;
     private readonly List<ModelEventBinding3D> _eventBindings = new();
+    private readonly ReadOnlyCollection<ModelEventBinding3D> _eventBindingsView;
     private readonly Dictionary<string, Material3D> _nodeMaterialOverrides = new(StringComparer.Ordinal);
     private readonly Dictionary<string, Material3D> _partMaterialOverrides = new(StringComparer.Ordinal);
 
     public ImportedModel3D(ModelAsset3D asset)
     {
         Asset = asset ?? throw new ArgumentNullException(nameof(asset));
+        _modelPartsView = _modelParts.AsReadOnly();
+        _eventBindingsView = _eventBindings.AsReadOnly();
         Name = CreateDisplayName(asset.SourcePath, asset.AssetId);
         Animation = new ModelAnimationController3D(this);
     }
@@ -57,20 +62,21 @@ public sealed class ImportedModel3D : CompositeObject3D
     public ModelAnimationController3D Animation { get; }
     public bool HasAnimations => Asset.Animations.Count > 0;
     public bool HasSkins => Asset.Skins.Count > 0;
-    public IReadOnlyList<ModelEventBinding3D> EventBindings => _eventBindings;
+    public IReadOnlyList<ModelEventBinding3D> EventBindings => _eventBindingsView;
     public IReadOnlyList<ModelPart3D> ModelParts
     {
         get
         {
             _ = Children;
-            return _modelParts;
+            return _modelPartsView;
         }
     }
 
     public void SetNodeMaterial(string nodePathOrName, Material3D material)
     {
-        if (string.IsNullOrWhiteSpace(nodePathOrName)) return;
-        _nodeMaterialOverrides[nodePathOrName] = (material ?? Material3D.Default).Clone();
+        using var mutation = EnterOwnedMutationScope();
+        if (string.IsNullOrWhiteSpace(nodePathOrName)) throw new ArgumentException("Node path or name cannot be empty.", nameof(nodePathOrName));
+        _nodeMaterialOverrides[nodePathOrName] = (material ?? throw new ArgumentNullException(nameof(material))).Clone();
         foreach (var part in ModelParts)
         {
             if (MatchesNode(part, nodePathOrName)) part.ApplyMaterial(_nodeMaterialOverrides[nodePathOrName]);
@@ -79,8 +85,9 @@ public sealed class ImportedModel3D : CompositeObject3D
 
     public void SetPrimitiveMaterial(string modelElementPath, Material3D material)
     {
+        using var mutation = EnterOwnedMutationScope();
         if (string.IsNullOrWhiteSpace(modelElementPath)) return;
-        _partMaterialOverrides[modelElementPath] = (material ?? Material3D.Default).Clone();
+        _partMaterialOverrides[modelElementPath] = (material ?? throw new ArgumentNullException(nameof(material))).Clone();
         foreach (var part in ModelParts)
         {
             if (StringComparer.Ordinal.Equals(part.ModelElementPath, modelElementPath)) part.ApplyMaterial(_partMaterialOverrides[modelElementPath]);
@@ -89,6 +96,7 @@ public sealed class ImportedModel3D : CompositeObject3D
 
     public bool ClearMaterialOverride(string nodePathOrElementPath)
     {
+        using var mutation = EnterOwnedMutationScope();
         var removed = _nodeMaterialOverrides.Remove(nodePathOrElementPath) | _partMaterialOverrides.Remove(nodePathOrElementPath);
         if (!removed) return false;
         foreach (var part in ModelParts) ApplyResolvedMaterial(part);
@@ -108,7 +116,10 @@ public sealed class ImportedModel3D : CompositeObject3D
         => AddEventBinding(new ModelEventBinding3D(ModelEventTargetKind3D.Triangle, trianglePath, eventKind, handler));
 
     public bool UnbindEvent(ModelEventBinding3D binding)
-        => binding is not null && _eventBindings.Remove(binding);
+    {
+        using var mutation = EnterOwnedMutationScope();
+        return binding is not null && _eventBindings.Remove(binding);
+    }
 
     public bool RaiseModelPointerEvent(ModelPointerEventKind eventKind, ModelHitResult3D hit, Vector2 viewportPosition, SceneMouseButton button)
     {
@@ -137,6 +148,11 @@ public sealed class ImportedModel3D : CompositeObject3D
     }
 
     public void AdvanceAnimation(float deltaSeconds) => Animation.Advance(deltaSeconds);
+
+    internal SceneAccessLease3D EnterModelMutationScope() => EnterOwnedMutationScope();
+
+    internal void NotifyAnimationPlaybackChanged()
+        => RaiseChanged(SceneChangeKind.AnimationPose);
 
     internal void ApplyAnimationPose(ModelAnimationPose3D pose)
     {
@@ -189,6 +205,7 @@ public sealed class ImportedModel3D : CompositeObject3D
 
     private IDisposable AddEventBinding(ModelEventBinding3D binding)
     {
+        using var mutation = EnterOwnedMutationScope();
         _eventBindings.Add(binding);
         return new BindingSubscription(this, binding);
     }

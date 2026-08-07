@@ -1,32 +1,41 @@
+using System;
 using System.Collections.Generic;
 using ThreeDEngine.Core.Rendering;
 using ThreeDEngine.Core.Scene;
 
 namespace ThreeDEngine.Core.Rendering.Pipeline;
 
-public static class RenderPipelinePlanner3D
+internal static class RenderPipelinePlanner3D
 {
     public static RenderPipelinePlan3D Plan(Scene3D scene, BackendKind backend)
     {
         var settings = scene.RenderPipeline;
-        var deferredRequested = settings.EnableDeferredLighting || settings.Mode is RenderPipelineMode3D.Deferred or RenderPipelineMode3D.DeferredIfSupported;
-        var hdrRequested = settings.EnableHdr || settings.ToneMapping.Enabled;
+        var cached = settings.GetCachedPlan(backend);
+        if (cached is not null) return cached;
+        if (settings.Mode is not RenderPipelineMode3D.Forward and not RenderPipelineMode3D.Deferred)
+        {
+            throw new ArgumentOutOfRangeException(nameof(settings.Mode), settings.Mode, "Unknown render pipeline mode.");
+        }
+
+        if (settings.ToneMapping.Enabled && settings.ToneMapping.Mode == ToneMappingMode3D.None)
+        {
+            throw new InvalidOperationException("Tone mapping cannot be enabled with ToneMappingMode3D.None.");
+        }
+
+        if (settings.ToneMapping.Mode is < ToneMappingMode3D.None or > ToneMappingMode3D.AcesApproximation)
+        {
+            throw new ArgumentOutOfRangeException(nameof(settings.ToneMapping.Mode), settings.ToneMapping.Mode, "Unknown tone-mapping mode.");
+        }
+
+        var deferredRequested = settings.EnableDeferredLighting || settings.Mode == RenderPipelineMode3D.Deferred;
+        var hdrRequested = settings.EnableHdr;
         var ssaoRequested = settings.Ssao.Enabled;
         var motionRequested = settings.EnableMotionVectorMetadata;
 
-        // Stage 8 establishes the engine-level pipeline contract and enables forward HDR tone mapping.
-        // Full G-buffer/deferred/SSAO render targets are intentionally capability-gated until the
-        // renderers are migrated to a multi-render-target pass graph.
-        var deferredActive = false;
-        var ssaoActive = false;
-        var motionActive = false;
-        var hdrActive = hdrRequested;
-        var activeMode = deferredActive ? RenderPipelineMode3D.Deferred : RenderPipelineMode3D.Forward;
-        var reason = deferredRequested
-            ? backend == BackendKind.WebGlBrowser
-                ? "deferred-fallback-webgl-mrt-not-enabled"
-                : "deferred-fallback-forward-tonemap-stage8"
-            : "forward";
+        RejectUnsupported(deferredRequested, "deferred lighting/G-buffer", backend);
+        RejectUnsupported(ssaoRequested, "SSAO", backend);
+        RejectUnsupported(hdrRequested, "HDR render targets", backend);
+        RejectUnsupported(motionRequested, "motion-vector targets", backend);
 
         var passes = new List<RenderPassDescriptor3D>
         {
@@ -37,21 +46,12 @@ public static class RenderPipelinePlanner3D
             }
         };
 
-        if (ssaoRequested)
-        {
-            passes.Add(new RenderPassDescriptor3D
-            {
-                Kind = RenderPassKind3D.Ssao,
-                Name = ssaoActive ? "SSAO" : "SSAO (fallback metadata)"
-            });
-        }
-
-        if (hdrActive || settings.ToneMapping.Enabled)
+        if (settings.ToneMapping.Enabled)
         {
             passes.Add(new RenderPassDescriptor3D
             {
                 Kind = RenderPassKind3D.HdrToneMapping,
-                Name = "Forward HDR Tone Mapping"
+                Name = "Forward Tone Mapping"
             });
         }
 
@@ -70,23 +70,33 @@ public static class RenderPipelinePlanner3D
             Name = "Overlay"
         });
 
-        return new RenderPipelinePlan3D
+        var plan = new RenderPipelinePlan3D
         {
             RequestedMode = settings.Mode,
-            ActiveMode = activeMode,
+            ActiveMode = RenderPipelineMode3D.Forward,
             DeferredRequested = deferredRequested,
-            DeferredActive = deferredActive,
-            GBufferActive = deferredActive,
+            DeferredActive = false,
+            GBufferActive = false,
             SsaoRequested = ssaoRequested,
-            SsaoActive = ssaoActive,
+            SsaoActive = false,
             HdrRequested = hdrRequested,
-            HdrActive = hdrActive,
+            HdrActive = false,
             ToneMappingMode = settings.ToneMapping.Enabled ? settings.ToneMapping.Mode : ToneMappingMode3D.None,
             ToneMappingActive = settings.ToneMapping.Enabled,
             MotionVectorsRequested = motionRequested,
-            MotionVectorsActive = motionActive,
-            Reason = reason,
-            Passes = passes
+            MotionVectorsActive = false,
+            Reason = "forward",
+            Passes = passes.AsReadOnly()
         };
+        settings.CachePlan(backend, plan);
+        return plan;
+    }
+
+    private static void RejectUnsupported(bool requested, string feature, BackendKind backend)
+    {
+        if (!requested) return;
+        throw new NotSupportedException(
+            $"The {backend} renderer does not implement a complete GPU {feature} path. " +
+            "The engine rejects the request instead of substituting a forward, metadata-only, or CPU fallback.");
     }
 }

@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using ThreeDEngine.Core.Validation;
 using System.Numerics;
 
 namespace ThreeDEngine.Core.Assets.Models;
@@ -10,10 +12,10 @@ public sealed class SkinAsset3D
 
     public SkinAsset3D(int index, string name, int? skeletonRootNodeIndex, IReadOnlyList<BoneAsset3D> bones)
     {
-        Index = index;
+        Index = Guard3D.NonNegative(index, nameof(index));
         Name = string.IsNullOrWhiteSpace(name) ? $"Skin_{index}" : name;
-        SkeletonRootNodeIndex = skeletonRootNodeIndex;
-        Bones = bones ?? Array.Empty<BoneAsset3D>();
+        SkeletonRootNodeIndex = skeletonRootNodeIndex is null || skeletonRootNodeIndex == -1 ? null : Guard3D.NonNegative(skeletonRootNodeIndex.Value, nameof(skeletonRootNodeIndex));
+        Bones = Array.AsReadOnly((bones ?? throw new ArgumentNullException(nameof(bones))).ToArray());
         _jointNodeToBoneIndex = new Dictionary<int, int>();
         foreach (var bone in Bones)
         {

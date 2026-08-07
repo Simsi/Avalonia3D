@@ -50,9 +50,9 @@ internal static class ControlPlaneRenderPlanner3D
 
         output.Clear();
         Span<Vector3> corners = stackalloc Vector3[4];
-        for (var i = 0; i < snapshot.AllObjects.Length; i++)
+        for (var i = 0; i < snapshot.AllObjectsInternal.Length; i++)
         {
-            if (snapshot.AllObjects[i] is not ControlPlane3D plane || !plane.IsVisible || plane.Snapshot is null)
+            if (snapshot.AllObjectsInternal[i] is not ControlPlane3D plane || !plane.IsVisible || plane.Snapshot is null)
             {
                 continue;
             }

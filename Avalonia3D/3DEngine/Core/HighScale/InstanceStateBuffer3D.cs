@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using ThreeDEngine.Core.Validation;
 
 namespace ThreeDEngine.Core.HighScale;
 
@@ -16,24 +18,27 @@ public sealed class InstanceStateBuffer3D
     private byte[] _flags;
     private bool[] _dirtyMarks;
     private readonly List<int> _dirtyIndices = new(1024);
+    private readonly ReadOnlyCollection<int> _dirtyIndicesView;
     private int _version;
 
     public InstanceStateBuffer3D(int capacity = 1024)
     {
-        var initial = System.Math.Max(1, capacity);
+        var initial = Guard3D.Positive(capacity, nameof(capacity));
         _materialVariants = new int[initial];
         _flags = new byte[initial];
         _dirtyMarks = new bool[initial];
+        _dirtyIndicesView = _dirtyIndices.AsReadOnly();
     }
 
     public int Version => _version;
     public bool HasDirtyState => _dirtyIndices.Count != 0;
-    public IReadOnlyList<int> DirtyIndices => _dirtyIndices;
+    public IReadOnlyList<int> DirtyIndices => _dirtyIndicesView;
     public ReadOnlySpan<int> MaterialVariants => _materialVariants;
     public ReadOnlySpan<byte> Flags => _flags;
 
     public void EnsureCapacity(int count)
     {
+        Guard3D.NonNegative(count, nameof(count));
         if (_materialVariants.Length >= count) return;
         var next = _materialVariants.Length;
         while (next < count) next *= 2;
@@ -42,13 +47,23 @@ public sealed class InstanceStateBuffer3D
         Array.Resize(ref _dirtyMarks, next);
     }
 
-    public int GetMaterialVariant(int index) => (uint)index < (uint)_materialVariants.Length ? _materialVariants[index] : 0;
+    public int GetMaterialVariant(int index)
+    {
+        ValidateAllocatedIndex(index);
+        return _materialVariants[index];
+    }
 
-    public byte GetFlags(int index) => (uint)index < (uint)_flags.Length ? _flags[index] : (byte)0;
+    public byte GetFlags(int index)
+    {
+        ValidateAllocatedIndex(index);
+        return _flags[index];
+    }
 
     public bool SetMaterialVariant(int index, int variant)
     {
-        EnsureCapacity(index + 1);
+        Guard3D.NonNegative(index, nameof(index));
+        Guard3D.NonNegative(variant, nameof(variant));
+        EnsureCapacity(checked(index + 1));
         if (_materialVariants[index] == variant) return false;
         _materialVariants[index] = variant;
         MarkDirty(index);
@@ -57,7 +72,8 @@ public sealed class InstanceStateBuffer3D
 
     public bool SetFlags(int index, byte flags)
     {
-        EnsureCapacity(index + 1);
+        Guard3D.NonNegative(index, nameof(index));
+        EnsureCapacity(checked(index + 1));
         if (_flags[index] == flags) return false;
         _flags[index] = flags;
         MarkDirty(index);
@@ -66,6 +82,7 @@ public sealed class InstanceStateBuffer3D
 
     public void MarkAllDirty(int count)
     {
+        Guard3D.NonNegative(count, nameof(count));
         EnsureCapacity(count);
         for (var i = 0; i < count; i++)
         {
@@ -90,7 +107,7 @@ public sealed class InstanceStateBuffer3D
 
     private void MarkDirty(int index)
     {
-        EnsureCapacity(index + 1);
+        EnsureCapacity(checked(index + 1));
         if (!_dirtyMarks[index])
         {
             _dirtyMarks[index] = true;
@@ -98,5 +115,11 @@ public sealed class InstanceStateBuffer3D
         }
 
         _version++;
+    }
+
+    private void ValidateAllocatedIndex(int index)
+    {
+        if ((uint)index >= (uint)_materialVariants.Length)
+            throw new ArgumentOutOfRangeException(nameof(index), index, "Index is outside the allocated state buffer.");
     }
 }

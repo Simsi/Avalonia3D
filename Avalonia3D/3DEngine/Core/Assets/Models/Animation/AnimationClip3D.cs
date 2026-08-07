@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using ThreeDEngine.Core.Validation;
 
 namespace ThreeDEngine.Core.Assets.Models;
 
@@ -7,9 +9,9 @@ public sealed class AnimationClip3D
 {
     public AnimationClip3D(int index, string name, IReadOnlyList<AnimationChannel3D> channels)
     {
-        Index = index;
+        Index = Guard3D.NonNegative(index, nameof(index));
         Name = string.IsNullOrWhiteSpace(name) ? $"Animation_{index}" : name;
-        Channels = channels ?? Array.Empty<AnimationChannel3D>();
+        Channels = Array.AsReadOnly((channels ?? throw new ArgumentNullException(nameof(channels))).ToArray());
         var duration = 0f;
         foreach (var channel in Channels)
         {

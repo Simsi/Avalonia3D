@@ -2,6 +2,7 @@ using System;
 using System.Numerics;
 using ThreeDEngine.Core.Primitives;
 using ThreeDEngine.Core.Scene;
+using ThreeDEngine.Core.Validation;
 
 namespace ThreeDEngine.Core.Lighting;
 
@@ -13,7 +14,6 @@ public sealed class DirectionalLight3D
     private bool _isEnabled = true;
 
     internal Scene3D? OwnerScene { get; set; }
-
     public event EventHandler? Changed;
 
     public Vector3 Direction
@@ -21,8 +21,10 @@ public sealed class DirectionalLight3D
         get => _direction;
         set
         {
-            if (value.LengthSquared() < 0.000001f) return;
-            var normalized = Vector3.Normalize(value);
+            using var access = OwnerScene?.EnterMutationScope() ?? default;
+            var finite = Guard3D.Finite(value, nameof(Direction));
+            if (finite.LengthSquared() <= 0.000001f) throw new ArgumentOutOfRangeException(nameof(Direction), value, "Light direction must be non-zero.");
+            var normalized = Vector3.Normalize(finite);
             if (_direction == normalized) return;
             _direction = normalized;
             RaiseChanged();
@@ -34,6 +36,8 @@ public sealed class DirectionalLight3D
         get => _color;
         set
         {
+            using var access = OwnerScene?.EnterMutationScope() ?? default;
+            value = Guard3D.Color(value, nameof(Color));
             if (_color.Equals(value)) return;
             _color = value;
             RaiseChanged();
@@ -45,9 +49,10 @@ public sealed class DirectionalLight3D
         get => _intensity;
         set
         {
-            var clamped = MathF.Max(0f, value);
-            if (MathF.Abs(_intensity - clamped) < 0.0001f) return;
-            _intensity = clamped;
+            using var access = OwnerScene?.EnterMutationScope() ?? default;
+            value = Guard3D.NonNegative(value, nameof(Intensity));
+            if (MathF.Abs(_intensity - value) < 0.0001f) return;
+            _intensity = value;
             RaiseChanged();
         }
     }
@@ -55,12 +60,7 @@ public sealed class DirectionalLight3D
     public bool IsEnabled
     {
         get => _isEnabled;
-        set
-        {
-            if (_isEnabled == value) return;
-            _isEnabled = value;
-            RaiseChanged();
-        }
+        set { using var access = OwnerScene?.EnterMutationScope() ?? default; if (_isEnabled == value) return; _isEnabled = value; RaiseChanged(); }
     }
 
     private void RaiseChanged() => Changed?.Invoke(this, EventArgs.Empty);

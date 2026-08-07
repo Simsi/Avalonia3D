@@ -1,5 +1,4 @@
 using System.Collections.Generic;
-using ThreeDEngine.Core.Assets.Models;
 using ThreeDEngine.Core.HighScale;
 using ThreeDEngine.Core.Materials;
 using ThreeDEngine.Core.Particles;
@@ -15,16 +14,15 @@ namespace ThreeDEngine.Core.Rendering;
 /// changed. This utility owns common scene resource discovery; backend-specific resources
 /// such as Avalonia control-plane textures remain outside Core.
 /// </summary>
-public static class SceneRenderResourceCollector3D
+internal static class SceneRenderResourceCollector3D
 {
     public static void CollectLiveMeshesAndTextures(
         Scene3D scene,
         SceneFrameSnapshot3D snapshot,
         ISet<string> liveMeshes,
-        ISet<string> liveTextures,
-        System.Func<ModelPart3D?, bool>? requiresCpuSkinFallback = null)
+        ISet<string> liveTextures)
     {
-        foreach (var obj in snapshot.Renderables)
+        foreach (var obj in snapshot.RenderablesInternal)
         {
             if (obj is ParticleSystem3D particleSystem)
             {
@@ -35,15 +33,13 @@ public static class SceneRenderResourceCollector3D
             }
             else
             {
-                var skinnedPart = obj as ModelPart3D;
-                var useCpuSkinFallback = requiresCpuSkinFallback?.Invoke(skinnedPart) == true;
-                liveMeshes.Add(useCpuSkinFallback ? skinnedPart!.GetCpuSkinnedFallbackMesh().ResourceKey : obj.GetMesh().ResourceKey);
+                liveMeshes.Add(obj.GetMesh().ResourceKey);
             }
 
             AddLiveMaterialTextures(liveTextures, obj.Material);
         }
 
-        foreach (var layer in snapshot.HighScaleLayers)
+        foreach (var layer in snapshot.HighScaleLayersInternal)
         {
             AddHighScaleLodMeshes(liveMeshes, layer, HighScaleLodLevel3D.Detailed);
             AddHighScaleLodMeshes(liveMeshes, layer, HighScaleLodLevel3D.Simplified);
@@ -59,21 +55,21 @@ public static class SceneRenderResourceCollector3D
 
     public static void AddLiveMaterialTextures(ISet<string> liveTextures, MaterialBinding3D material)
     {
-        AddLiveTexture(liveTextures, material.BaseColorTextureKey, material.HasBaseColorTexture);
-        AddLiveTexture(liveTextures, material.NormalMapTextureKey, material.HasNormalMap);
-        AddLiveTexture(liveTextures, material.MetallicRoughnessTextureKey, material.HasMetallicRoughnessTexture);
-        AddLiveTexture(liveTextures, material.EmissiveTextureKey, material.HasEmissiveTexture);
+        AddLiveTexture(liveTextures, material.BaseColorTextureResourceKey, material.HasBaseColorTexture);
+        AddLiveTexture(liveTextures, material.NormalMapTextureResourceKey, material.HasNormalMap);
+        AddLiveTexture(liveTextures, material.MetallicRoughnessTextureResourceKey, material.HasMetallicRoughnessTexture);
+        AddLiveTexture(liveTextures, material.EmissiveTextureResourceKey, material.HasEmissiveTexture);
     }
 
     public static void AddEnvironmentTextures(Scene3D scene, ISet<string> liveTextures)
     {
         var skybox = scene.Environment.Skybox;
-        AddLiveTexture(liveTextures, skybox.EquirectangularTextureKey, skybox.HasEquirectangularTexture);
+        AddLiveTexture(liveTextures, skybox.EquirectangularTextureResourceKey, skybox.HasEquirectangularTexture);
         if (!skybox.HasCubemapTextures) return;
 
-        for (var i = 0; i < skybox.CubemapTextureKeys.Count; i++)
+        for (var i = 0; i < skybox.CubemapTextures.Count; i++)
         {
-            AddLiveTexture(liveTextures, skybox.CubemapTextureKeys[i], true);
+            AddLiveTexture(liveTextures, skybox.CubemapTextures[i]?.ResourceKey, true);
         }
     }
 

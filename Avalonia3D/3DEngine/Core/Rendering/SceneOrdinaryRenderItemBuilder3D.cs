@@ -12,24 +12,24 @@ namespace ThreeDEngine.Core.Rendering;
 /// Shared ordinary render extraction for all GPU backends.
 ///
 /// Keep visibility, particle exclusion, interpolation, color override, batch key and
-/// skinned mesh fallback rules here so OpenGL and WebGL do not drift apart.
+/// GPU-skinning rules here so OpenGL and WebGL do not drift apart.
 /// </summary>
-public static class SceneOrdinaryRenderItemBuilder3D
+internal static class SceneOrdinaryRenderItemBuilder3D
 {
     public static void Build(
         Scene3D scene,
         SceneFrameSnapshot3D snapshot,
         List<OrdinaryRenderItem3D> output,
-        Func<ModelPart3D?, bool>? requiresCpuSkinFallback = null,
-        RenderStats? stats = null,
-        SceneRenderPlanScratch3D? scratch = null)
+        SceneRenderPlanScratch3D scratch,
+        RenderStats? stats = null)
     {
         if (scene is null) throw new ArgumentNullException(nameof(scene));
         if (snapshot is null) throw new ArgumentNullException(nameof(snapshot));
         if (output is null) throw new ArgumentNullException(nameof(output));
+        if (scratch is null) throw new ArgumentNullException(nameof(scratch));
 
         output.Clear();
-        foreach (var obj in snapshot.Renderables)
+        foreach (var obj in snapshot.RenderablesInternal)
         {
             if (!obj.IsVisible || !obj.UseMeshRendering)
             {
@@ -49,8 +49,7 @@ public static class SceneOrdinaryRenderItemBuilder3D
             }
 
             var skinnedPart = obj as ModelPart3D;
-            var useCpuSkinFallback = requiresCpuSkinFallback?.Invoke(skinnedPart) == true;
-            var mesh = useCpuSkinFallback ? skinnedPart!.GetCpuSkinnedFallbackMesh() : obj.GetMesh();
+            var mesh = obj.GetMesh();
             if (mesh.Positions.Length == 0 || mesh.Indices.Length == 0)
             {
                 continue;
@@ -60,12 +59,10 @@ public static class SceneOrdinaryRenderItemBuilder3D
                 ? interpolatedModel
                 : obj.GetModelMatrix();
             var material = MaterialBinding3D.FromMaterial(obj.Material);
-            var usesGpuSkinning = skinnedPart is not null && skinnedPart.IsSkinned && !useCpuSkinFallback;
+            var usesGpuSkinning = skinnedPart is not null && skinnedPart.IsSkinned;
             var skinOwnerId = usesGpuSkinning ? obj.Id : null;
-            var logicalBatchKey = scratch?.GetLogicalMeshBatchKey(mesh.ResourceKey, skinOwnerId)
-                ?? RenderId3D.BuildLogicalMeshBatchKey(mesh.ResourceKey, skinOwnerId);
-            var retainedBatchId = scratch?.GetOrdinaryRetainedBatchId(mesh.ResourceKey, material.BatchKeyHash, skinOwnerId)
-                ?? RenderId3D.BuildOrdinaryRetainedBatchId(mesh.ResourceKey, material.BatchKeyHash, skinOwnerId);
+            var logicalBatchKey = scratch.GetLogicalMeshBatchKey(mesh.ResourceKey, skinOwnerId);
+            var retainedBatchId = scratch.GetOrdinaryRetainedBatchId(mesh.ResourceKey, material.BatchKeyHash, skinOwnerId);
 
             output.Add(new OrdinaryRenderItem3D(
                 obj,
@@ -73,7 +70,6 @@ public static class SceneOrdinaryRenderItemBuilder3D
                 material,
                 model,
                 ResolveColor(obj),
-                useCpuSkinFallback,
                 usesGpuSkinning,
                 logicalBatchKey,
                 retainedBatchId));

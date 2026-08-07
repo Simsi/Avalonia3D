@@ -1,6 +1,6 @@
 namespace ThreeDEngine.Core.Rendering.Pipeline;
 
-public enum RenderPassKind3D
+internal enum RenderPassKind3D
 {
     ForwardOpaque = 0,
     GBuffer = 1,

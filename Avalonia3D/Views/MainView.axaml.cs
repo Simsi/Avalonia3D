@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -9,8 +9,6 @@ using Avalonia.Controls;
 using Avalonia.Layout;
 using Avalonia.Media;
 using Avalonia.Platform;
-using Avalonia.Threading;
-using Avalonia.VisualTree;
 using ThreeDEngine.Avalonia.Controls;
 using ThreeDEngine.Avalonia.Hosting;
 using ThreeDEngine.Core.Assets.Models;
@@ -28,7 +26,6 @@ using ThreeDEngine.Core.Physics;
 using ThreeDEngine.Core.Physics.Jitter2;
 using ThreeDEngine.Core.Primitives;
 using ThreeDEngine.Core.Rendering;
-using ThreeDEngine.Core.Rendering.Capabilities;
 using ThreeDEngine.Core.Rendering.Pipeline;
 using ThreeDEngine.Core.Scene;
 
@@ -50,15 +47,25 @@ public partial class MainView : UserControl
         ShaderLightingLab,
         BuildingWalkthrough,
         BridgeDigitalTwin,
-        RenderPipelineAndDiagnostics
+        RenderPipelineAndDiagnostics,
+        CrossPlatformStressLab
     }
 
     private sealed record DemoDefinition(DemoSceneKind Kind, string Title, string Summary);
+    private sealed record StressParameters(
+        int Columns,
+        int Rows,
+        int TransparentObjects,
+        int ParticleCapacityA,
+        int ParticleEmissionA,
+        int ParticleCapacityB,
+        int ParticleEmissionB,
+        int TelemetryUpdatesPerSecond);
 
     private static readonly DemoDefinition[] DemoDefinitions =
     {
         new(DemoSceneKind.PrimitivesAndMaterials, "01. Геометрия и материалы", "Процедурные примитивы, прозрачность, разные lighting-модели и базовая анимация transform."),
-        new(DemoSceneKind.LightingAndEnvironment, "02. Свет, тени и окружение", "Directional, point и spot lights, skybox, ambient light и directional shadows."),
+        new(DemoSceneKind.LightingAndEnvironment, "02. Свет и окружение", "Directional, point и spot lights, skybox и ambient light в общем OpenGL/WebGL2 forward pipeline."),
         new(DemoSceneKind.PickingAndInteraction, "03. Picking и selection", "Объекты сцены кликаются, получают selection state и отдают данные обратно в Avalonia UI."),
         new(DemoSceneKind.EmbeddedAvaloniaControls, "04. Avalonia UI внутри 3D", "Обычные Avalonia controls рендерятся на 3D-плоскость и принимают pointer input."),
         new(DemoSceneKind.HighScaleDigitalTwin, "05. High-scale / digital twin", "Retained instance layer для большого числа похожих объектов, palette variants, telemetry updates и smooth GPU motion."),
@@ -66,22 +73,21 @@ public partial class MainView : UserControl
         new(DemoSceneKind.Physics, "07. Default rigidbody physics", "Встроенная default-физика: rigidbody, вращения, friction/restitution, sleep, CCD и многоточечные контакты для устойчивых столкновений."),
         new(DemoSceneKind.ImportedGlbModel, "08. GLB character / Doctor Watson", "Загрузка rigged/skinned GLB с embedded текстурами и authored skeletal animation clip."),
         new(DemoSceneKind.CameraArcPlanetFocus, "09. Камера: дуговой облёт и фокус", "Детализированная планета, координаты точки вводятся вручную, камера облетает тело по безопасной дуге."),
-        new(DemoSceneKind.ShaderLightingLab, "10. Шейдеры, свет и цветокор", "Отдельная сцена для настройки света, HDR/tone mapping, SSAO и визуальных пресетов."),
+        new(DemoSceneKind.ShaderLightingLab, "10. Шейдеры, свет и цветокор", "Отдельная forward-сцена для настройки света, GPU tone mapping и визуальных пресетов."),
         new(DemoSceneKind.BuildingWalkthrough, "11. Person camera / 4-этажное здание", "Площадка и 4-этажное здание с кабинетами, мебелью и Person-навигацией с физическими коллизиями."),
         new(DemoSceneKind.BridgeDigitalTwin, "12. Цифровой двойник разводного моста", "Большой разводной мост, створки, опоры, трафик и множество интерактивных датчиков телеметрии."),
-        new(DemoSceneKind.RenderPipelineAndDiagnostics, "13. Pipeline и diagnostics", "HDR/deferred-if-supported/SSAO flags, wireframe overlay, frame stats и runtime metrics.")
+        new(DemoSceneKind.RenderPipelineAndDiagnostics, "13. RHI и diagnostics", "Actual RHI capabilities/limits, forward tone mapping, wireframe overlay, GPU timing и resource telemetry."),
+        new(DemoSceneKind.CrossPlatformStressLab, "14. Cross-platform GPU stress lab", "Параметрический retained/GPU stress lab: размеры поля, прозрачность, particle capacity/emission и state churn задаются точными значениями одинаково для OpenGL/WebGL2.")
     };
 
     private readonly Scene3DControl _sceneControl;
-    private readonly DispatcherTimer _animationTimer;
-    private readonly bool _driveAnimationFromRenderLoop;
     private readonly Random _random = new(20260506);
     private readonly List<Object3D> _selectableObjects = new();
     private readonly List<Object3D> _physicsObjects = new();
     private readonly List<Object3D> _characterRigObjects = new();
-    private readonly List<ParticleSystem3D> _particleSystems = new();
     private readonly List<Object3D> _bridgeSensors = new();
     private readonly List<(Object3D Obj, Vector3 Normal, float RadiusOffset)> _planetSurfaceObjects = new();
+    private readonly List<(Object3D Obj, Vector3 Origin, float Phase)> _stressAnimatedObjects = new();
     private readonly CameraArcFlight3D _cameraFlight = new();
 
     private ComboBox _demoBox = null!;
@@ -93,7 +99,6 @@ public partial class MainView : UserControl
     private CheckBox _animateCheck = null!;
     private CheckBox _metricsCheck = null!;
     private CheckBox _wireframeCheck = null!;
-    private CheckBox _shadowsCheck = null!;
     private Button _primaryActionButton = null!;
     private StackPanel _demoSpecificPanel = null!;
     private TextBox? _planetLatBox;
@@ -101,7 +106,14 @@ public partial class MainView : UserControl
     private TextBox? _exposureBox;
     private TextBox? _gammaBox;
     private TextBox? _ambientBox;
-    private TextBox? _ssaoBox;
+    private TextBox? _stressColumnsBox;
+    private TextBox? _stressRowsBox;
+    private TextBox? _stressTransparentBox;
+    private TextBox? _stressParticleCapacityABox;
+    private TextBox? _stressParticleEmissionABox;
+    private TextBox? _stressParticleCapacityBBox;
+    private TextBox? _stressParticleEmissionBBox;
+    private TextBox? _stressTelemetryRateBox;
 
     private DemoSceneKind _activeDemo = DemoSceneKind.PrimitivesAndMaterials;
     private Object3D? _selectedObject;
@@ -113,7 +125,7 @@ public partial class MainView : UserControl
     private SpotLight3D? _movingSpotLight;
     private ControlPlane3D? _controlPlane;
     private HighScaleInstanceLayer3D? _rackLayer;
-    private ParticleSystem3D? _particleSystem;
+    private HighScaleInstanceLayer3D? _stressLayer;
     private Box3D? _physicsCube;
     private Sphere3D? _physicsBall;
     private ImportedModel3D? _doctorWatsonModel;
@@ -133,23 +145,24 @@ public partial class MainView : UserControl
     private float _characterSequenceTime;
     private float _doctorWatsonBaseY;
     private SceneFrameRenderedEventArgs? _lastFrame;
-    private double _lastFrameTime;
     private double _animationTimeSeconds;
-    private long _lastAnimationTick;
     private double _lastFps;
     private int _clickCount;
     private int _telemetryCursor;
     private int _embeddedCounter;
+    private double _stressTelemetryAccumulator;
+    private int _stressTelemetryUpdateCursor;
     private long _lastStatusTicks;
     private long _lastBackendTextTicks;
     private string _lastStatusText = string.Empty;
+    private bool _showingDiagnosticReport;
+    private StressParameters _stressParameters = new(480, 320, 768, 24000, 9000, 12000, 4000, 120000);
 
     public MainView()
     {
         InitializeComponent();
 
         var isBrowser = OperatingSystem.IsBrowser();
-        _driveAnimationFromRenderLoop = isBrowser;
         _sceneControl = new Scene3DControl
         {
             HorizontalAlignment = HorizontalAlignment.Stretch,
@@ -160,9 +173,11 @@ public partial class MainView : UserControl
             FpsLockEnabled = true,
             TargetFps = 60d,
             UnlockedMaxFps = isBrowser ? 60d : 180d,
-            FrameInterpolationEnabled = !isBrowser,
-            FrameInterpolationTickFps = 30d,
-            AdaptivePerformanceEnabled = isBrowser,
+            FrameInterpolationEnabled = true,
+            AutomaticSceneUpdates = true,
+            FixedUpdateFramesPerSecond = 60d,
+            MaximumCatchUpSteps = 4,
+            AdaptivePerformanceEnabled = false,
             EnableSceneNavigation = true,
             ShowCenterCursor = !isBrowser,
             Width = double.NaN,
@@ -171,22 +186,11 @@ public partial class MainView : UserControl
         _sceneControl.ObjectClicked += OnObjectClicked;
         _sceneControl.SelectionChanged += (_, e) => SetSelection(e.NewSelection);
         _sceneControl.FrameRendered += OnFrameRendered;
-
-        _animationTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
-        _animationTimer.Tick += OnAnimationTick;
+        _sceneControl.Scene.FixedUpdate += OnSceneFixedUpdate;
+        _sceneControl.Scene.FixedUpdateCompleted += OnSceneFixedUpdateCompleted;
 
         BuildUi();
         LoadDemo(DemoSceneKind.PrimitivesAndMaterials);
-        if (!_driveAnimationFromRenderLoop)
-        {
-            _animationTimer.Start();
-        }
-    }
-
-    protected override void OnDetachedFromVisualTree(VisualTreeAttachmentEventArgs e)
-    {
-        _animationTimer.Stop();
-        base.OnDetachedFromVisualTree(e);
     }
 
     private void BuildUi()
@@ -246,11 +250,14 @@ public partial class MainView : UserControl
         _animateCheck = Check("Анимация", true);
         _metricsCheck = Check("Performance overlay", !OperatingSystem.IsBrowser());
         _wireframeCheck = Check("Wireframe overlay", false);
-        _shadowsCheck = Check("Directional shadows", true);
 
+        _animateCheck.IsCheckedChanged += (_, _) =>
+        {
+            _sceneControl.IsSimulationPaused = _animateCheck.IsChecked != true;
+            UpdateStatus(force: true);
+        };
         _metricsCheck.IsCheckedChanged += (_, _) => ApplyRuntimeToggles();
         _wireframeCheck.IsCheckedChanged += (_, _) => ApplyRuntimeToggles();
-        _shadowsCheck.IsCheckedChanged += (_, _) => ApplyRuntimeToggles();
 
         _selectionText = MonospaceText("Selection: none");
         _backendText = MonospaceText("Backend: detecting...");
@@ -280,12 +287,11 @@ public partial class MainView : UserControl
         stack.Children.Add(_animateCheck);
         stack.Children.Add(_metricsCheck);
         stack.Children.Add(_wireframeCheck);
-        stack.Children.Add(_shadowsCheck);
 
         stack.Children.Add(Section("Scene notes"));
         stack.Children.Add(new TextBlock
         {
-            Text = "Каждая сцена намеренно маленькая: она показывает одну группу возможностей, чтобы поведение было проще проверить на Desktop и Web backend.",
+            Text = "Сцены используют одинаковые GPU paths на Desktop и WebGL2. В stress lab нагрузка задаётся точными числовыми параметрами; движок не подменяет отсутствующий GPU path CPU-реализацией.",
             Foreground = new SolidColorBrush(Color.FromRgb(185, 194, 210)),
             TextWrapping = TextWrapping.Wrap
         });
@@ -335,6 +341,7 @@ public partial class MainView : UserControl
         _demoSummaryText.Text = definition.Summary;
 
         var scene = _sceneControl.Scene;
+        scene.UpdateLoop.Reset(resetTimeline: true);
         using (scene.BeginUpdate())
         {
             scene.Clear();
@@ -380,6 +387,9 @@ public partial class MainView : UserControl
                     break;
                 case DemoSceneKind.RenderPipelineAndDiagnostics:
                     BuildPipelineAndDiagnosticsScene(scene);
+                    break;
+                case DemoSceneKind.CrossPlatformStressLab:
+                    BuildCrossPlatformStressLabScene(scene);
                     break;
             }
         }
@@ -433,9 +443,9 @@ public partial class MainView : UserControl
         _selectableObjects.Clear();
         _physicsObjects.Clear();
         _characterRigObjects.Clear();
-        _particleSystems.Clear();
         _bridgeSensors.Clear();
         _planetSurfaceObjects.Clear();
+        _stressAnimatedObjects.Clear();
         _cameraFlight.Cancel();
         _selectedObject = null;
         _rotatingBox = null;
@@ -446,7 +456,7 @@ public partial class MainView : UserControl
         _movingSpotLight = null;
         _controlPlane = null;
         _rackLayer = null;
-        _particleSystem = null;
+        _stressLayer = null;
         _physicsCube = null;
         _physicsBall = null;
         _doctorWatsonModel = null;
@@ -462,11 +472,11 @@ public partial class MainView : UserControl
         _shaderAccent = null;
         _characterSequenceTime = 0f;
         _animationTimeSeconds = 0d;
-        _lastAnimationTick = 0;
-        _lastFrameTime = 0d;
         _doctorWatsonBaseY = 0f;
         _clickCount = 0;
         _telemetryCursor = 0;
+        _stressTelemetryAccumulator = 0d;
+        _stressTelemetryUpdateCursor = 0;
     }
 
     private static void ConfigureBaseScene(Scene3D scene)
@@ -484,23 +494,16 @@ public partial class MainView : UserControl
         scene.Environment.Skybox.HorizonColor = new ColorRgba(0.13f, 0.18f, 0.27f, 1f);
         scene.Environment.Skybox.BottomColor = new ColorRgba(0.015f, 0.018f, 0.025f, 1f);
         scene.Environment.Skybox.Intensity = 1.0f;
-        scene.Environment.DirectionalShadows.IsEnabled = true;
-        scene.Environment.DirectionalShadows.Resolution = 1024;
-        scene.Environment.DirectionalShadows.OrthographicSize = 24f;
-        scene.Environment.DirectionalShadows.Distance = 36f;
-        scene.Environment.DirectionalShadows.Strength = 0.46f;
-        scene.Environment.DirectionalShadows.Bias = 0.004f;
 
         scene.Debug.ShowWireframeOverlay = false;
         scene.Performance.EnableWebGlClientGpuTransformAnimation = false;
         scene.Performance.WebGlClientGpuTransformAnimationAmplitude = 0f;
         scene.Performance.EnableWebGlClientHighScaleRuntime = true;
-        scene.Performance.UseConservativeSkinnedPicking = OperatingSystem.IsBrowser();
+        scene.Performance.UseConservativeSkinnedPicking = true;
         scene.Performance.EnableBakedHighScaleDetailedMeshes = true;
         scene.Performance.EnableHighScalePaletteTexture = true;
-        scene.FrameInterpolator.Enabled = !OperatingSystem.IsBrowser();
-        scene.FrameInterpolator.SimulationTickFps = 30d;
-        scene.PhysicsCore = null;
+        scene.FrameInterpolator.Enabled = true;
+        scene.SetPhysicsEnabled(false);
 
         scene.RenderPipeline.Mode = RenderPipelineMode3D.Forward;
         scene.RenderPipeline.EnableDeferredLighting = false;
@@ -583,6 +586,8 @@ public partial class MainView : UserControl
             Position = new Vector3(2.8f, 0.77f, 0f),
             Material = glass
         });
+
+        AddAnimatedObjectGallery(scene, new Vector3(0f, 0.30f, 2.35f), 18, 9, 0.72f, 0.72f);
     }
 
     private void BuildLightingAndEnvironmentScene(Scene3D scene)
@@ -590,12 +595,11 @@ public partial class MainView : UserControl
         scene.Camera.Position = new Vector3(7.6f, 5.1f, -8.6f);
         scene.Camera.Target = new Vector3(0.2f, 1.0f, 0.3f);
         scene.AmbientLightIntensity = 0.16f;
-        scene.Environment.DirectionalShadows.Strength = 0.62f;
         AddGround(scene, 12f, 8f);
 
         AddSelectable(scene, new Box3D
         {
-            Name = "Shadow receiver cube",
+            Name = "Lighting sample cube",
             Width = 1.3f,
             Height = 1.3f,
             Depth = 1.3f,
@@ -637,17 +641,24 @@ public partial class MainView : UserControl
             OuterConeDegrees = 34f,
             Color = new ColorRgba(1f, 0.78f, 0.52f, 1f)
         });
+
+        AddAnimatedObjectGallery(scene, new Vector3(0f, 0.24f, 2.45f), 15, 9, 0.78f, 0.64f);
     }
 
     private void BuildPickingAndInteractionScene(Scene3D scene)
     {
-        scene.Camera.Position = new Vector3(6.0f, 3.8f, -7.4f);
+        scene.Camera.Position = new Vector3(8.6f, 6.2f, -12.6f);
         scene.Camera.Target = new Vector3(0f, 0.9f, 0f);
-        AddGround(scene, 9f, 6f);
+        AddGround(scene, 13f, 20f);
 
-        for (var i = 0; i < 6; i++)
+        var pickableCount = 24;
+        const int columns = 12;
+        var rows = (pickableCount + columns - 1) / columns;
+        for (var i = 0; i < pickableCount; i++)
         {
-            var x = -3.0f + i * 1.2f;
+            var x = (i % columns - (columns - 1) * 0.5f) * 0.88f;
+            var z = (i / columns - (rows - 1) * 0.5f) * 0.86f;
+            var color = ColorFromHue(i * 0.071f);
             Object3D obj = (i % 3) switch
             {
                 0 => new Box3D
@@ -656,8 +667,8 @@ public partial class MainView : UserControl
                     Width = 0.82f,
                     Height = 0.82f,
                     Depth = 0.82f,
-                    Position = new Vector3(x, 0.46f, 0f),
-                    Material = Material3D.CreatePhong(new ColorRgba(0.20f + i * 0.10f, 0.54f, 0.96f, 1f), 0.45f, 48f)
+                    Position = new Vector3(x, 0.46f, z),
+                    Material = Material3D.CreatePhong(color, 0.45f, 48f)
                 },
                 1 => new Sphere3D
                 {
@@ -665,8 +676,8 @@ public partial class MainView : UserControl
                     Radius = 0.46f,
                     Segments = 32,
                     Rings = 16,
-                    Position = new Vector3(x, 0.52f, 0f),
-                    Material = Material3D.CreateLambert(new ColorRgba(0.20f, 0.82f - i * 0.04f, 0.42f, 1f))
+                    Position = new Vector3(x, 0.52f, z),
+                    Material = Material3D.CreateLambert(color)
                 },
                 _ => new Cylinder3D
                 {
@@ -674,8 +685,8 @@ public partial class MainView : UserControl
                     Radius = 0.34f,
                     Height = 0.92f,
                     Segments = 28,
-                    Position = new Vector3(x, 0.46f, 0f),
-                    Material = Material3D.CreatePhong(new ColorRgba(0.96f, 0.56f, 0.18f, 1f), 0.34f, 36f)
+                    Position = new Vector3(x, 0.46f, z),
+                    Material = Material3D.CreatePhong(color, 0.34f, 36f)
                 }
             };
             AddSelectable(scene, obj);
@@ -684,7 +695,7 @@ public partial class MainView : UserControl
         _rotatingBox = scene.Add(new Box3D
         {
             Name = "Selection marker / non-pickable helper",
-            Width = 7.4f,
+            Width = 11.2f,
             Height = 0.04f,
             Depth = 0.08f,
             Position = new Vector3(0f, 0.04f, 0.92f),
@@ -798,8 +809,9 @@ public partial class MainView : UserControl
             Height = 1.35f,
             Position = new Vector3(1.95f, 1.75f, 0.20f),
             AlwaysFaceCamera = true,
-            RenderScale = global::System.OperatingSystem.IsBrowser() ? 1.25d : 4.0d
+            RenderScale = 2.0d
         });
+        AddAnimatedObjectGallery(scene, new Vector3(-0.25f, 0.22f, 2.05f), 12, 12, 0.62f, 0.58f);
     }
 
     private void BuildHighScaleDigitalTwinScene(Scene3D scene)
@@ -809,31 +821,27 @@ public partial class MainView : UserControl
         scene.Camera.Target = new Vector3(0.6f, 1.35f, 0.4f);
         scene.Camera.FarPlane = 500f;
         scene.Performance.DrawDistance = 1000f;
-        var browserFastPath = OperatingSystem.IsBrowser();
-        if (!browserFastPath)
-        {
-            AddGround(scene, 24f, 16f);
-        }
+        var rackColumns = 24;
+        var rackRows = 16;
+        AddGround(scene, rackColumns * 1.18f, rackRows * 1.16f);
         scene.AmbientLightIntensity = 0.38f;
         scene.Environment.Skybox.TopColor = new ColorRgba(0.05f, 0.09f, 0.15f, 1f);
         scene.Environment.Skybox.HorizonColor = new ColorRgba(0.13f, 0.19f, 0.25f, 1f);
         scene.AddLight(new DirectionalLight3D { Direction = Vector3.Normalize(new Vector3(-0.38f, -0.82f, -0.24f)), Intensity = 1.08f, Color = new ColorRgba(1f, 0.95f, 0.86f, 1f) });
         scene.AddLight(new PointLight3D { Position = new Vector3(-5f, 5.2f, -5f), Range = 28f, Intensity = 2.4f, Color = new ColorRgba(0.55f, 0.76f, 1f, 1f) });
 
-        // Keep this showcase deterministic. Shader-side high-scale motion is useful for
-        // stress tests, but in a demo it can make retained batches appear to blink while
-        // camera/LOD state is still warming up.
+        // The same retained configuration and counts are used on native OpenGL and WebGL2.
+        // Animation remains disabled in this topology-focused scene; the dedicated stress lab
+        // exercises the shared shader-side transform path.
         scene.Performance.EnableWebGlClientGpuTransformAnimation = false;
         scene.Performance.WebGlClientGpuTransformAnimationAmplitude = 0f;
         scene.Performance.MaxVisibleHighScaleChunks = 0;
         scene.Performance.MaxHighScaleVisibleInstances = 0;
         scene.Performance.EnableDistanceFade = false;
-        // This demo is intentionally small (~160 retained racks). Force the stable aggregate
-        // high-scale path on Desktop so it does not depend on per-chunk frustum classification
-        // while the generic chunk culler is still kept conservative. This removes the
-        // angle-dependent "only some racks load" behavior reported for the digital-twin scene.
+        // Force the same aggregate instance path for both backends so camera movement cannot
+        // select a platform-specific chunk submission strategy.
         scene.Performance.EnableHighScaleAggregateLayerBatches = true;
-        scene.Performance.HighScaleAggregateLayerInstanceThreshold = 1024;
+        scene.Performance.HighScaleAggregateLayerInstanceThreshold = 10000;
 
         // Keep detailed rack rendering unbaked in this demo. The generic baked-detailed path is
         // still useful for large scenes, but for the current rack template it can collapse the
@@ -846,38 +854,37 @@ public partial class MainView : UserControl
         template.AddMaterialVariant(2, "Critical").DefaultColor = new ColorRgba(1.0f, 0.19f, 0.14f, 1f);
         template.AddMaterialVariant(3, "Offline").DefaultColor = new ColorRgba(0.22f, 0.24f, 0.29f, 0.52f);
 
-        var layer = new HighScaleInstanceLayer3D(template, 256, 7f) { Name = "Digital twin retained rack layer" };
+        var layer = new HighScaleInstanceLayer3D(template, rackColumns * rackRows, 7f) { Name = "Digital twin retained rack layer" };
         layer.LodPolicy.DetailedDistance = 44f;
         layer.LodPolicy.SimplifiedDistance = 86f;
         layer.LodPolicy.ProxyDistance = 160f;
         layer.LodPolicy.DrawDistance = 420f;
         layer.LodPolicy.FadeDistance = 0f;
         layer.LodPolicy.EnableBillboardFallback = false;
-        layer.AddInstances(CreateRackTransforms(16, 10, 1.05f, 1.02f));
+        layer.AddInstances(CreateRackTransforms(rackColumns, rackRows, 1.05f, 1.02f));
         scene.Add(layer);
         _rackLayer = layer;
 
-        if (!browserFastPath)
-        {
-            var floor = Material3D.CreateLambert(new ColorRgba(0.12f, 0.14f, 0.16f, 1f));
-            var aisle = Material3D.CreateLambert(new ColorRgba(0.20f, 0.23f, 0.26f, 1f));
-            var cable = Material3D.CreatePhong(new ColorRgba(0.08f, 0.12f, 0.18f, 1f), 0.28f, 44f);
+        var floor = Material3D.CreateLambert(new ColorRgba(0.12f, 0.14f, 0.16f, 1f));
+        var aisle = Material3D.CreateLambert(new ColorRgba(0.20f, 0.23f, 0.26f, 1f));
+        var cable = Material3D.CreatePhong(new ColorRgba(0.08f, 0.12f, 0.18f, 1f), 0.28f, 44f);
 
             // Do not duplicate rack cabinet geometry here. The retained layer above is the
             // single source of rack rendering; overlapping StaticBox cabinets caused depth
             // fighting and angle-dependent disappearing/flickering in the digital twin demo.
-            for (var z = -5; z <= 5; z += 2)
+            for (var z = -rackRows / 2; z <= rackRows / 2; z += 3)
             {
-                StaticBox(scene, "Service aisle " + z.ToString(CultureInfo.InvariantCulture), 20.5f, 0.035f, 0.10f, new Vector3(0f, 0.055f, z * 1.02f), aisle, pickable: false);
+                StaticBox(scene, "Service aisle " + z.ToString(CultureInfo.InvariantCulture), rackColumns * 1.10f, 0.035f, 0.10f, new Vector3(0f, 0.055f, z * 1.02f), aisle, pickable: false);
             }
-            for (var x = -8; x <= 8; x += 2)
+            for (var x = -rackColumns / 2; x <= rackColumns / 2; x += 4)
             {
-                StaticBox(scene, "Overhead cable tray " + x.ToString(CultureInfo.InvariantCulture), 0.08f, 0.10f, 12.4f, new Vector3(x * 0.65f, 2.65f, 0f), cable, pickable: false);
+                StaticBox(scene, "Overhead cable tray " + x.ToString(CultureInfo.InvariantCulture), 0.08f, 0.10f, rackRows * 1.08f, new Vector3(x * 1.05f, 2.65f, 0f), cable, pickable: false);
             }
-            for (var i = 0; i < 18; i++)
+            var beaconCount = 24;
+            for (var i = 0; i < beaconCount; i++)
             {
-                var x = -8.0f + (i % 9) * 2.0f;
-                var z = -4.8f + (i / 9) * 9.6f;
+                var x = ((i * 7) % rackColumns - rackColumns * 0.5f) * 1.05f;
+                var z = ((i * 11) % rackRows - rackRows * 0.5f) * 1.02f;
                 var beacon = scene.Add(new Sphere3D
                 {
                     Name = "Telemetry beacon " + (i + 1).ToString(CultureInfo.InvariantCulture),
@@ -891,8 +898,7 @@ public partial class MainView : UserControl
                 });
                 _selectableObjects.Add(beacon);
             }
-            StaticBox(scene, "Operations floor mat", 21.5f, 0.02f, 12.2f, new Vector3(0f, 0.07f, 0f), floor, pickable: false);
-        }
+        StaticBox(scene, "Operations floor mat", rackColumns * 1.12f, 0.02f, rackRows * 1.10f, new Vector3(0f, 0.07f, 0f), floor, pickable: false);
         RandomizeRackTelemetry();
     }
 
@@ -915,7 +921,7 @@ public partial class MainView : UserControl
             IsPickable = false
         });
 
-        _particleSystem = AddParticleSystem(scene,
+        AddParticleSystem(scene,
             "Blue fountain / soft quads",
             new Vector3(-1.35f, 0.28f, -0.1f),
             new ParticleSystemSettings3D
@@ -1033,6 +1039,9 @@ public partial class MainView : UserControl
 
     private ParticleSystem3D AddParticleSystem(Scene3D scene, string name, Vector3 position, ParticleSystemSettings3D settings, ParticleEmitter3D emitter)
     {
+        var loadMultiplier = 1.75f;
+        settings.Capacity = global::System.Math.Max(1, (int)(settings.Capacity * loadMultiplier));
+        settings.EmissionRatePerSecond *= loadMultiplier;
         var system = scene.Add(new ParticleSystem3D(settings, emitter)
         {
             Name = name,
@@ -1045,7 +1054,6 @@ public partial class MainView : UserControl
                 Opacity = settings.StartColor.A
             }
         });
-        _particleSystems.Add(system);
         return system;
     }
 
@@ -1053,14 +1061,14 @@ public partial class MainView : UserControl
     {
         scene.Camera.Position = new Vector3(5.6f, 3.4f, -6.8f);
         scene.Camera.Target = new Vector3(0.3f, 0.9f, 0.2f);
-        scene.PhysicsCore = new Jitter2PhysicsCore
+        scene.ReplacePhysicsCore(new Jitter2PhysicsCore
         {
             FixedTimeStep = 1f / 120f,
             MaxStepsPerFrame = 10,
             SubstepCount = 4,
             SolverIterations = (solver: 14, relaxation: 5),
             Gravity = new Vector3(0f, -9.81f, 0f)
-        };
+        });
 
         scene.Add(new Plane3D
         {
@@ -1190,11 +1198,55 @@ public partial class MainView : UserControl
             _physicsObjects.Add(body);
         }
 
+        var stressBodyCount = 12;
+        for (var i = 0; i < stressBodyCount; i++)
+        {
+            var column = i % 8;
+            var layer = i / 8;
+            Object3D body = (i & 1) == 0
+                ? new Box3D
+                {
+                    Name = "Physics stress box " + (i + 1).ToString(CultureInfo.InvariantCulture),
+                    Width = 0.34f,
+                    Height = 0.34f,
+                    Depth = 0.34f,
+                    Position = new Vector3(-2.3f + column * 0.62f, 3.5f + layer * 0.46f, -0.4f + (i % 3) * 0.42f),
+                    Material = Material3D.CreatePhong(ColorFromHue(i * 0.093f), 0.32f, 42f),
+                    Rigidbody = CreateStressRigidbody(i)
+                }
+                : new Sphere3D
+                {
+                    Name = "Physics stress sphere " + (i + 1).ToString(CultureInfo.InvariantCulture),
+                    Radius = 0.19f,
+                    Segments = 20,
+                    Rings = 10,
+                    Position = new Vector3(-2.3f + column * 0.62f, 3.5f + layer * 0.46f, -0.4f + (i % 3) * 0.42f),
+                    Material = Material3D.CreatePhong(ColorFromHue(i * 0.093f), 0.38f, 48f),
+                    Rigidbody = CreateStressRigidbody(i)
+                };
+            AddSelectable(scene, body);
+            _physicsObjects.Add(body);
+        }
+
         foreach (var obj in _physicsObjects)
         {
             EnablePhysicsGrab(obj);
         }
     }
+
+    private static Rigidbody3D CreateStressRigidbody(int index)
+        => new()
+        {
+            Mass = 0.42f + (index % 5) * 0.08f,
+            Restitution = 0.08f + (index % 3) * 0.04f,
+            Friction = 0.58f,
+            RollingFriction = 0.012f,
+            LinearDamping = 0.008f,
+            AngularDamping = 0.014f,
+            MaxAngularSpeed = 20f,
+            GenerateContactRotation = true,
+            Velocity = new Vector3((index % 4 - 1.5f) * 0.08f, 0f, ((index * 3) % 5 - 2f) * 0.05f)
+        };
 
     private void EnablePhysicsGrab(Object3D obj)
     {
@@ -1228,7 +1280,6 @@ public partial class MainView : UserControl
         scene.Camera.Position = new Vector3(4.3f, 2.45f, -5.4f);
         scene.Camera.Target = new Vector3(0f, 1.10f, 0f);
         scene.AmbientLightIntensity = 0.38f;
-        scene.Environment.DirectionalShadows.Strength = 0.42f;
         AddGround(scene, 6.0f, 4.8f);
 
         scene.AddLight(new PointLight3D
@@ -1303,7 +1354,7 @@ public partial class MainView : UserControl
             $"{asset.Textures.Count.ToString(CultureInfo.InvariantCulture)} embedded textures.\n" +
             $"Skins: {asset.Skins.Count.ToString(CultureInfo.InvariantCulture)} | animations: {asset.Animations.Count.ToString(CultureInfo.InvariantCulture)}. " +
             (hasSkins && hasAnimations
-                ? "Rigged animation data is present. CPU skinning is enabled, so the imported mesh bends according to authored bone animation clips."
+                ? "Rigged animation data is present. GPU skinning is active, so the imported mesh bends according to authored bone animation clips."
                 : "This GLB has no skeleton/authored animation clips, so the demo uses a procedural proxy. For wave/jump/squat, provide GLB/FBX clips authored for this skeleton.") +
             "\n" + asset.Diagnostics.ToSummary();
     }
@@ -1614,7 +1665,8 @@ public partial class MainView : UserControl
     {
         var starMat = new Material3D { BaseColor = new ColorRgba(0.86f, 0.92f, 1f, 1f), Lighting = LightingMode.Unlit };
         var warmStar = new Material3D { BaseColor = new ColorRgba(1f, 0.84f, 0.62f, 1f), Lighting = LightingMode.Unlit };
-        for (var i = 0; i < 120; i++)
+        var starCount = 240;
+        for (var i = 0; i < starCount; i++)
         {
             var a = i * 12.9898f;
             var b = i * 78.233f;
@@ -1681,13 +1733,11 @@ public partial class MainView : UserControl
         scene.Camera.Position = new Vector3(6.6f, 4.1f, -7.4f);
         scene.Camera.Target = new Vector3(0f, 0.95f, 0f);
         scene.AmbientLightIntensity = 0.28f;
-        scene.RenderPipeline.Mode = RenderPipelineMode3D.DeferredIfSupported;
-        scene.RenderPipeline.EnableDeferredLighting = true;
-        scene.RenderPipeline.EnableHdr = true;
+        scene.RenderPipeline.Mode = RenderPipelineMode3D.Forward;
+        scene.RenderPipeline.EnableDeferredLighting = false;
+        scene.RenderPipeline.EnableHdr = false;
         scene.RenderPipeline.EnableTransparentForwardPass = true;
-        scene.RenderPipeline.Ssao.Enabled = true;
-        scene.RenderPipeline.Ssao.Strength = 0.36f;
-        scene.RenderPipeline.Ssao.Radius = 0.65f;
+        scene.RenderPipeline.Ssao.Enabled = false;
         scene.RenderPipeline.ToneMapping.Enabled = true;
         scene.RenderPipeline.ToneMapping.Mode = ToneMappingMode3D.AcesApproximation;
         scene.RenderPipeline.ToneMapping.Exposure = 1.05f;
@@ -1760,6 +1810,7 @@ public partial class MainView : UserControl
                 Shininess = 84f
             }
         });
+        AddAnimatedObjectGallery(scene, new Vector3(0f, 0.22f, 2.25f), 18, 12, 0.68f, 0.60f);
     }
 
 
@@ -1776,7 +1827,7 @@ public partial class MainView : UserControl
         scene.Environment.Skybox.HorizonColor = new ColorRgba(0.30f, 0.36f, 0.42f, 1f);
         scene.Environment.Skybox.BottomColor = new ColorRgba(0.045f, 0.055f, 0.065f, 1f);
 
-        scene.PhysicsCore = null;
+        scene.SetPhysicsEnabled(false);
         scene.AddLight(new DirectionalLight3D { Direction = Vector3.Normalize(new Vector3(-0.40f, -0.76f, -0.30f)), Intensity = 1.15f, Color = new ColorRgba(1f, 0.94f, 0.84f, 1f) });
         scene.AddLight(new PointLight3D { Position = new Vector3(-2.6f, 4.2f, -3.4f), Range = 18f, Intensity = 2.0f, Color = new ColorRgba(0.70f, 0.84f, 1f, 1f) });
         scene.AddLight(new PointLight3D { Position = new Vector3(3.8f, 3.0f, 1.8f), Range = 14f, Intensity = 1.5f, Color = new ColorRgba(1f, 0.78f, 0.55f, 1f) });
@@ -1789,13 +1840,15 @@ public partial class MainView : UserControl
         var accent = Material3D.CreatePhong(new ColorRgba(0.16f, 0.48f, 0.92f, 1f), 0.30f, 46f);
 
         StaticBox(scene, "Open plaza walkable slab", 28f, 0.20f, 24f, new Vector3(0f, -0.10f, 0f), concrete, pickable: false);
-        for (var i = 0; i < 10; i++)
+        var cityBlockCount = 18;
+        for (var i = 0; i < cityBlockCount; i++)
         {
-            var x = -12f + i * 2.8f;
-            StaticBox(scene, "Background city block " + i.ToString(CultureInfo.InvariantCulture), 1.2f, 1.8f + (i % 5) * 0.7f, 1.1f, new Vector3(x, 0.9f + (i % 5) * 0.35f, 10.5f), Material3D.CreateLambert(new ColorRgba(0.12f, 0.16f, 0.20f, 1f)), pickable: false);
+            var x = -18f + (i % 13) * 2.8f;
+            var z = 10.5f + (i / 13) * 2.2f;
+            StaticBox(scene, "Background city block " + i.ToString(CultureInfo.InvariantCulture), 1.2f, 1.8f + (i % 5) * 0.7f, 1.1f, new Vector3(x, 0.9f + (i % 5) * 0.35f, z), Material3D.CreateLambert(new ColorRgba(0.12f, 0.16f, 0.20f, 1f)), pickable: false);
         }
 
-        const int floors = 3;
+        const int floors = 4;
         const float floorHeight = 2.25f;
         const float width = 10.4f;
         const float depth = 8.0f;
@@ -1900,11 +1953,14 @@ public partial class MainView : UserControl
                 StaticBox(scene, "Suspender cable " + side.ToString(CultureInfo.InvariantCulture) + "/" + c.ToString(CultureInfo.InvariantCulture), 0.065f, 6.0f - c * 0.18f, 0.065f, new Vector3(side * (2.4f + c * 0.75f), 5.0f - c * 0.05f, z), darkSteel, new Vector3(0f, 0f, side * (18f + c * 2f)), pickable: false);
             }
         }
-        for (var i = 0; i < 18; i++)
+        var vehicleCount = 36;
+        for (var i = 0; i < vehicleCount; i++)
         {
-            var x = -28f + i * 3.3f;
-            var z = i % 2 == 0 ? -0.95f : 1.05f;
-            StaticBox(scene, "Traffic vehicle " + (i + 1).ToString(CultureInfo.InvariantCulture), 0.95f, 0.46f, 0.55f, new Vector3(x, 1.66f, z), Material3D.CreatePhong(ColorFromHue(0.02f + i * 0.08f), 0.30f, 46f), pickable: true);
+            var lane = i % 4;
+            var slot = (i / 4) % 32;
+            var x = -29f + slot * 1.87f + (lane & 1) * 0.32f;
+            var z = -1.55f + lane * 1.02f;
+            StaticBox(scene, "Traffic vehicle " + (i + 1).ToString(CultureInfo.InvariantCulture), 0.78f, 0.42f, 0.48f, new Vector3(x, 1.63f, z), Material3D.CreatePhong(ColorFromHue(0.02f + i * 0.08f), 0.30f, 46f), pickable: true);
         }
 
         AddBridgeSensor(scene, "S-01 West hinge torque", new Vector3(-9.4f, 1.80f, -3.05f), "torque 41 kNm", "Main west hinge", "Hydraulic torque is within normal opening envelope.");
@@ -2011,7 +2067,7 @@ public partial class MainView : UserControl
             Height = 1.02f,
             Position = sensor.Position + new Vector3(0.0f, 0.82f, 0.0f),
             AlwaysFaceCamera = true,
-            RenderScale = global::System.OperatingSystem.IsBrowser() ? 1.25d : 3.5d,
+            RenderScale = 2.0d,
             IsPickable = false,
             IsManipulationEnabled = false
         });
@@ -2032,14 +2088,12 @@ public partial class MainView : UserControl
         scene.Camera.Position = new Vector3(7.0f, 4.6f, -8.0f);
         scene.Camera.Target = new Vector3(0f, 0.95f, 0f);
         AddGround(scene, 10f, 7f);
-        scene.RenderPipeline.Mode = RenderPipelineMode3D.DeferredIfSupported;
-        scene.RenderPipeline.EnableDeferredLighting = true;
-        scene.RenderPipeline.EnableHdr = true;
+        scene.RenderPipeline.Mode = RenderPipelineMode3D.Forward;
+        scene.RenderPipeline.EnableDeferredLighting = false;
+        scene.RenderPipeline.EnableHdr = false;
         scene.RenderPipeline.EnableTransparentForwardPass = true;
-        scene.RenderPipeline.EnableMotionVectorMetadata = true;
-        scene.RenderPipeline.Ssao.Enabled = true;
-        scene.RenderPipeline.Ssao.Strength = 0.45f;
-        scene.RenderPipeline.Ssao.Radius = 0.65f;
+        scene.RenderPipeline.EnableMotionVectorMetadata = false;
+        scene.RenderPipeline.Ssao.Enabled = false;
         scene.RenderPipeline.ToneMapping.Enabled = true;
         scene.RenderPipeline.ToneMapping.Mode = ToneMappingMode3D.AcesApproximation;
         scene.RenderPipeline.ToneMapping.Exposure = 1.05f;
@@ -2056,7 +2110,7 @@ public partial class MainView : UserControl
         });
         AddSelectable(scene, new Sphere3D
         {
-            Name = "HDR/SSAO sample sphere",
+            Name = "Forward tone-mapping sample sphere",
             Radius = 0.65f,
             Segments = 42,
             Rings = 20,
@@ -2089,6 +2143,188 @@ public partial class MainView : UserControl
                 Shininess = 96f
             }
         });
+
+        AddAnimatedObjectGallery(scene, new Vector3(0f, 0.24f, 2.30f), 18, 12, 0.70f, 0.62f);
+    }
+
+    private void BuildCrossPlatformStressLabScene(Scene3D scene)
+    {
+        var parameters = _stressParameters;
+        var columns = parameters.Columns;
+        var rows = parameters.Rows;
+        var instanceCount = checked(columns * rows);
+
+        scene.Camera.Position = new Vector3(columns * 0.42f, 16f, -rows * 0.48f);
+        scene.Camera.Target = new Vector3(0f, 1.2f, 0f);
+        scene.Camera.FarPlane = 900f;
+        scene.AmbientLightIntensity = 0.34f;
+        scene.Environment.Skybox.TopColor = new ColorRgba(0.025f, 0.055f, 0.13f, 1f);
+        scene.Environment.Skybox.HorizonColor = new ColorRgba(0.12f, 0.20f, 0.30f, 1f);
+        AddGround(scene, columns * 0.92f, rows * 0.92f);
+        scene.AddLight(new PointLight3D
+        {
+            Position = new Vector3(-8f, 9f, -8f),
+            Range = 80f,
+            Intensity = 3.2f,
+            Color = new ColorRgba(0.36f, 0.66f, 1f, 1f)
+        });
+        scene.AddLight(new PointLight3D
+        {
+            Position = new Vector3(10f, 6f, 9f),
+            Range = 72f,
+            Intensity = 2.8f,
+            Color = new ColorRgba(1f, 0.38f, 0.20f, 1f)
+        });
+
+        scene.RenderPipeline.ToneMapping.Enabled = true;
+        scene.RenderPipeline.ToneMapping.Mode = ToneMappingMode3D.AcesApproximation;
+        scene.RenderPipeline.ToneMapping.Exposure = 1.08f;
+        scene.Performance.EnableHighScaleAggregateLayerBatches = true;
+        scene.Performance.HighScaleAggregateLayerInstanceThreshold = 10000;
+        scene.Performance.EnableBakedHighScaleDetailedMeshes = false;
+        scene.Performance.EnableWebGlClientGpuTransformAnimation = true;
+        scene.Performance.WebGlClientGpuTransformAnimationAmplitude = 0.14f;
+        scene.Performance.MaxVisibleHighScaleChunks = 0;
+        scene.Performance.MaxHighScaleVisibleInstances = 0;
+        scene.Performance.EnableDistanceFade = false;
+
+        var template = HighScaleTemplateCompiler.Compile(7001, new DemoStressNode3D(), false);
+        template.AddMaterialVariant(1, "Cool").DefaultColor = new ColorRgba(0.18f, 0.62f, 1f, 1f);
+        template.AddMaterialVariant(2, "Hot").DefaultColor = new ColorRgba(1f, 0.30f, 0.12f, 1f);
+        template.AddMaterialVariant(3, "Telemetry alert").DefaultColor = new ColorRgba(1f, 0.88f, 0.18f, 1f);
+        var layer = new HighScaleInstanceLayer3D(template, instanceCount, 8f)
+        {
+            Name = $"Cross-platform retained stress field / {instanceCount:n0} instances"
+        };
+        layer.LodPolicy.DetailedDistance = 80f;
+        layer.LodPolicy.SimplifiedDistance = 180f;
+        layer.LodPolicy.ProxyDistance = 360f;
+        layer.LodPolicy.DrawDistance = 760f;
+        layer.LodPolicy.FadeDistance = 0f;
+        layer.LodPolicy.EnableBillboardFallback = false;
+        layer.AddInstances(CreateStressFieldTransforms(columns, rows, 0.82f));
+        scene.Add(layer);
+        _stressLayer = layer;
+        BurstStressTelemetry();
+        EngineLog3D.Information(
+            "Demo.Stress",
+            $"Built parameterized stress workload: logicalNodes={instanceCount:n0}, " +
+            $"compositePartInstances={instanceCount * template.Parts.Count:n0}, field={columns}x{rows}, " +
+            $"transparent={parameters.TransparentObjects:n0}, particles={parameters.ParticleCapacityA:n0}+{parameters.ParticleCapacityB:n0}, " +
+            $"telemetry={parameters.TelemetryUpdatesPerSecond:n0}/s, backendCounts=identical.");
+
+        var transparentCount = parameters.TransparentObjects;
+        for (var i = 0; i < transparentCount; i++)
+        {
+            var angle = i * (MathF.PI * 2f / transparentCount);
+            var ring = 7.5f + (i % 5) * 0.45f;
+            var origin = new Vector3(MathF.Cos(angle) * ring, 1.1f + (i % 4) * 0.34f, MathF.Sin(angle) * ring);
+            var panel = scene.Add(new Box3D
+            {
+                Name = "Transparent sorting stress panel " + (i + 1).ToString(CultureInfo.InvariantCulture),
+                Width = 0.46f,
+                Height = 0.72f,
+                Depth = 0.035f,
+                Position = origin,
+                RotationDegrees = new Vector3(0f, -angle * 180f / MathF.PI, 0f),
+                Material = new Material3D
+                {
+                    BaseColor = WithAlpha(ColorFromHue(i * 0.071f), 0.30f),
+                    Opacity = 0.30f,
+                    Surface = SurfaceMode.Transparent,
+                    Lighting = LightingMode.Phong,
+                    SpecularStrength = 0.52f,
+                    Shininess = 72f
+                },
+                IsPickable = false,
+                IsManipulationEnabled = false
+            });
+            _stressAnimatedObjects.Add((panel, origin, i * 0.37f));
+        }
+
+        AddParticleSystem(scene,
+            "Stress plasma stream A",
+            new Vector3(-4.2f, 0.35f, -3.2f),
+            new ParticleSystemSettings3D
+            {
+                Capacity = parameters.ParticleCapacityA,
+                EmissionRatePerSecond = parameters.ParticleEmissionA,
+                ParticleLifetimeSeconds = 3.0f,
+                StartSize = 0.075f,
+                EndSize = 0.012f,
+                StartColor = new ColorRgba(0.22f, 0.72f, 1f, 0.92f),
+                EndColor = new ColorRgba(0.08f, 0.16f, 0.8f, 0f),
+                InitialSpeed = 2.5f,
+                Spread = 1.1f,
+                Prewarm = true,
+                RenderMode = ParticleRenderMode3D.CameraFacingQuad
+            },
+            new ParticleEmitter3D(8101) { Direction = new Vector3(0.35f, 1f, 0.2f), Gravity = new Vector3(0f, -0.62f, 0f) });
+
+        AddParticleSystem(scene,
+            "Stress cube debris B",
+            new Vector3(4.2f, 0.42f, 3.2f),
+            new ParticleSystemSettings3D
+            {
+                Capacity = parameters.ParticleCapacityB,
+                EmissionRatePerSecond = parameters.ParticleEmissionB,
+                ParticleLifetimeSeconds = 3.4f,
+                StartSize = 0.09f,
+                EndSize = 0.025f,
+                StartColor = new ColorRgba(1f, 0.34f, 0.12f, 0.95f),
+                EndColor = new ColorRgba(0.55f, 0.05f, 0.02f, 0f),
+                InitialSpeed = 1.8f,
+                Spread = 1.4f,
+                Prewarm = true,
+                RenderMode = ParticleRenderMode3D.Cube3D
+            },
+            new ParticleEmitter3D(8102) { Direction = new Vector3(-0.25f, 1f, -0.2f), Gravity = new Vector3(0f, -0.48f, 0f) });
+    }
+
+    private void AddAnimatedObjectGallery(Scene3D scene, Vector3 center, int count, int columns, float spacingX, float spacingZ)
+    {
+        var rows = (count + columns - 1) / columns;
+        var materials = new Material3D[8];
+        for (var i = 0; i < materials.Length; i++)
+        {
+            materials[i] = Material3D.CreatePhong(ColorFromHue(i / (float)materials.Length), 0.36f + (i % 3) * 0.12f, 42f + i * 7f);
+        }
+
+        for (var i = 0; i < count; i++)
+        {
+            var x = (i % columns - (columns - 1) * 0.5f) * spacingX;
+            var z = (i / columns - (rows - 1) * 0.5f) * spacingZ;
+            var origin = center + new Vector3(x, (i % 4) * 0.12f, z);
+            Object3D obj = (i % 3) switch
+            {
+                0 => new Box3D { Width = 0.34f, Height = 0.34f, Depth = 0.34f },
+                1 => new Sphere3D { Radius = 0.20f, Segments = 20, Rings = 10 },
+                _ => new Cylinder3D { Radius = 0.16f, Height = 0.42f, Segments = 18 }
+            };
+            obj.Name = "Dense gallery object " + (i + 1).ToString(CultureInfo.InvariantCulture);
+            obj.Position = origin;
+            obj.Material = materials[i % materials.Length];
+            obj.IsPickable = false;
+            obj.IsManipulationEnabled = false;
+            scene.Add(obj);
+            _stressAnimatedObjects.Add((obj, origin, i * 0.41f));
+        }
+    }
+
+    private static IEnumerable<Matrix4x4> CreateStressFieldTransforms(int columns, int rows, float spacing)
+    {
+        var offsetX = (columns - 1) * spacing * 0.5f;
+        var offsetZ = (rows - 1) * spacing * 0.5f;
+        for (var z = 0; z < rows; z++)
+        {
+            for (var x = 0; x < columns; x++)
+            {
+                var wave = MathF.Sin(x * 0.31f) * 0.22f + MathF.Cos(z * 0.27f) * 0.18f;
+                var rotation = ((x * 17 + z * 11) % 360) * MathF.PI / 180f;
+                yield return Matrix4x4.CreateRotationY(rotation) *
+                             Matrix4x4.CreateTranslation(x * spacing - offsetX, 0.58f + wave, z * spacing - offsetZ);
+            }
+        }
     }
 
     private T AddSelectable<T>(Scene3D scene, T obj) where T : Object3D
@@ -2125,7 +2361,6 @@ public partial class MainView : UserControl
         var scene = _sceneControl.Scene;
         _sceneControl.ShowPerformanceMetrics = _metricsCheck.IsChecked == true;
         scene.Debug.ShowWireframeOverlay = _wireframeCheck.IsChecked == true;
-        scene.Environment.DirectionalShadows.IsEnabled = _shadowsCheck.IsChecked == true;
         UpdateStatus(force: true);
     }
 
@@ -2143,6 +2378,7 @@ public partial class MainView : UserControl
             DemoSceneKind.EmbeddedAvaloniaControls => "Press embedded UI programmatically",
             DemoSceneKind.PickingAndInteraction => "Select next object",
             DemoSceneKind.RenderPipelineAndDiagnostics => "Toggle wireframe",
+            DemoSceneKind.CrossPlatformStressLab => "Burst-update all telemetry",
             _ => "Reset camera"
         };
     }
@@ -2186,6 +2422,9 @@ public partial class MainView : UserControl
                 _wireframeCheck.IsChecked = _wireframeCheck.IsChecked != true;
                 ApplyRuntimeToggles();
                 break;
+            case DemoSceneKind.CrossPlatformStressLab:
+                BurstStressTelemetry();
+                break;
             default:
                 ResetCameraForCurrentDemo();
                 break;
@@ -2212,59 +2451,23 @@ public partial class MainView : UserControl
         SetSelection(_selectableObjects[next]);
     }
 
-    private void OnAnimationTick(object? sender, EventArgs e) => RunAnimationTick();
-
-    private void RunAnimationTick()
+    private void OnSceneFixedUpdate(Scene3D scene, in SceneFixedUpdateContext3D context)
     {
-        try
-        {
-            var nowTicks = Stopwatch.GetTimestamp();
-            var dt = ComputeAnimationDelta(nowTicks);
-            _animationTimeSeconds += dt;
-            _lastFrameTime = _animationTimeSeconds;
-
-            if (_animateCheck is not null && _animateCheck.IsChecked == true)
-            {
-                AnimateScene((float)_animationTimeSeconds, (float)dt);
-            }
-
-            UpdateStatus();
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine("Avalonia3D demo animation tick failed: " + ex);
-        }
+        if (!ReferenceEquals(scene, _sceneControl.Scene)) return;
+        _animationTimeSeconds = context.SimulationTimeSeconds;
+        AnimateScene(scene, (float)context.SimulationTimeSeconds, context.DeltaSeconds);
     }
 
-    private double ComputeAnimationDelta(long nowTicks)
+    private void OnSceneFixedUpdateCompleted(Scene3D scene, in SceneFixedUpdateContext3D context)
     {
-        if (_lastAnimationTick == 0)
-        {
-            _lastAnimationTick = nowTicks;
-            return 1d / 60d;
-        }
-
-        var rawDt = (nowTicks - _lastAnimationTick) / (double)Stopwatch.Frequency;
-        _lastAnimationTick = nowTicks;
-
-        if (rawDt > 0.25d)
-        {
-            _sceneControl.Scene.FrameInterpolator.Reset();
-            return 1d / 60d;
-        }
-
-        var maxDt = OperatingSystem.IsBrowser() ? 1d / 30d : 0.05d;
-        return System.Math.Clamp(rawDt, 0.001d, maxDt);
+        if (!ReferenceEquals(scene, _sceneControl.Scene)) return;
+        // The engine advances the active clip before this callback. A zero-delta sequence
+        // update performs only the deterministic transition to the next authored clip.
+        _doctorWatsonSequence?.Advance(0f);
     }
 
-    private void AnimateScene(float t, float dt)
+    private void AnimateScene(Scene3D scene, float t, float dt)
     {
-        var scene = _sceneControl.Scene;
-        scene.BeginSimulationTick();
-        try
-        {
-            using (scene.BeginUpdate())
-            {
             if (_rotatingBox is not null)
             {
                 _rotatingBox.RotationDegrees = new Vector3(10f + MathF.Sin(t * 0.9f) * 7f, t * 35f, MathF.Cos(t * 0.7f) * 5f);
@@ -2325,21 +2528,8 @@ public partial class MainView : UserControl
                 _bridgeSensorPanel.FaceCamera(scene.Camera);
             }
 
-            if (_particleSystem is not null)
-            {
-                _particleSystem.Advance(dt);
-            }
-            foreach (var particleSystem in _particleSystems)
-            {
-                if (!ReferenceEquals(particleSystem, _particleSystem))
-                {
-                    particleSystem.Advance(dt);
-                }
-            }
-
             if (_activeDemo == DemoSceneKind.Physics)
             {
-                scene.StepPhysics(dt);
                 if ((_physicsCube is not null && _physicsCube.Position.Y < -4f) ||
                     (_physicsBall is not null && _physicsBall.Position.Y < -4f))
                 {
@@ -2347,17 +2537,24 @@ public partial class MainView : UserControl
                 }
             }
 
-                if (_rackLayer is not null)
-                {
-                    AnimateRackTelemetry(t);
-                }
+            if (_rackLayer is not null)
+            {
+                AnimateRackTelemetry(t);
+            }
+
+            for (var i = 0; i < _stressAnimatedObjects.Count; i++)
+            {
+                var entry = _stressAnimatedObjects[i];
+                var wave = MathF.Sin(t * 1.45f + entry.Phase);
+                entry.Obj.Position = entry.Origin + new Vector3(0f, wave * 0.10f, 0f);
+                entry.Obj.RotationDegrees = new Vector3(wave * 8f, t * (18f + i % 11), MathF.Cos(t + entry.Phase) * 6f);
+            }
+
+            if (_stressLayer is not null)
+            {
+                AnimateStressTelemetry(dt);
             }
         }
-        finally
-        {
-            scene.EndSimulationTick();
-        }
-    }
 
 
     private void BuildDemoSpecificControls(DemoSceneKind kind)
@@ -2383,24 +2580,22 @@ public partial class MainView : UserControl
                 _exposureBox = TextInput("1.05");
                 _gammaBox = TextInput("2.20");
                 _ambientBox = TextInput("0.28");
-                _ssaoBox = TextInput("0.36");
                 _demoSpecificPanel.Children.Add(Label("Exposure"));
                 _demoSpecificPanel.Children.Add(_exposureBox);
                 _demoSpecificPanel.Children.Add(Label("Gamma"));
                 _demoSpecificPanel.Children.Add(_gammaBox);
                 _demoSpecificPanel.Children.Add(Label("Ambient intensity"));
                 _demoSpecificPanel.Children.Add(_ambientBox);
-                _demoSpecificPanel.Children.Add(Label("SSAO strength"));
-                _demoSpecificPanel.Children.Add(_ssaoBox);
                 _demoSpecificPanel.Children.Add(Button("Apply shader/light settings", ApplyShaderLabValues));
-                _demoSpecificPanel.Children.Add(Button("Warm sunset preset", () => SetShaderPreset(1.22f, 2.18f, 0.18f, 0.52f, new ColorRgba(1f, 0.72f, 0.48f, 1f))));
-                _demoSpecificPanel.Children.Add(Button("Cold studio preset", () => SetShaderPreset(0.92f, 2.25f, 0.38f, 0.22f, new ColorRgba(0.70f, 0.82f, 1f, 1f))));
+                _demoSpecificPanel.Children.Add(Button("Warm sunset preset", () => SetShaderPreset(1.22f, 2.18f, 0.18f, new ColorRgba(1f, 0.72f, 0.48f, 1f))));
+                _demoSpecificPanel.Children.Add(Button("Cold studio preset", () => SetShaderPreset(0.92f, 2.25f, 0.38f, new ColorRgba(0.70f, 0.82f, 1f, 1f))));
+                _demoSpecificPanel.Children.Add(Note("Deferred, SSAO и HDR render targets будут добавлены на этапах 13–15. Это демо использует только реализованный forward GPU tone mapping без fallback."));
                 break;
             case DemoSceneKind.ImportedGlbModel:
                 if (_doctorWatsonSequence is not null)
                 {
                     _demoSpecificPanel.Children.Add(Button("Restart authored GLB clip", AdvanceCharacterAnimationPhase));
-                    _demoSpecificPanel.Children.Add(Note("В этой версии Doctor Watson GLB содержит skeleton, skin weights и authored clip. Движок выполняет CPU skinning, поэтому модель реально сгибается по костям. Произвольные wave/jump/squat требуют отдельных authored clips или отдельного animation-authoring слоя."));
+                    _demoSpecificPanel.Children.Add(Note("Doctor Watson GLB содержит skeleton, skin weights и authored clip. Деформация выполняется GPU skinning path; CPU используется только для точного ray picking. Произвольные wave/jump/squat требуют отдельных authored clips или animation graph."));
                 }
                 else
                 {
@@ -2422,6 +2617,33 @@ public partial class MainView : UserControl
                 _demoSpecificPanel.Children.Add(Button("Random sensor alert", RandomizeBridgeSensorAlert));
                 _demoSpecificPanel.Children.Add(Note("Кликните зелёный датчик на мосту: выбранный сенсор подсвечивается красным, а имя содержит текущую телеметрию."));
                 break;
+            case DemoSceneKind.CrossPlatformStressLab:
+                _stressColumnsBox = TextInput(_stressParameters.Columns.ToString(CultureInfo.InvariantCulture));
+                _stressRowsBox = TextInput(_stressParameters.Rows.ToString(CultureInfo.InvariantCulture));
+                _stressTransparentBox = TextInput(_stressParameters.TransparentObjects.ToString(CultureInfo.InvariantCulture));
+                _stressParticleCapacityABox = TextInput(_stressParameters.ParticleCapacityA.ToString(CultureInfo.InvariantCulture));
+                _stressParticleEmissionABox = TextInput(_stressParameters.ParticleEmissionA.ToString(CultureInfo.InvariantCulture));
+                _stressParticleCapacityBBox = TextInput(_stressParameters.ParticleCapacityB.ToString(CultureInfo.InvariantCulture));
+                _stressParticleEmissionBBox = TextInput(_stressParameters.ParticleEmissionB.ToString(CultureInfo.InvariantCulture));
+                _stressTelemetryRateBox = TextInput(_stressParameters.TelemetryUpdatesPerSecond.ToString(CultureInfo.InvariantCulture));
+                _demoSpecificPanel.Children.Add(Label("Retained field columns (1..4096)"));
+                _demoSpecificPanel.Children.Add(_stressColumnsBox);
+                _demoSpecificPanel.Children.Add(Label("Retained field rows (1..4096)"));
+                _demoSpecificPanel.Children.Add(_stressRowsBox);
+                _demoSpecificPanel.Children.Add(Label("Transparent objects (0..20000)"));
+                _demoSpecificPanel.Children.Add(_stressTransparentBox);
+                _demoSpecificPanel.Children.Add(Label("Particle A capacity / emission per second"));
+                _demoSpecificPanel.Children.Add(_stressParticleCapacityABox);
+                _demoSpecificPanel.Children.Add(_stressParticleEmissionABox);
+                _demoSpecificPanel.Children.Add(Label("Particle B capacity / emission per second"));
+                _demoSpecificPanel.Children.Add(_stressParticleCapacityBBox);
+                _demoSpecificPanel.Children.Add(_stressParticleEmissionBBox);
+                _demoSpecificPanel.Children.Add(Label("Telemetry state updates per second"));
+                _demoSpecificPanel.Children.Add(_stressTelemetryRateBox);
+                _demoSpecificPanel.Children.Add(Button("Apply exact stress parameters", ApplyStressParameters));
+                _demoSpecificPanel.Children.Add(Button("Burst-update all telemetry", BurstStressTelemetry));
+                _demoSpecificPanel.Children.Add(Note("Параметры применяются только кнопкой, чтобы ввод числа не пересобирал сцену на каждый символ. Поле ограничено 2 000 000 logical nodes; particle capacity — до 500 000 на поток. Telemetry churn распределён равномерно по fixed ticks без искусственного 4 Hz burst. Все counts идентичны на OpenGL и WebGL2."));
+                break;
             default:
                 _demoSpecificPanel.Children.Add(Note("Для этой сцены дополнительных параметров нет. Используйте Runtime switches и основную кнопку действия."));
                 break;
@@ -2433,7 +2655,7 @@ public partial class MainView : UserControl
         if (_doctorWatsonModel is null) return;
         if (_doctorWatsonSequence is not null)
         {
-            _doctorWatsonSequence.Advance(dt);
+            // Authored clips are advanced once by SceneUpdateLoop3D.
             return;
         }
 
@@ -2629,7 +2851,7 @@ public partial class MainView : UserControl
             Width = 1.75f,
             Height = 0.50f,
             AlwaysFaceCamera = true,
-            RenderScale = global::System.OperatingSystem.IsBrowser() ? 1.25d : 4.0d,
+            RenderScale = 2.0d,
             IsPickable = false,
             IsManipulationEnabled = false
         });
@@ -2698,27 +2920,83 @@ public partial class MainView : UserControl
         scene.RenderPipeline.ToneMapping.Exposure = global::System.Math.Clamp(ParseBox(_exposureBox, scene.RenderPipeline.ToneMapping.Exposure), 0.15f, 4.0f);
         scene.RenderPipeline.ToneMapping.Gamma = global::System.Math.Clamp(ParseBox(_gammaBox, scene.RenderPipeline.ToneMapping.Gamma), 1.0f, 3.4f);
         scene.AmbientLightIntensity = global::System.Math.Clamp(ParseBox(_ambientBox, scene.AmbientLightIntensity), 0f, 2.0f);
-        scene.RenderPipeline.Ssao.Strength = global::System.Math.Clamp(ParseBox(_ssaoBox, scene.RenderPipeline.Ssao.Strength), 0f, 2.0f);
 
         if (_exposureBox is not null) _exposureBox.Text = scene.RenderPipeline.ToneMapping.Exposure.ToString("0.###", CultureInfo.InvariantCulture);
         if (_gammaBox is not null) _gammaBox.Text = scene.RenderPipeline.ToneMapping.Gamma.ToString("0.###", CultureInfo.InvariantCulture);
         if (_ambientBox is not null) _ambientBox.Text = scene.AmbientLightIntensity.ToString("0.###", CultureInfo.InvariantCulture);
-        if (_ssaoBox is not null) _ssaoBox.Text = scene.RenderPipeline.Ssao.Strength.ToString("0.###", CultureInfo.InvariantCulture);
         UpdateStatus(force: true);
     }
 
-    private void SetShaderPreset(float exposure, float gamma, float ambient, float ssao, ColorRgba sunColor)
+    private void SetShaderPreset(float exposure, float gamma, float ambient, ColorRgba sunColor)
     {
         if (_exposureBox is not null) _exposureBox.Text = exposure.ToString("0.###", CultureInfo.InvariantCulture);
         if (_gammaBox is not null) _gammaBox.Text = gamma.ToString("0.###", CultureInfo.InvariantCulture);
         if (_ambientBox is not null) _ambientBox.Text = ambient.ToString("0.###", CultureInfo.InvariantCulture);
-        if (_ssaoBox is not null) _ssaoBox.Text = ssao.ToString("0.###", CultureInfo.InvariantCulture);
         if (_shaderSun is not null) _shaderSun.Color = sunColor;
         ApplyShaderLabValues();
     }
 
     private static float ParseBox(TextBox? box, float fallback)
         => float.TryParse(box?.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value) ? value : fallback;
+
+    private void ApplyStressParameters()
+    {
+        if (!TryReadStressValue(_stressColumnsBox, "columns", 1, 4096, out var columns, out var error) ||
+            !TryReadStressValue(_stressRowsBox, "rows", 1, 4096, out var rows, out error) ||
+            !TryReadStressValue(_stressTransparentBox, "transparent objects", 0, 20000, out var transparent, out error) ||
+            !TryReadStressValue(_stressParticleCapacityABox, "particle A capacity", 1, 500000, out var capacityA, out error) ||
+            !TryReadStressValue(_stressParticleEmissionABox, "particle A emission", 0, 1000000, out var emissionA, out error) ||
+            !TryReadStressValue(_stressParticleCapacityBBox, "particle B capacity", 1, 500000, out var capacityB, out error) ||
+            !TryReadStressValue(_stressParticleEmissionBBox, "particle B emission", 0, 1000000, out var emissionB, out error) ||
+            !TryReadStressValue(_stressTelemetryRateBox, "telemetry updates/s", 0, 50000000, out var telemetryRate, out error))
+        {
+            ShowStressParameterError(error);
+            return;
+        }
+
+        var logicalNodeCount = (long)columns * rows;
+        if (logicalNodeCount > 2_000_000L)
+        {
+            ShowStressParameterError($"columns × rows must not exceed 2,000,000 logical nodes (received {logicalNodeCount:n0}).");
+            return;
+        }
+
+        _stressParameters = new StressParameters(
+            columns,
+            rows,
+            transparent,
+            capacityA,
+            emissionA,
+            capacityB,
+            emissionB,
+            telemetryRate);
+        EngineLog3D.Information("Demo.Stress", $"Applying exact stress parameters: {_stressParameters}.");
+        LoadDemo(DemoSceneKind.CrossPlatformStressLab);
+    }
+
+    private void ShowStressParameterError(string error)
+    {
+        var message = "Stress parameter error: " + error;
+        EngineLog3D.Warning("Demo.Stress", message);
+        _lastStatusText = message;
+        _statusText.Text = message;
+    }
+
+    private static bool TryReadStressValue(TextBox? box, string name, int minimum, int maximum, out int value, out string error)
+    {
+        if (!int.TryParse(box?.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out value))
+        {
+            error = $"{name} must be an integer.";
+            return false;
+        }
+        if (value < minimum || value > maximum)
+        {
+            error = $"{name} must be in range {minimum:n0}..{maximum:n0}.";
+            return false;
+        }
+        error = string.Empty;
+        return true;
+    }
 
     private void AnimateRackTelemetry(float t)
     {
@@ -2771,10 +3049,13 @@ public partial class MainView : UserControl
                 continue;
             }
 
-            obj.Position = new Vector3(-0.15f + i * 0.22f, 2.7f + i * 0.28f, -0.55f + i * 0.18f);
+            var slot = global::System.Math.Max(0, i - 2);
+            var column = slot % 8;
+            var layer = slot / 8;
+            obj.Position = new Vector3(-2.25f + column * 0.62f, 2.75f + layer * 0.46f, -0.65f + (slot % 3) * 0.44f);
             obj.RotationDegrees = Vector3.Zero;
-            obj.Rigidbody.Velocity = new Vector3(0.22f + i * 0.08f, 0f, 0.07f - i * 0.03f);
-            obj.Rigidbody.AngularVelocity = new Vector3(0.10f + i * 0.08f, 0.05f, 0.38f + i * 0.12f);
+            obj.Rigidbody.Velocity = new Vector3(0.14f + (slot % 5) * 0.05f, 0f, ((slot * 3) % 5 - 2f) * 0.035f);
+            obj.Rigidbody.AngularVelocity = new Vector3(0.10f + (slot % 4) * 0.08f, 0.05f, 0.38f + (slot % 6) * 0.09f);
         }
     }
 
@@ -2788,6 +3069,43 @@ public partial class MainView : UserControl
             var r = _random.NextDouble();
             batch.SetMaterialVariant(i, r > 0.92 ? 2 : r > 0.72 ? 1 : r > 0.66 ? 3 : 0);
         }
+    }
+
+    private void BurstStressTelemetry()
+    {
+        var layer = _stressLayer;
+        if (layer is null) return;
+        _telemetryCursor++;
+        using var batch = layer.BeginTelemetryBatch();
+        for (var i = 0; i < layer.Instances.Count; i++)
+        {
+            var signal = (i * 17 + _telemetryCursor * 29) % 23;
+            batch.SetMaterialVariant(i, signal == 0 ? 3 : signal < 5 ? 2 : signal < 12 ? 1 : 0);
+        }
+    }
+
+    private void AnimateStressTelemetry(float deltaSeconds)
+    {
+        var layer = _stressLayer;
+        if (layer is null || layer.Instances.Count == 0) return;
+        _stressTelemetryAccumulator += _stressParameters.TelemetryUpdatesPerSecond * global::System.Math.Max(0f, deltaSeconds);
+        var scheduled = (int)global::System.Math.Min(int.MaxValue, global::System.Math.Floor(_stressTelemetryAccumulator));
+        if (scheduled <= 0) return;
+        _stressTelemetryAccumulator -= scheduled;
+
+        // A logical instance needs at most one final state per fixed tick. Very high requested
+        // rates therefore saturate at one complete layer pass per tick instead of producing
+        // redundant CPU writes that do not increase GPU state-buffer pressure.
+        var updateCount = global::System.Math.Min(layer.Instances.Count, scheduled);
+        var start = _stressTelemetryUpdateCursor;
+        using var batch = layer.BeginTelemetryBatch();
+        for (var i = 0; i < updateCount; i++)
+        {
+            var index = (start + i) % layer.Instances.Count;
+            batch.SetMaterialVariant(index, ((_telemetryCursor + i) * 3 + index) & 3);
+        }
+        _telemetryCursor++;
+        _stressTelemetryUpdateCursor = (start + updateCount) % layer.Instances.Count;
     }
 
     private void OnObjectClicked(object? sender, ScenePointerEventArgs e)
@@ -2873,19 +3191,21 @@ public partial class MainView : UserControl
         }
 
         _lastFrame = e;
-        _lastFps = e.FrameMilliseconds > 0d ? 1000d / e.FrameMilliseconds : 0d;
+        _lastFps = e.PresentedFramesPerSecond;
 
         var now = Stopwatch.GetTimestamp();
-        if (_lastBackendTextTicks == 0 || (now - _lastBackendTextTicks) >= Stopwatch.Frequency / 4)
+        // Text layout competes with the graphics callback on Avalonia's UI thread. Keep
+        // diagnostics live but never recreate two multi-line text layouts four times per
+        // second on Desktop; the render statistics themselves are still sampled per frame.
+        var backendTextInterval = Stopwatch.Frequency;
+        if (_lastBackendTextTicks == 0 || (now - _lastBackendTextTicks) >= backendTextInterval)
         {
             _lastBackendTextTicks = now;
-            _backendText.Text = $"Backend: {e.Kind} | frame {e.FrameMilliseconds:0.00} ms";
+            _backendText.Text =
+                $"Backend: {e.Kind} | presented {e.PresentationIntervalMilliseconds:0.00} ms | render {e.Stats.BackendMilliseconds:0.00} ms";
         }
 
-        if (_driveAnimationFromRenderLoop)
-        {
-            RunAnimationTick();
-        }
+        UpdateStatus();
     }
 
     private void UpdateStatus(bool force = false)
@@ -2895,8 +3215,15 @@ public partial class MainView : UserControl
             return;
         }
 
+        if (_showingDiagnosticReport && !force)
+        {
+            return;
+        }
+
+        _showingDiagnosticReport = false;
+
         var now = Stopwatch.GetTimestamp();
-        var statusIntervalTicks = OperatingSystem.IsBrowser() ? Stopwatch.Frequency : Stopwatch.Frequency / 4;
+        var statusIntervalTicks = Stopwatch.Frequency;
         if (!force && _lastStatusTicks != 0 && (now - _lastStatusTicks) < statusIntervalTicks)
         {
             return;
@@ -2904,13 +3231,19 @@ public partial class MainView : UserControl
         _lastStatusTicks = now;
 
         var stats = _lastFrame?.Stats ?? new RenderStats();
+        var stressLine = _activeDemo == DemoSceneKind.CrossPlatformStressLab
+            ? $"Stress: {_stressParameters.Columns}x{_stressParameters.Rows} nodes | transparent {_stressParameters.TransparentObjects:n0} | particles {_stressParameters.ParticleCapacityA:n0}+{_stressParameters.ParticleCapacityB:n0} | telemetry {_stressParameters.TelemetryUpdatesPerSecond:n0}/s\n"
+            : string.Empty;
         var statusText =
             $"Demo: {GetDefinition(_activeDemo).Title}\n" +
+            stressLine +
             $"FPS: {_lastFps:0.0}\n" +
             $"Objects: {stats.ObjectCount:n0} | Renderables: {stats.RenderableCount:n0} | Pickables: {stats.PickableCount:n0}\n" +
             $"HighScale: {stats.HighScaleInstanceCount:n0} instances | chunks {stats.VisibleChunkCount:n0}/{stats.TotalChunkCount:n0}\n" +
             $"Draw: {stats.DrawCallCount:n0} calls | batches {stats.InstancedBatchCount:n0} | triangles {stats.TriangleCount:n0}\n" +
-            $"Pipeline: {stats.RenderPipelineMode} | HDR {OnOff(stats.HdrActive)} | SSAO {OnOff(stats.SsaoActive)} | shadows {OnOff(stats.DirectionalShadowEnabled)}\n" +
+            $"Frame: CPU prep {stats.CpuPreparationMilliseconds:0.00} ms | upload {stats.UploadMilliseconds:0.00} ms | backend {stats.BackendMilliseconds:0.00} ms\n" +
+            $"Pipeline: {stats.RenderPipelineMode} | tone {OnOff(stats.ToneMappingActive)} mode={stats.ToneMappingMode}\n" +
+            $"RHI: {stats.RhiBackend} gen={stats.RhiContextGeneration} resources={stats.RhiResourceCount:n0} registered={stats.RhiResidentBytes / 1024d:0.0} KB | GPU {(stats.GpuTimingAvailable ? stats.GpuFrameMilliseconds.ToString("0.00", CultureInfo.InvariantCulture) + " ms" : "unavailable")}\n" +
             $"Particles: {stats.ParticleCount:n0} | control planes: {stats.ControlPlaneCount:n0}\n" +
             $"Smooth high-scale motion: {OnOff(_sceneControl.Scene.Performance.EnableWebGlClientGpuTransformAnimation)} | overlay: {OnOff(_sceneControl.ShowPerformanceMetrics)}" +
             (_activeDemo == DemoSceneKind.ImportedGlbModel && !string.IsNullOrWhiteSpace(_doctorWatsonImportInfo)
@@ -2950,6 +3283,9 @@ public partial class MainView : UserControl
         var b = 2f - System.MathF.Abs(hue * 6f - 4f);
         return new ColorRgba(Clamp01(r), Clamp01(g), Clamp01(b), 1f);
     }
+
+    private static ColorRgba WithAlpha(ColorRgba color, float alpha)
+        => new(color.R, color.G, color.B, Clamp01(alpha));
 
     private static float Clamp01(float value) => System.MathF.Max(0f, System.MathF.Min(1f, value));
 
@@ -3071,5 +3407,57 @@ public sealed class DemoRack3D : CompositeObject3D
             BaseColor = new ColorRgba(r, g, b, 1f),
             Lighting = LightingMode.Lambert,
             Roughness = 0.82f
+        };
+}
+
+public sealed class DemoStressNode3D : CompositeObject3D
+{
+    public DemoStressNode3D()
+    {
+        Name = "DemoStressNode3D";
+    }
+
+    protected override void Build(CompositeBuilder3D b)
+    {
+        b.Box("Core", 0.34f, 0.72f, 0.34f)
+            .At(0f, 0.36f, 0f)
+            .Material(Lit(new ColorRgba(0.18f, 0.28f, 0.46f, 1f)))
+            .NoCollider()
+            .Pickable(false)
+            .Manipulation(false);
+
+        b.Sphere("TelemetryOrb", 0.15f, 16, 8)
+            .At(0f, 0.86f, 0f)
+            .Material(new Material3D
+            {
+                BaseColor = new ColorRgba(0.18f, 0.82f, 1f, 1f),
+                Lighting = LightingMode.Phong,
+                SpecularStrength = 0.62f,
+                Shininess = 72f
+            })
+            .NoCollider()
+            .Pickable(false)
+            .Manipulation(false);
+
+        b.Box("SignalBar", 0.56f, 0.055f, 0.055f)
+            .At(0f, 0.58f, -0.20f)
+            .Material(new Material3D
+            {
+                BaseColor = new ColorRgba(0.22f, 1f, 0.52f, 1f),
+                Lighting = LightingMode.Unlit
+            })
+            .NoCollider()
+            .Pickable(false)
+            .Manipulation(false);
+    }
+
+    private static Material3D Lit(ColorRgba color)
+        => new()
+        {
+            BaseColor = color,
+            Lighting = LightingMode.BlinnPhong,
+            SpecularStrength = 0.38f,
+            Shininess = 48f,
+            Roughness = 0.64f
         };
 }

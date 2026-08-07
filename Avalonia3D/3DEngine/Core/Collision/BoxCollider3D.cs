@@ -2,13 +2,34 @@ using System;
 using System.Numerics;
 using ThreeDEngine.Core.Math;
 using ThreeDEngine.Core.Scene;
+using ThreeDEngine.Core.Validation;
 
 namespace ThreeDEngine.Core.Collision;
 
 public sealed class BoxCollider3D : Collider3D
 {
-    public Vector3 Center { get; set; }
-    public Vector3 Size { get; set; } = Vector3.One;
+    private Vector3 _center;
+    private Vector3 _size = Vector3.One;
+
+    public Vector3 Center
+    {
+        get => _center;
+        set { using var mutation = EnterMutationScope(); value = Guard3D.Finite(value, nameof(value)); if (_center == value) return; _center = value; RaiseChanged(); }
+    }
+
+    public Vector3 Size
+    {
+        get => _size;
+        set
+        {
+            using var mutation = EnterMutationScope();
+            value = Guard3D.Finite(value, nameof(value));
+            if (value.X <= 0f || value.Y <= 0f || value.Z <= 0f) throw new ArgumentOutOfRangeException(nameof(value), value, "Box collider dimensions must be positive.");
+            if (_size == value) return;
+            _size = value;
+            RaiseChanged();
+        }
+    }
 
     public override Bounds3D GetWorldBounds(Object3D owner)
     {

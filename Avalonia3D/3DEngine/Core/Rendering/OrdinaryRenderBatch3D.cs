@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.Numerics;
 using ThreeDEngine.Core.Geometry;
 using ThreeDEngine.Core.Materials;
@@ -10,15 +11,21 @@ namespace ThreeDEngine.Core.Rendering;
 /// Backend-neutral ordinary render batch. The core owns grouping and draw ordering;
 /// backends only translate batches into their retained/runtime buffer formats.
 /// </summary>
-public sealed class OrdinaryRenderBatch3D
+internal sealed class OrdinaryRenderBatch3D
 {
     private readonly List<OrdinaryRenderItem3D> _items = new(64);
+    private readonly ReadOnlyCollection<OrdinaryRenderItem3D> _itemsView;
+
+    public OrdinaryRenderBatch3D()
+    {
+        _itemsView = _items.AsReadOnly();
+    }
 
     public string BatchId { get; private set; } = string.Empty;
     public string LogicalMeshBatchKey { get; private set; } = string.Empty;
     public Mesh3D Mesh { get; private set; } = Mesh3D.Empty;
     public MaterialBinding3D Material { get; private set; }
-    public IReadOnlyList<OrdinaryRenderItem3D> Items => _items;
+    public IReadOnlyList<OrdinaryRenderItem3D> Items => _itemsView;
     public bool Transparent { get; private set; }
     public float SortDistanceSquared { get; private set; }
 

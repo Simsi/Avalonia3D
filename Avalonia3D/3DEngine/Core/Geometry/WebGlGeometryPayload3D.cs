@@ -9,7 +9,7 @@ namespace ThreeDEngine.Core.Geometry;
 /// </summary>
 public sealed class WebGlGeometryPayload3D
 {
-    public WebGlGeometryPayload3D(
+    internal WebGlGeometryPayload3D(
         int vertexCount,
         int indexCount,
         byte[] positions,
@@ -33,17 +33,17 @@ public sealed class WebGlGeometryPayload3D
     {
         VertexCount = vertexCount;
         IndexCount = indexCount;
-        Positions = positions;
-        Normals = normals;
-        TexCoords0 = texCoords0;
-        Tangents = tangents;
-        Colors0 = colors0;
-        MaterialSlots = materialSlots;
-        BoneIndices0 = boneIndices0;
-        BoneWeights0 = boneWeights0;
-        Indices = indices;
+        PositionStorage = positions;
+        NormalStorage = normals;
+        TexCoordStorage = texCoords0;
+        TangentStorage = tangents;
+        ColorStorage = colors0;
+        MaterialSlotStorage = materialSlots;
+        BoneIndexStorage = boneIndices0;
+        BoneWeightStorage = boneWeights0;
+        IndexStorage = indices;
         IndexElementSize = indexElementSize;
-        WireframeIndices = wireframeIndices;
+        WireframeIndexStorage = wireframeIndices;
         WireframeIndexElementSize = wireframeIndexElementSize;
         HasTexCoords0 = hasTexCoords0;
         HasTangents = hasTangents;
@@ -55,17 +55,17 @@ public sealed class WebGlGeometryPayload3D
 
     public int VertexCount { get; }
     public int IndexCount { get; }
-    public byte[] Positions { get; }
-    public byte[] Normals { get; }
-    public byte[] TexCoords0 { get; }
-    public byte[] Tangents { get; }
-    public byte[] Colors0 { get; }
-    public byte[] MaterialSlots { get; }
-    public byte[] BoneIndices0 { get; }
-    public byte[] BoneWeights0 { get; }
-    public byte[] Indices { get; }
+    public ReadOnlyMemory<byte> Positions => PositionStorage.Length == 0 ? ReadOnlyMemory<byte>.Empty : new ReadOnlyMemory<byte>((byte[])PositionStorage.Clone());
+    public ReadOnlyMemory<byte> Normals => NormalStorage.Length == 0 ? ReadOnlyMemory<byte>.Empty : new ReadOnlyMemory<byte>((byte[])NormalStorage.Clone());
+    public ReadOnlyMemory<byte> TexCoords0 => TexCoordStorage.Length == 0 ? ReadOnlyMemory<byte>.Empty : new ReadOnlyMemory<byte>((byte[])TexCoordStorage.Clone());
+    public ReadOnlyMemory<byte> Tangents => TangentStorage.Length == 0 ? ReadOnlyMemory<byte>.Empty : new ReadOnlyMemory<byte>((byte[])TangentStorage.Clone());
+    public ReadOnlyMemory<byte> Colors0 => ColorStorage.Length == 0 ? ReadOnlyMemory<byte>.Empty : new ReadOnlyMemory<byte>((byte[])ColorStorage.Clone());
+    public ReadOnlyMemory<byte> MaterialSlots => MaterialSlotStorage.Length == 0 ? ReadOnlyMemory<byte>.Empty : new ReadOnlyMemory<byte>((byte[])MaterialSlotStorage.Clone());
+    public ReadOnlyMemory<byte> BoneIndices0 => BoneIndexStorage.Length == 0 ? ReadOnlyMemory<byte>.Empty : new ReadOnlyMemory<byte>((byte[])BoneIndexStorage.Clone());
+    public ReadOnlyMemory<byte> BoneWeights0 => BoneWeightStorage.Length == 0 ? ReadOnlyMemory<byte>.Empty : new ReadOnlyMemory<byte>((byte[])BoneWeightStorage.Clone());
+    public ReadOnlyMemory<byte> Indices => IndexStorage.Length == 0 ? ReadOnlyMemory<byte>.Empty : new ReadOnlyMemory<byte>((byte[])IndexStorage.Clone());
     public int IndexElementSize { get; }
-    public byte[] WireframeIndices { get; }
+    public ReadOnlyMemory<byte> WireframeIndices => WireframeIndexStorage.Length == 0 ? ReadOnlyMemory<byte>.Empty : new ReadOnlyMemory<byte>((byte[])WireframeIndexStorage.Clone());
     public int WireframeIndexElementSize { get; }
     public bool HasTexCoords0 { get; }
     public bool HasTangents { get; }
@@ -74,15 +74,36 @@ public sealed class WebGlGeometryPayload3D
     public bool HasSkinWeights { get; }
     public string VertexLayout { get; }
 
+    internal byte[] PositionStorage { get; }
+    internal byte[] NormalStorage { get; }
+    internal byte[] TexCoordStorage { get; }
+    internal byte[] TangentStorage { get; }
+    internal byte[] ColorStorage { get; }
+    internal byte[] MaterialSlotStorage { get; }
+    internal byte[] BoneIndexStorage { get; }
+    internal byte[] BoneWeightStorage { get; }
+    internal byte[] IndexStorage { get; }
+    internal byte[] WireframeIndexStorage { get; }
+
+    public long VertexUploadByteCount =>
+        PositionStorage.LongLength +
+        NormalStorage.LongLength +
+        TexCoordStorage.LongLength +
+        TangentStorage.LongLength +
+        ColorStorage.LongLength +
+        MaterialSlotStorage.LongLength +
+        BoneIndexStorage.LongLength +
+        BoneWeightStorage.LongLength;
+
     public long UploadByteCount =>
-        Positions.LongLength +
-        Normals.LongLength +
-        TexCoords0.LongLength +
-        Tangents.LongLength +
-        Colors0.LongLength +
-        MaterialSlots.LongLength +
-        BoneIndices0.LongLength +
-        BoneWeights0.LongLength +
-        Indices.LongLength +
-        WireframeIndices.LongLength;
+        PositionStorage.LongLength +
+        NormalStorage.LongLength +
+        TexCoordStorage.LongLength +
+        TangentStorage.LongLength +
+        ColorStorage.LongLength +
+        MaterialSlotStorage.LongLength +
+        BoneIndexStorage.LongLength +
+        BoneWeightStorage.LongLength +
+        IndexStorage.LongLength +
+        WireframeIndexStorage.LongLength;
 }

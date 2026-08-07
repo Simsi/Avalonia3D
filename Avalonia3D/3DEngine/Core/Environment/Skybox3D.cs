@@ -1,6 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using ThreeDEngine.Core.Primitives;
+using ThreeDEngine.Core.Resources;
+using ThreeDEngine.Core.Scene;
+using ThreeDEngine.Core.Validation;
 
 namespace ThreeDEngine.Core.Environment;
 
@@ -11,22 +15,30 @@ public sealed class Skybox3D
     private ColorRgba _horizonColor = new(0.62f, 0.76f, 0.94f, 1f);
     private ColorRgba _bottomColor = new(0.82f, 0.86f, 0.90f, 1f);
     private float _intensity = 1f;
-    private readonly string?[] _cubemapFaces = new string?[6];
-    private readonly string?[] _cubemapTextureKeys = new string?[6];
-    private readonly byte[]?[] _cubemapTextureData = new byte[6][];
-    private readonly string?[] _cubemapTextureMimeTypes = new string?[6];
-    private string? _equirectangularTextureKey;
-    private byte[]? _equirectangularTextureData;
-    private string? _equirectangularTextureMimeType;
+    private readonly TextureResource3D?[] _cubemapTextures = new TextureResource3D?[6];
+    private readonly ReadOnlyCollection<TextureResource3D?> _cubemapTexturesView;
+    private TextureResource3D? _equirectangularTexture;
     private int _environmentTextureVersion;
 
+    public Skybox3D()
+    {
+        _cubemapTexturesView = Array.AsReadOnly(_cubemapTextures);
+    }
+
     public event EventHandler? Changed;
+    internal Func<SceneAccessLease3D>? MutationScopeRequested { get; set; }
 
     public SkyboxMode3D Mode
     {
         get => _mode;
         set
         {
+            using var mutation = EnterMutationScope();
+            value = Guard3D.Defined(value, nameof(value));
+            if (value == SkyboxMode3D.Equirectangular && !HasEquirectangularTexture)
+                throw new InvalidOperationException("Equirectangular mode requires a complete immutable texture resource.");
+            if (value == SkyboxMode3D.Cubemap && !HasCubemapTextures)
+                throw new InvalidOperationException("Cubemap mode requires six complete immutable texture resources.");
             if (_mode == value) return;
             _mode = value;
             RaiseChanged();
@@ -36,34 +48,19 @@ public sealed class Skybox3D
     public ColorRgba TopColor
     {
         get => _topColor;
-        set
-        {
-            if (_topColor.Equals(value)) return;
-            _topColor = value;
-            RaiseChanged();
-        }
+        set { using var mutation = EnterMutationScope(); value = Guard3D.Color(value, nameof(value)); if (_topColor.Equals(value)) return; _topColor = value; RaiseChanged(); }
     }
 
     public ColorRgba HorizonColor
     {
         get => _horizonColor;
-        set
-        {
-            if (_horizonColor.Equals(value)) return;
-            _horizonColor = value;
-            RaiseChanged();
-        }
+        set { using var mutation = EnterMutationScope(); value = Guard3D.Color(value, nameof(value)); if (_horizonColor.Equals(value)) return; _horizonColor = value; RaiseChanged(); }
     }
 
     public ColorRgba BottomColor
     {
         get => _bottomColor;
-        set
-        {
-            if (_bottomColor.Equals(value)) return;
-            _bottomColor = value;
-            RaiseChanged();
-        }
+        set { using var mutation = EnterMutationScope(); value = Guard3D.Color(value, nameof(value)); if (_bottomColor.Equals(value)) return; _bottomColor = value; RaiseChanged(); }
     }
 
     public float Intensity
@@ -71,53 +68,120 @@ public sealed class Skybox3D
         get => _intensity;
         set
         {
-            var clamped = global::System.Math.Clamp(value, 0f, 8f);
-            if (MathF.Abs(_intensity - clamped) < 0.0001f) return;
-            _intensity = clamped;
+            using var mutation = EnterMutationScope();
+            var validated = Guard3D.Range(value, 0f, 8f, nameof(value));
+            if (MathF.Abs(_intensity - validated) < 0.0001f) return;
+            _intensity = validated;
             RaiseChanged();
         }
     }
 
-    public IReadOnlyList<string?> CubemapFaces => _cubemapFaces;
-    public IReadOnlyList<string?> CubemapTextureKeys => _cubemapTextureKeys;
-    public IReadOnlyList<byte[]?> CubemapTextureData => _cubemapTextureData;
-    public IReadOnlyList<string?> CubemapTextureMimeTypes => _cubemapTextureMimeTypes;
-    public string? EquirectangularTextureKey => _equirectangularTextureKey;
-    public byte[]? EquirectangularTextureData => _equirectangularTextureData;
-    public string? EquirectangularTextureMimeType => _equirectangularTextureMimeType;
+    public IReadOnlyList<TextureResource3D?> CubemapTextures => _cubemapTexturesView;
+
+    public IReadOnlyList<string?> CubemapTextureKeys
+    {
+        get
+        {
+            var result = new string?[6];
+            for (var i = 0; i < result.Length; i++) result[i] = _cubemapTextures[i]?.LogicalKey;
+            return Array.AsReadOnly(result);
+        }
+    }
+
+    public IReadOnlyList<string?> CubemapTextureResourceKeys
+    {
+        get
+        {
+            var result = new string?[6];
+            for (var i = 0; i < result.Length; i++) result[i] = _cubemapTextures[i]?.ResourceKey;
+            return Array.AsReadOnly(result);
+        }
+    }
+
+    public IReadOnlyList<byte[]?> CubemapTextureData
+    {
+        get
+        {
+            var result = new byte[]?[6];
+            for (var i = 0; i < result.Length; i++) result[i] = _cubemapTextures[i]?.CopyEncodedData();
+            return Array.AsReadOnly(result);
+        }
+    }
+
+    public IReadOnlyList<string?> CubemapTextureMimeTypes
+    {
+        get
+        {
+            var result = new string?[6];
+            for (var i = 0; i < result.Length; i++) result[i] = _cubemapTextures[i]?.MimeType;
+            return Array.AsReadOnly(result);
+        }
+    }
+
+    public TextureResource3D? EquirectangularTexture => _equirectangularTexture;
+    public string? EquirectangularTextureKey => _equirectangularTexture?.LogicalKey;
+    public string? EquirectangularTextureResourceKey => _equirectangularTexture?.ResourceKey;
+    public byte[]? EquirectangularTextureData => _equirectangularTexture?.CopyEncodedData();
+    public string? EquirectangularTextureMimeType => _equirectangularTexture?.MimeType;
     public int EnvironmentTextureVersion => _environmentTextureVersion;
-    public bool HasEquirectangularTexture => !string.IsNullOrWhiteSpace(_equirectangularTextureKey) && _equirectangularTextureData is { Length: > 0 };
+    public bool HasEquirectangularTexture => _equirectangularTexture is not null;
+    internal TextureResource3D? EquirectangularTextureInternal => _equirectangularTexture;
+    internal IReadOnlyList<TextureResource3D?> CubemapTexturesInternal => _cubemapTexturesView;
+
     public bool HasCubemapTextures
     {
         get
         {
-            for (var i = 0; i < _cubemapTextureKeys.Length; i++)
-            {
-                if (string.IsNullOrWhiteSpace(_cubemapTextureKeys[i]) || _cubemapTextureData[i] is not { Length: > 0 }) return false;
-            }
+            for (var i = 0; i < _cubemapTextures.Length; i++) if (_cubemapTextures[i] is null) return false;
             return true;
         }
     }
 
-    public void SetEquirectangularTexture(string textureKey, byte[] textureData, string? mimeType = null)
+    public void SetEquirectangularTexture(TextureResource3D texture)
     {
-        _equirectangularTextureKey = string.IsNullOrWhiteSpace(textureKey) ? null : textureKey;
-        _equirectangularTextureData = textureData is { Length: > 0 } ? (byte[])textureData.Clone() : null;
-        _equirectangularTextureMimeType = string.IsNullOrWhiteSpace(mimeType) ? null : mimeType;
-        _environmentTextureVersion++;
-        Mode = SkyboxMode3D.Equirectangular;
+        using var mutation = EnterMutationScope();
+        ArgumentNullException.ThrowIfNull(texture);
+        if (TextureSlotEquals(_equirectangularTexture, texture) && _mode == SkyboxMode3D.Equirectangular) return;
+        _equirectangularTexture = texture;
+        unchecked { _environmentTextureVersion++; }
+        _mode = SkyboxMode3D.Equirectangular;
         RaiseChanged();
     }
+
+    public void SetEquirectangularTexture(string textureKey, byte[] textureData, string? mimeType = null)
+        => SetEquirectangularTexture(TextureResource3D.Create(textureKey, textureData, mimeType));
 
     public void ClearEquirectangularTexture()
     {
-        _equirectangularTextureKey = null;
-        _equirectangularTextureData = null;
-        _equirectangularTextureMimeType = null;
-        _environmentTextureVersion++;
+        using var mutation = EnterMutationScope();
+        if (_equirectangularTexture is null) return;
+        _equirectangularTexture = null;
+        if (_mode == SkyboxMode3D.Equirectangular) _mode = SkyboxMode3D.None;
+        unchecked { _environmentTextureVersion++; }
         RaiseChanged();
     }
 
+    public void SetCubemapFaceTextures(
+        TextureResource3D positiveX,
+        TextureResource3D negativeX,
+        TextureResource3D positiveY,
+        TextureResource3D negativeY,
+        TextureResource3D positiveZ,
+        TextureResource3D negativeZ)
+    {
+        using var mutation = EnterMutationScope();
+        var textures = new[] { positiveX, negativeX, positiveY, negativeY, positiveZ, negativeZ };
+        for (var i = 0; i < textures.Length; i++) ArgumentNullException.ThrowIfNull(textures[i], $"cubemapTexture[{i}]");
+
+        var changed = _mode != SkyboxMode3D.Cubemap;
+        for (var i = 0; i < 6; i++) changed |= !TextureSlotEquals(_cubemapTextures[i], textures[i]);
+        if (!changed) return;
+
+        Array.Copy(textures, _cubemapTextures, textures.Length);
+        unchecked { _environmentTextureVersion++; }
+        _mode = SkyboxMode3D.Cubemap;
+        RaiseChanged();
+    }
 
     public void SetCubemapFaceTextures(
         string positiveXKey, byte[] positiveXData, string? positiveXMime,
@@ -126,57 +190,38 @@ public sealed class Skybox3D
         string negativeYKey, byte[] negativeYData, string? negativeYMime,
         string positiveZKey, byte[] positiveZData, string? positiveZMime,
         string negativeZKey, byte[] negativeZData, string? negativeZMime)
+        => SetCubemapFaceTextures(
+            TextureResource3D.Create(positiveXKey, positiveXData, positiveXMime),
+            TextureResource3D.Create(negativeXKey, negativeXData, negativeXMime),
+            TextureResource3D.Create(positiveYKey, positiveYData, positiveYMime),
+            TextureResource3D.Create(negativeYKey, negativeYData, negativeYMime),
+            TextureResource3D.Create(positiveZKey, positiveZData, positiveZMime),
+            TextureResource3D.Create(negativeZKey, negativeZData, negativeZMime));
+
+    public void ClearCubemapTextures()
     {
-        SetCubemapTexture(0, positiveXKey, positiveXData, positiveXMime);
-        SetCubemapTexture(1, negativeXKey, negativeXData, negativeXMime);
-        SetCubemapTexture(2, positiveYKey, positiveYData, positiveYMime);
-        SetCubemapTexture(3, negativeYKey, negativeYData, negativeYMime);
-        SetCubemapTexture(4, positiveZKey, positiveZData, positiveZMime);
-        SetCubemapTexture(5, negativeZKey, negativeZData, negativeZMime);
-        _environmentTextureVersion++;
-        Mode = SkyboxMode3D.Cubemap;
+        using var mutation = EnterMutationScope();
+        if (!HasAny(_cubemapTextures)) return;
+        Array.Clear(_cubemapTextures, 0, _cubemapTextures.Length);
+        if (_mode == SkyboxMode3D.Cubemap) _mode = SkyboxMode3D.None;
+        unchecked { _environmentTextureVersion++; }
         RaiseChanged();
     }
 
-    private void SetCubemapTexture(int index, string key, byte[] data, string? mimeType)
+    private static bool HasAny(TextureResource3D?[] values)
     {
-        _cubemapTextureKeys[index] = string.IsNullOrWhiteSpace(key) ? null : key;
-        _cubemapTextureData[index] = data is { Length: > 0 } ? (byte[])data.Clone() : null;
-        _cubemapTextureMimeTypes[index] = string.IsNullOrWhiteSpace(mimeType) ? null : mimeType;
+        for (var i = 0; i < values.Length; i++) if (values[i] is not null) return true;
+        return false;
     }
 
-    public void SetCubemapFaces(string? positiveX, string? negativeX, string? positiveY, string? negativeY, string? positiveZ, string? negativeZ)
-    {
-        _cubemapFaces[0] = positiveX;
-        _cubemapFaces[1] = negativeX;
-        _cubemapFaces[2] = positiveY;
-        _cubemapFaces[3] = negativeY;
-        _cubemapFaces[4] = positiveZ;
-        _cubemapFaces[5] = negativeZ;
-        RaiseChanged();
-    }
+    private static bool TextureSlotEquals(TextureResource3D? left, TextureResource3D right)
+        => left is not null
+           && left.Equals(right)
+           && string.Equals(left.LogicalKey, right.LogicalKey, StringComparison.Ordinal)
+           && string.Equals(left.MimeType, right.MimeType, StringComparison.Ordinal);
 
-    public void ClearCubemapFaces()
-    {
-        Array.Clear(_cubemapFaces, 0, _cubemapFaces.Length);
-        Array.Clear(_cubemapTextureKeys, 0, _cubemapTextureKeys.Length);
-        Array.Clear(_cubemapTextureData, 0, _cubemapTextureData.Length);
-        Array.Clear(_cubemapTextureMimeTypes, 0, _cubemapTextureMimeTypes.Length);
-        _environmentTextureVersion++;
-        RaiseChanged();
-    }
-
-    public bool HasCubemapFaces
-    {
-        get
-        {
-            for (var i = 0; i < _cubemapFaces.Length; i++)
-            {
-                if (string.IsNullOrWhiteSpace(_cubemapFaces[i])) return false;
-            }
-            return true;
-        }
-    }
+    private SceneAccessLease3D EnterMutationScope()
+        => MutationScopeRequested?.Invoke() ?? default;
 
     private void RaiseChanged() => Changed?.Invoke(this, EventArgs.Empty);
 }

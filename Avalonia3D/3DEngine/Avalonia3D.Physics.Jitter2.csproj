@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net8.0-browser</TargetFrameworks>
+    <RootNamespace>ThreeDEngine</RootNamespace>
+    <AssemblyName>Avalonia3D.Physics.Jitter2</AssemblyName>
+    <PackageId>Avalonia3D.Physics.Jitter2</PackageId>
+    <Description>Jitter2 physics adapter for Avalonia3D.</Description>
+    <IsPackable>true</IsPackable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Core/Physics/Jitter2/**/*.cs" />
+    <ProjectReference Include="Avalonia3D.Core.csproj" />
+    <PackageReference Include="Jitter2" />
+  </ItemGroup>
+</Project>

@@ -3,6 +3,10 @@ let nextHostId = 1;
 let documentVisibilityVersion = 0;
 const uniformCacheByContext = new WeakMap();
 
+function finiteOr(value, fallback) {
+  return Number.isFinite(value) ? value : fallback;
+}
+
 if (typeof document !== 'undefined' && document.addEventListener) {
   document.addEventListener('visibilitychange', () => {
     documentVisibilityVersion++;
@@ -63,7 +67,21 @@ function createProgram(gl, vertexSource, fragmentSource) {
   return program;
 }
 
+function createRequiredBuffer(gl, label) {
+  const buffer = gl.createBuffer();
+  if (!buffer) throw new Error(`WebGL 2 failed to allocate required buffer '${label}'.`);
+  return buffer;
+}
+
+function createRequiredTexture(gl, label) {
+  const texture = gl.createTexture();
+  if (!texture) throw new Error(`WebGL 2 failed to allocate required texture '${label}'.`);
+  return texture;
+}
+
 function createHostState(canvas, gl, metricsElement, centerCursorElement) {
+  if (!gl || typeof gl.createVertexArray !== 'function' || typeof gl.drawElementsInstanced !== 'function') throw new Error('Avalonia3D RHI requires WebGL 2. WebGL 1 and extension-based legacy paths are not supported.');
+  if (typeof BigInt === 'undefined') throw new Error('Avalonia3D retained RHI protocol requires browser BigInt support for stable 64-bit resource handles.');
   const meshProgram = createProgram(gl, `
 attribute vec3 aPosition;
 attribute vec3 aNormal;
@@ -282,10 +300,17 @@ void main() {
   if (uPostProcessParams.z > 0.5) {
     float exposure = max(uPostProcessParams.x, 0.001);
     float gamma = max(uPostProcessParams.y, 0.1);
+    vec3 mapped = max(outColor * exposure, vec3(0.0));
     if (uPostProcessParams.w < 1.5) {
-      outColor = outColor / (vec3(1.0) + outColor);
+      outColor = mapped / (vec3(1.0) + mapped);
+    } else if (uPostProcessParams.w < 2.5) {
+      outColor = vec3(1.0) - exp(-mapped);
     } else {
-      outColor = vec3(1.0) - exp(-outColor * exposure);
+      outColor = clamp(
+        (mapped * (2.51 * mapped + vec3(0.03))) /
+        (mapped * (2.43 * mapped + vec3(0.59)) + vec3(0.14)),
+        0.0,
+        1.0);
     }
     outColor = pow(max(outColor, vec3(0.0)), vec3(1.0 / gamma));
   }
@@ -310,6 +335,8 @@ uniform int uSkyboxMode;
 uniform vec3 uCameraRight;
 uniform vec3 uCameraUp;
 uniform vec3 uCameraForward;
+uniform float uProjectionScaleX;
+uniform float uProjectionScaleY;
 uniform sampler2D uSkyboxTexture;
 uniform float uSkyboxTextureEnabled;
 uniform sampler2D uSkyboxPX;
@@ -324,9 +351,9 @@ float hash(vec2 p) {
   return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
 }
 void main() {
-  if (uSkyboxMode == 1) { gl_FragColor = vec4(uHorizonColor, 1.0); return; }
+  if (uSkyboxMode == 1) { gl_FragColor = vec4(uHorizonColor * max(uIntensity, 0.0), 1.0); return; }
   vec2 screen = vUv * 2.0 - 1.0;
-  vec3 dir = normalize(uCameraForward + uCameraRight * screen.x * 1.35 + uCameraUp * screen.y * 0.78);
+  vec3 dir = normalize(uCameraForward + uCameraRight * screen.x * uProjectionScaleX + uCameraUp * screen.y * uProjectionScaleY);
   const float PI = 3.14159265359;
   vec2 uv = vec2(atan(dir.x, dir.z) / (2.0 * PI) + 0.5, asin(clamp(dir.y, -1.0, 1.0)) / PI + 0.5);
   if (uSkyboxMode == 5 && uSkyboxTextureEnabled > 0.5) {
@@ -359,7 +386,7 @@ void main() {
     gl_FragColor = vec4((baseColor + star) * max(uIntensity, 0.0), 1.0);
     return;
   }
-  float t = clamp(vUv.y, 0.0, 1.0);
+  float t = clamp(uv.y, 0.0, 1.0);
   vec3 lower = mix(uBottomColor, uHorizonColor, smoothstep(0.0, 0.55, t));
   vec3 upper = mix(uHorizonColor, uTopColor, smoothstep(0.45, 1.0, t));
   vec3 color = t < 0.5 ? lower : upper;
@@ -385,29 +412,38 @@ void main() {
 }
 `);
 
-  const skyboxVertexBuffer = gl.createBuffer();
+  const skyboxPositionLocation = gl.getAttribLocation(skyboxProgram, 'aPosition');
+  const texturedPositionLocation = gl.getAttribLocation(texturedProgram, 'aPosition');
+  const texturedUvLocation = gl.getAttribLocation(texturedProgram, 'aTexCoord');
+  const skyboxVertexBuffer = createRequiredBuffer(gl, 'utility:skybox:vertices');
   gl.bindBuffer(gl.ARRAY_BUFFER, skyboxVertexBuffer);
   gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, 1, 1, -1, 1]), gl.STATIC_DRAW);
   gl.bindBuffer(gl.ARRAY_BUFFER, null);
 
-  const quadIndexBuffer = gl.createBuffer();
+  const quadIndexBuffer = createRequiredBuffer(gl, 'utility:quad:indices');
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, quadIndexBuffer);
   gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0, 1, 2, 0, 2, 3]), gl.STATIC_DRAW);
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
+  const skyboxVertexArray = gl.createVertexArray();
+  if (!skyboxVertexArray) throw new Error('WebGL 2 failed to allocate the required skybox vertex array.');
+  gl.bindVertexArray(skyboxVertexArray);
+  gl.bindBuffer(gl.ARRAY_BUFFER, skyboxVertexBuffer);
+  gl.enableVertexAttribArray(skyboxPositionLocation);
+  gl.vertexAttribPointer(skyboxPositionLocation, 2, gl.FLOAT, false, 8, 0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, quadIndexBuffer);
+  gl.bindVertexArray(null);
+  gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  const gpuTimerExtension = gl.getExtension('EXT_disjoint_timer_query_webgl2');
+  const debugRendererInfo = gl.getExtension('WEBGL_debug_renderer_info');
 
   return {
     canvas,
     metricsElement,
     centerCursorElement,
     gl,
-    isWebGl2: !!gl.drawElementsInstanced,
-    instancing: gl.drawElementsInstanced ? {
-      drawElementsInstancedANGLE: (mode, count, type, offset, instanceCount) => gl.drawElementsInstanced(mode, count, type, offset, instanceCount),
-      vertexAttribDivisorANGLE: (location, divisor) => gl.vertexAttribDivisor(location, divisor)
-    } : gl.getExtension('ANGLE_instanced_arrays'),
     meshProgram,
     skyboxProgram,
-    skyboxPositionLocation: gl.getAttribLocation(skyboxProgram, 'aPosition'),
+    skyboxPositionLocation,
     skyboxTopColorLocation: gl.getUniformLocation(skyboxProgram, 'uTopColor'),
     skyboxHorizonColorLocation: gl.getUniformLocation(skyboxProgram, 'uHorizonColor'),
     skyboxBottomColorLocation: gl.getUniformLocation(skyboxProgram, 'uBottomColor'),
@@ -416,6 +452,8 @@ void main() {
     skyboxCameraRightLocation: gl.getUniformLocation(skyboxProgram, 'uCameraRight'),
     skyboxCameraUpLocation: gl.getUniformLocation(skyboxProgram, 'uCameraUp'),
     skyboxCameraForwardLocation: gl.getUniformLocation(skyboxProgram, 'uCameraForward'),
+    skyboxProjectionScaleXLocation: gl.getUniformLocation(skyboxProgram, 'uProjectionScaleX'),
+    skyboxProjectionScaleYLocation: gl.getUniformLocation(skyboxProgram, 'uProjectionScaleY'),
     skyboxTextureLocation: gl.getUniformLocation(skyboxProgram, 'uSkyboxTexture'),
     skyboxTextureEnabledLocation: gl.getUniformLocation(skyboxProgram, 'uSkyboxTextureEnabled'),
     skyboxPXLocation: gl.getUniformLocation(skyboxProgram, 'uSkyboxPX'),
@@ -426,6 +464,7 @@ void main() {
     skyboxNZLocation: gl.getUniformLocation(skyboxProgram, 'uSkyboxNZ'),
     skyboxCubemapEnabledLocation: gl.getUniformLocation(skyboxProgram, 'uSkyboxCubemapEnabled'),
     skyboxVertexBuffer,
+    skyboxVertexArray,
     texturedProgram,
     meshPositionLocation: gl.getAttribLocation(meshProgram, 'aPosition'),
     meshNormalLocation: gl.getAttribLocation(meshProgram, 'aNormal'),
@@ -481,8 +520,8 @@ void main() {
     meshNormalMapStrengthLocation: gl.getUniformLocation(meshProgram, 'uNormalMapStrength'),
     meshPostProcessParamsLocation: gl.getUniformLocation(meshProgram, 'uPostProcessParams'),
     meshSsaoParamsLocation: gl.getUniformLocation(meshProgram, 'uSsaoParams'),
-    texturedPositionLocation: gl.getAttribLocation(texturedProgram, 'aPosition'),
-    texturedUvLocation: gl.getAttribLocation(texturedProgram, 'aTexCoord'),
+    texturedPositionLocation,
+    texturedUvLocation,
     texturedViewProjLocation: gl.getUniformLocation(texturedProgram, 'uViewProj'),
     texturedSamplerLocation: gl.getUniformLocation(texturedProgram, 'uTexture'),
     quadIndexBuffer,
@@ -496,8 +535,6 @@ void main() {
     retainedHandleRefs: new Map(),
     highScaleLayerHandleRefs: new Map(),
     retainedDrawOrder: [],
-    allowLegacyDrawPath: false,
-    allowLegacyStringProtocol: false,
     controlPlanes: [],
     controlPlaneDrawList: [],
     emptyBatches: [],
@@ -512,7 +549,6 @@ void main() {
     scratch3: new Float32Array(3),
     scratch4: new Float32Array(4),
     scratch16: new Float32Array(16),
-    vaoExt: gl.createVertexArray ? null : gl.getExtension('OES_vertex_array_object'),
     glState: {
       activeTextureUnit: -1,
       texture2D: new Array(16).fill(null),
@@ -523,6 +559,8 @@ void main() {
       blend: null,
       depthTest: null,
       depthMask: null,
+      cullMode: null,
+      cullFace: null,
       blendSrc: null,
       blendDst: null,
       depthFunc: null,
@@ -539,7 +577,14 @@ void main() {
       dynamicBufferDataCalls: 0
     },
     maxDevicePixelRatio: 1.0,
-    gpuSkinningSupported: (gl.getParameter(gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS) || 0) > 0 && (!!gl.getExtension('OES_texture_float') || !!gl.texImage3D),
+    gpuSkinningSupported: (gl.getParameter(gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS) || 0) > 0,
+    gpuTimerExtension,
+    gpuTimerActive: null,
+    gpuTimerPending: [],
+    gpuTimerLastMilliseconds: -1,
+    gpuTimerValid: false,
+    adapterName: debugRendererInfo ? String(gl.getParameter(debugRendererInfo.UNMASKED_RENDERER_WEBGL) || 'Unknown GPU') : String(gl.getParameter(gl.RENDERER) || 'Unknown GPU'),
+    apiVersion: String(gl.getParameter(gl.VERSION) || 'WebGL 2'),
     lastCssLeft: null,
     lastCssTop: null,
     lastCssWidth: null,
@@ -555,8 +600,6 @@ void main() {
     animationUploadBatches: 0,
     textureResources: new Map(),
     controlVertexBuffers: new Map(),
-    elementIndexUintExt: gl.drawElementsInstanced ? true : gl.getExtension('OES_element_index_uint'),
-    textureFloatExt: gl.getExtension('OES_texture_float'),
     vertexTextureUnits: gl.getParameter(gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS) || 0,
     width: 0,
     height: 0,
@@ -625,9 +668,8 @@ export function createHost() {
     preserveDrawingBuffer: false,
     powerPreference: 'high-performance'
   };
-  const gl2 = canvas.getContext('webgl2', contextOptions);
-  const gl = gl2 || canvas.getContext('webgl', contextOptions);
-  if (!gl) throw new Error('WebGL is not available.');
+  const gl = canvas.getContext('webgl2', contextOptions);
+  if (!gl) throw new Error('WebGL 2 is required by the Avalonia3D RHI. WebGL 1 fallback is disabled.');
 
   document.body.appendChild(canvas);
   document.body.appendChild(metricsElement);
@@ -694,13 +736,21 @@ export function destroyHost(hostId) {
   const host = hosts.get(hostId);
   if (!host) return;
   const { gl } = host;
+  if (host.gpuTimerActive) gl.deleteQuery(host.gpuTimerActive);
+  for (const query of host.gpuTimerPending || []) gl.deleteQuery(query);
   for (const r of host.meshResources.values()) disposeMeshResource(gl, r);
   for (const b of host.instanceBuffers.values()) gl.deleteBuffer(b);
   for (const b of host.retainedBatches.values()) { gl.deleteBuffer(b.transformBuffer); gl.deleteBuffer(b.stateBuffer); if (b.particleBuffer) gl.deleteBuffer(b.particleBuffer); if (b.paletteTexture) gl.deleteTexture(b.paletteTexture); if (b.boneTexture) gl.deleteTexture(b.boneTexture); }
   for (const t of host.textureResources.values()) gl.deleteTexture(t.texture);
-  for (const b of host.controlVertexBuffers.values()) gl.deleteBuffer(b);
+  for (const resource of host.controlVertexBuffers.values()) {
+    gl.deleteVertexArray(resource.vao);
+    gl.deleteBuffer(resource.buffer);
+  }
+  gl.deleteVertexArray(host.skyboxVertexArray);
+  gl.deleteBuffer(host.skyboxVertexBuffer);
   gl.deleteBuffer(host.quadIndexBuffer);
   gl.deleteProgram(host.meshProgram);
+  gl.deleteProgram(host.skyboxProgram);
   gl.deleteProgram(host.texturedProgram);
   if (host.contextLostHandler) host.canvas.removeEventListener('webglcontextlost', host.contextLostHandler, false);
   if (host.contextRestoredHandler) host.canvas.removeEventListener('webglcontextrestored', host.contextRestoredHandler, false);
@@ -760,8 +810,7 @@ export function updateHost(hostId, x, y, width, height, visible) {
 function disposeMeshResource(gl, r) {
   if (!r) return;
   if (r.vao) {
-    if (gl.deleteVertexArray) gl.deleteVertexArray(r.vao);
-    else if (r.vaoExt && r.vaoExt.deleteVertexArrayOES) r.vaoExt.deleteVertexArrayOES(r.vao);
+    gl.deleteVertexArray(r.vao);
     r.vao = null;
   }
   if (r.vertexBuffer) gl.deleteBuffer(r.vertexBuffer);
@@ -814,7 +863,7 @@ function uploadTexture(hostId, textureId, width, height, rgbaBytesBase64) {
   const safeHeight = Math.max(1, height | 0);
   let resource = host.textureResources.get(textureId);
   if (!resource) {
-    resource = { texture: gl.createTexture(), width: 0, height: 0 };
+    resource = { texture: createRequiredTexture(gl, `texture:${textureId}`), width: 0, height: 0 };
     host.textureResources.set(textureId, resource);
   }
   const rgbaBytes = coerceRgbaPayload(host, rgbaBytesBase64, safeWidth, safeHeight, 'texture');
@@ -874,21 +923,32 @@ function uploadMeshGeometryTyped(hostId, meshId, vertexCount, indexCount, positi
   const host = hosts.get(hostId);
   if (!host) return;
   const { gl } = host;
+  const safeVertexCount = vertexCount | 0;
+  const safeIndexCount = indexCount | 0;
+  if (safeVertexCount <= 0 || safeIndexCount <= 0) throw new Error(`Mesh '${meshId}' has an empty GPU geometry submission.`);
+  requireFloatStream('positions', positions, safeVertexCount * 3, true);
+  requireFloatStream('normals', normals, safeVertexCount * 3, true);
+  requireFloatStream('texCoords0', texCoords0, safeVertexCount * 2, !!hasTexCoords);
+  requireFloatStream('tangents', tangents, safeVertexCount * 4, !!hasTangents);
+  requireFloatStream('colors0', colors0, safeVertexCount * 4, !!hasColors);
+  requireFloatStream('materialSlots', materialSlots, safeVertexCount, !!hasMaterialSlots);
+  requireFloatStream('boneIndices', boneIndices, safeVertexCount * 4, !!hasSkinWeights);
+  requireFloatStream('boneWeights', boneWeights, safeVertexCount * 4, !!hasSkinWeights);
+  if (!indices || indices.length !== safeIndexCount) throw new Error(`Mesh '${meshId}' index payload has ${indices ? indices.length : 0} elements; exactly ${safeIndexCount} are required.`);
   let resource = host.meshResources.get(meshId);
   if (!resource) {
     resource = {
-      vertexBuffer: gl.createBuffer(),
-      normalBuffer: gl.createBuffer(),
+      vertexBuffer: createRequiredBuffer(gl, `mesh:${meshId}:position`),
+      normalBuffer: createRequiredBuffer(gl, `mesh:${meshId}:normal`),
       texCoordBuffer: null,
       tangentBuffer: null,
       colorBuffer: null,
       materialSlotBuffer: null,
       boneIndexBuffer: null,
       boneWeightBuffer: null,
-      indexBuffer: gl.createBuffer(),
+      indexBuffer: createRequiredBuffer(gl, `mesh:${meshId}:index`),
       wireframeIndexBuffer: null,
       vao: null,
-      vaoExt: null,
       indexCount: 0,
       wireframeIndexCount: 0,
       wireframeIndexType: gl.UNSIGNED_SHORT,
@@ -906,20 +966,18 @@ function uploadMeshGeometryTyped(hostId, meshId, vertexCount, indexCount, positi
     host.meshResourceList.push(resource);
   }
 
-  const safeVertexCount = Math.max(0, vertexCount | 0) || Math.max(0, (positions.length / 3) | 0);
   const localBounds = computeLocalBounds3(positions);
   resource.localCenter = localBounds.center;
   resource.localExtents = localBounds.extents;
   resource.localBoundsValid = localBounds.valid;
   bindArrayBufferCached(host, resource.vertexBuffer);
   gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
-  const normalData = normals.length === safeVertexCount * 3 ? normals : createDefaultNormalsTyped(safeVertexCount);
   bindArrayBufferCached(host, resource.normalBuffer);
-  gl.bufferData(gl.ARRAY_BUFFER, normalData, gl.STATIC_DRAW);
+  gl.bufferData(gl.ARRAY_BUFFER, normals, gl.STATIC_DRAW);
 
-  resource.hasTexCoords = !!hasTexCoords && texCoords0.length === safeVertexCount * 2;
+  resource.hasTexCoords = !!hasTexCoords;
   if (resource.hasTexCoords) {
-    if (!resource.texCoordBuffer) resource.texCoordBuffer = gl.createBuffer();
+    if (!resource.texCoordBuffer) resource.texCoordBuffer = createRequiredBuffer(gl, `mesh:${meshId}:uv0`);
     bindArrayBufferCached(host, resource.texCoordBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, texCoords0, gl.STATIC_DRAW);
   } else if (resource.texCoordBuffer) {
@@ -927,9 +985,9 @@ function uploadMeshGeometryTyped(hostId, meshId, vertexCount, indexCount, positi
     resource.texCoordBuffer = null;
   }
 
-  resource.hasTangents = !!hasTangents && tangents.length === safeVertexCount * 4;
+  resource.hasTangents = !!hasTangents;
   if (resource.hasTangents) {
-    if (!resource.tangentBuffer) resource.tangentBuffer = gl.createBuffer();
+    if (!resource.tangentBuffer) resource.tangentBuffer = createRequiredBuffer(gl, `mesh:${meshId}:tangent`);
     bindArrayBufferCached(host, resource.tangentBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, tangents, gl.STATIC_DRAW);
   } else if (resource.tangentBuffer) {
@@ -937,9 +995,9 @@ function uploadMeshGeometryTyped(hostId, meshId, vertexCount, indexCount, positi
     resource.tangentBuffer = null;
   }
 
-  resource.hasColors = !!hasColors && colors0.length === safeVertexCount * 4;
+  resource.hasColors = !!hasColors;
   if (resource.hasColors) {
-    if (!resource.colorBuffer) resource.colorBuffer = gl.createBuffer();
+    if (!resource.colorBuffer) resource.colorBuffer = createRequiredBuffer(gl, `mesh:${meshId}:color0`);
     bindArrayBufferCached(host, resource.colorBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, colors0, gl.STATIC_DRAW);
   } else if (resource.colorBuffer) {
@@ -947,9 +1005,9 @@ function uploadMeshGeometryTyped(hostId, meshId, vertexCount, indexCount, positi
     resource.colorBuffer = null;
   }
 
-  resource.hasMaterialSlots = !!hasMaterialSlots && materialSlots.length === safeVertexCount;
+  resource.hasMaterialSlots = !!hasMaterialSlots;
   if (resource.hasMaterialSlots) {
-    if (!resource.materialSlotBuffer) resource.materialSlotBuffer = gl.createBuffer();
+    if (!resource.materialSlotBuffer) resource.materialSlotBuffer = createRequiredBuffer(gl, `mesh:${meshId}:material-slot`);
     bindArrayBufferCached(host, resource.materialSlotBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, materialSlots, gl.STATIC_DRAW);
   } else if (resource.materialSlotBuffer) {
@@ -957,10 +1015,10 @@ function uploadMeshGeometryTyped(hostId, meshId, vertexCount, indexCount, positi
     resource.materialSlotBuffer = null;
   }
 
-  resource.hasSkinWeights = !!hasSkinWeights && boneIndices.length === safeVertexCount * 4 && boneWeights.length === safeVertexCount * 4;
+  resource.hasSkinWeights = !!hasSkinWeights;
   if (resource.hasSkinWeights) {
-    if (!resource.boneIndexBuffer) resource.boneIndexBuffer = gl.createBuffer();
-    if (!resource.boneWeightBuffer) resource.boneWeightBuffer = gl.createBuffer();
+    if (!resource.boneIndexBuffer) resource.boneIndexBuffer = createRequiredBuffer(gl, `mesh:${meshId}:bone-index`);
+    if (!resource.boneWeightBuffer) resource.boneWeightBuffer = createRequiredBuffer(gl, `mesh:${meshId}:bone-weight`);
     bindArrayBufferCached(host, resource.boneIndexBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, boneIndices, gl.STATIC_DRAW);
     bindArrayBufferCached(host, resource.boneWeightBuffer);
@@ -973,20 +1031,18 @@ function uploadMeshGeometryTyped(hostId, meshId, vertexCount, indexCount, positi
   }
 
   if (indices instanceof Uint32Array) {
-    if (!host.elementIndexUintExt) throw new Error('Mesh ' + meshId + ' requires 32-bit indices, but OES_element_index_uint is unavailable.');
     resource.indexType = gl.UNSIGNED_INT;
   } else {
     resource.indexType = gl.UNSIGNED_SHORT;
   }
   bindElementArrayBufferCached(host, resource.indexBuffer);
   gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
-  resource.indexCount = Math.max(0, indexCount | 0) || indices.length;
+  resource.indexCount = safeIndexCount;
 
   if (wireframeIndices && wireframeIndices.length > 0) {
-    if (!resource.wireframeIndexBuffer) resource.wireframeIndexBuffer = gl.createBuffer();
+    if (!resource.wireframeIndexBuffer) resource.wireframeIndexBuffer = createRequiredBuffer(gl, `mesh:${meshId}:wireframe-index`);
     let safeWireframe = wireframeIndices;
     if (wireframeIndices instanceof Uint32Array) {
-      if (!host.elementIndexUintExt) throw new Error('Wireframe for mesh ' + meshId + ' requires 32-bit indices, but OES_element_index_uint is unavailable.');
       resource.wireframeIndexType = gl.UNSIGNED_INT;
     } else {
       resource.wireframeIndexType = gl.UNSIGNED_SHORT;
@@ -1007,6 +1063,14 @@ function uploadMeshGeometryTyped(hostId, meshId, vertexCount, indexCount, positi
   bindElementArrayBufferCached(host, null);
 }
 
+function requireFloatStream(name, stream, expectedLength, present) {
+  const actualLength = stream ? stream.length : 0;
+  const requiredLength = present ? expectedLength : 0;
+  if (actualLength !== requiredLength) {
+    throw new Error(`Mesh ${name} payload has ${actualLength} floats; exactly ${requiredLength} are required by its declared layout.`);
+  }
+}
+
 function decodeIndexPayload(payload, elementSize) {
   const bytes = toUint8Array(payload);
   if (bytes.byteLength === 0) return new Uint16Array(0);
@@ -1024,45 +1088,33 @@ function maxArrayValue(values) {
   return max;
 }
 
-function createDefaultNormalsTyped(vertexCount) {
-  const normals = new Float32Array(Math.max(0, vertexCount) * 3);
-  for (let i = 0; i < normals.length; i += 3) normals[i + 2] = 1;
-  return normals;
-}
-
-function createDefaultNormals(vertexCount) {
-  const normals = new Array(Math.max(0, vertexCount) * 3);
-  for (let i = 0; i < normals.length; i += 3) { normals[i] = 0; normals[i + 1] = 0; normals[i + 2] = 1; }
-  return normals;
-}
-
-function createDefaultTexCoords(vertexCount) {
-  const tex = new Array(Math.max(0, vertexCount) * 2);
-  for (let i = 0; i < tex.length; i++) tex[i] = 0;
-  return tex;
-}
-
-function createDefaultTangents(vertexCount) {
-  const tangents = new Array(Math.max(0, vertexCount) * 4);
-  for (let i = 0; i < tangents.length; i += 4) { tangents[i] = 1; tangents[i + 1] = 0; tangents[i + 2] = 0; tangents[i + 3] = 1; }
-  return tangents;
-}
-
-function createDefaultMaterialSlots(vertexCount) {
-  const slots = new Array(Math.max(0, vertexCount));
-  for (let i = 0; i < slots.length; i++) slots[i] = 0;
-  return slots;
-}
-
-function getOrCreateControlBuffer(host, id) {
-  let buffer = host.controlVertexBuffers.get(id);
-  if (!buffer) { buffer = host.gl.createBuffer(); host.controlVertexBuffers.set(id, buffer); }
-  return buffer;
+function getOrCreateControlResource(host, id) {
+  let resource = host.controlVertexBuffers.get(id);
+  if (resource) return resource;
+  const { gl } = host;
+  const buffer = gl.createBuffer();
+  const vao = gl.createVertexArray();
+  if (!buffer || !vao) {
+    if (buffer) gl.deleteBuffer(buffer);
+    if (vao) gl.deleteVertexArray(vao);
+    throw new Error(`WebGL 2 failed to allocate the required control-plane GPU resource '${id}'.`);
+  }
+  resource = { buffer, vao, initialized: false };
+  bindVertexArrayCached(host, vao);
+  bindArrayBufferCached(host, buffer);
+  gl.enableVertexAttribArray(host.texturedPositionLocation);
+  gl.vertexAttribPointer(host.texturedPositionLocation, 3, gl.FLOAT, false, 20, 0);
+  gl.enableVertexAttribArray(host.texturedUvLocation);
+  gl.vertexAttribPointer(host.texturedUvLocation, 2, gl.FLOAT, false, 20, 12);
+  bindElementArrayBufferCached(host, host.quadIndexBuffer);
+  bindVertexArrayCached(host, null);
+  host.controlVertexBuffers.set(id, resource);
+  return resource;
 }
 
 function getOrCreateInstanceBuffer(host, id) {
   let buffer = host.instanceBuffers.get(id);
-  if (!buffer) { buffer = host.gl.createBuffer(); host.instanceBuffers.set(id, buffer); }
+  if (!buffer) { buffer = createRequiredBuffer(host.gl, `instance:${id}`); host.instanceBuffers.set(id, buffer); }
   return buffer;
 }
 
@@ -1095,6 +1147,14 @@ function decodeFloat32Payload(payload) {
   return new Float32Array(copy.buffer);
 }
 
+function requireExactFloatPayload(label, payload, expectedLength) {
+  const values = decodeFloat32Payload(payload);
+  if (values.length !== expectedLength) {
+    throw new Error(`${label} payload has ${values.length} floats; exactly ${expectedLength} are required.`);
+  }
+  return values;
+}
+
 function expectedRgbaByteCount(width, height) {
   const w = Math.max(1, width | 0);
   const h = Math.max(1, height | 0);
@@ -1109,24 +1169,12 @@ function isPowerOfTwo(value) {
 function coerceRgbaPayload(host, payload, width, height, kind) {
   const expected = expectedRgbaByteCount(width, height);
   const source = typeof payload === 'string' ? decodeBase64Bytes(payload) : toUint8Array(payload);
-  if (source.byteLength >= expected) {
-    return source.byteLength === expected ? source : source.subarray(0, expected);
-  }
+  if (source.byteLength === expected) return source;
 
   if (kind === 'palette') host.palettePayloadErrors = (host.palettePayloadErrors || 0) + 1;
   else host.texturePayloadErrors = (host.texturePayloadErrors || 0) + 1;
 
-  const fallback = new Uint8Array(expected);
-  if (source.byteLength > 0) fallback.set(source.subarray(0, Math.min(source.byteLength, expected)));
-  for (let i = 0; i < expected; i += 4) {
-    if (i + 3 >= source.byteLength) {
-      fallback[i + 0] = fallback[i + 0] || 255;
-      fallback[i + 1] = fallback[i + 1] || 255;
-      fallback[i + 2] = fallback[i + 2] || 255;
-      fallback[i + 3] = 255;
-    }
-  }
-  return fallback;
+  throw new Error(`${kind || 'texture'} RGBA payload has ${source.byteLength} bytes; exactly ${expected} are required.`);
 }
 
 function hasNonEmptyPayload(payload) {
@@ -1190,6 +1238,14 @@ function getOrCreateRetainedBatch(host, batchId) {
   let batch = host.retainedBatches.get(batchId);
   if (!batch) {
     const gl = host.gl;
+    const transformBuffer = createRequiredBuffer(gl, `retained:${batchId}:transform`);
+    let stateBuffer;
+    try {
+      stateBuffer = createRequiredBuffer(gl, `retained:${batchId}:state`);
+    } catch (error) {
+      gl.deleteBuffer(transformBuffer);
+      throw error;
+    }
     batch = {
       batchId,
       batchIndex: host.retainedBatchList.length,
@@ -1198,8 +1254,8 @@ function getOrCreateRetainedBatch(host, batchId) {
       lightingEnabled: 0,
       usePalette: false,
       instanceCount: 0,
-      transformBuffer: gl.createBuffer(),
-      stateBuffer: gl.createBuffer(),
+      transformBuffer,
+      stateBuffer,
       baseTransformData: new Float32Array(0),
       baseStateData: new Float32Array(0),
       visibleTransformData: new Float32Array(0),
@@ -1223,6 +1279,7 @@ function getOrCreateRetainedBatch(host, batchId) {
       roughness: 1,
       alphaCutoff: 0,
       transparent: false,
+      cullMode: 0,
       emissiveColor: [0, 0, 0, 0],
       materialTextureKey: ''
     };
@@ -1243,8 +1300,11 @@ function uploadRetainedBatchTransforms(hostId, batchId, meshId, lightingEnabled,
   batch.meshIndex = host.meshIdToIndex.has(meshId) ? host.meshIdToIndex.get(meshId) : -1;
   batch.lightingEnabled = lightingEnabled || 0;
   batch.usePalette = !!usePalette;
-  batch.instanceCount = instanceCount || 0;
+  batch.instanceCount = instanceCount | 0;
+  if (batch.instanceCount < 0) throw new Error(`Retained batch '${batchId}' has a negative instance count.`);
   const transforms = decodeFloat32Payload(transformFloatsBase64);
+  const expectedTransformFloats = batch.instanceCount * 16;
+  if (transforms.length !== expectedTransformFloats) throw new Error(`Retained batch '${batchId}' has ${transforms.length} transform floats; exactly ${expectedTransformFloats} are required.`);
   batch.baseTransformData = new Float32Array(transforms);
   batch.animatedTransformData = new Float32Array(batch.baseTransformData.length);
   batch.animationFrameId = -1;
@@ -1264,13 +1324,14 @@ function uploadRetainedBatchTransformsRange(hostId, batchId, startInstance, tran
   const host = hosts.get(hostId);
   if (!host) return;
   const batch = host.retainedBatches.get(batchId);
-  if (!batch || !batch.transformBuffer) return;
+  if (!batch || !batch.transformBuffer) throw new Error(`Transform patch references unknown retained batch '${batchId}'.`);
   const transforms = decodeFloat32Payload(transformFloatsBase64);
   if (transforms.length === 0) return;
-  const offsetFloats = Math.max(0, startInstance | 0) * 16;
-  if (batch.baseTransformData && batch.baseTransformData.length >= offsetFloats + transforms.length) {
-    batch.baseTransformData.set(transforms, offsetFloats);
-  }
+  const start = startInstance | 0;
+  if (start < 0 || (transforms.length % 16) !== 0) throw new Error(`Retained batch '${batchId}' has an invalid transform patch range.`);
+  const offsetFloats = start * 16;
+  if (!batch.baseTransformData || offsetFloats + transforms.length > batch.baseTransformData.length) throw new Error(`Retained batch '${batchId}' transform patch exceeds its allocated instance range.`);
+  batch.baseTransformData.set(transforms, offsetFloats);
   const { gl } = host;
   if (!batch.animationActive) {
     bindArrayBufferCached(host, batch.transformBuffer);
@@ -1286,12 +1347,14 @@ function uploadRetainedBatchState(hostId, batchId, usePalette, paletteWidth, pal
   const batch = getOrCreateRetainedBatch(host, batchId);
   batch.usePalette = !!usePalette;
   const states = decodeFloat32Payload(stateFloatsBase64);
+  const expectedStateFloats = batch.instanceCount * 4;
+  if (states.length !== expectedStateFloats) throw new Error(`Retained batch '${batchId}' has ${states.length} state floats; exactly ${expectedStateFloats} are required.`);
   batch.baseStateData = new Float32Array(states);
   bindArrayBufferCached(host, batch.stateBuffer);
   trackedBufferData(host, gl.ARRAY_BUFFER, batch.baseStateData, gl.DYNAMIC_DRAW);
   bindArrayBufferCached(host, null);
   if (batch.usePalette && hasNonEmptyPayload(paletteRgbaBase64)) {
-    if (!batch.paletteTexture) batch.paletteTexture = gl.createTexture();
+    if (!batch.paletteTexture) batch.paletteTexture = createRequiredTexture(gl, `retained:${batchId}:palette`);
     batch.paletteWidth = Math.max(1, paletteWidth || 1);
     batch.paletteHeight = Math.max(1, paletteHeight || 1);
     const rgbaBytes = coerceRgbaPayload(host, paletteRgbaBase64, batch.paletteWidth, batch.paletteHeight, 'palette');
@@ -1327,7 +1390,8 @@ export function uploadRetainedBatchMaterial(
   emissiveR,
   emissiveG,
   emissiveB,
-  emissiveA) {
+  emissiveA,
+  cullMode) {
   const host = hosts.get(hostId);
   if (!host) return;
   const batch = getOrCreateRetainedBatch(host, batchId);
@@ -1337,11 +1401,14 @@ export function uploadRetainedBatchMaterial(
   batch.metallicRoughnessTextureId = metallicRoughnessTextureId || '';
   batch.emissiveTextureId = emissiveTextureId || '';
   batch.materialTextureKey = (batch.baseColorTextureId || '') + '|' + (batch.normalTextureId || '') + '|' + (batch.metallicRoughnessTextureId || '') + '|' + (batch.emissiveTextureId || '');
-  batch.metallic = metallic || 0;
-  batch.roughness = roughness || 1;
-  batch.alphaCutoff = alphaCutoff || 0;
+  batch.metallic = finiteOr(metallic, 0);
+  batch.roughness = finiteOr(roughness, 1);
+  batch.alphaCutoff = finiteOr(alphaCutoff, 0);
   batch.transparent = !!transparent;
   batch.emissiveColor = [emissiveR || 0, emissiveG || 0, emissiveB || 0, emissiveA || 0];
+  const resolvedCullMode = Number(cullMode || 0) | 0;
+  if (resolvedCullMode < 0 || resolvedCullMode > 2) throw new Error(`Unsupported CullMode ${resolvedCullMode}.`);
+  batch.cullMode = resolvedCullMode;
 }
 
 export function uploadRetainedBatchTransformsRangeBytes(hostId, batchId, startInstance, transformBytes) {
@@ -1352,13 +1419,14 @@ function uploadRetainedBatchStateRange(hostId, batchId, startInstance, stateFloa
   const host = hosts.get(hostId);
   if (!host) return;
   const batch = host.retainedBatches.get(batchId);
-  if (!batch || !batch.stateBuffer) return;
+  if (!batch || !batch.stateBuffer) throw new Error(`State patch references unknown retained batch '${batchId}'.`);
   const states = decodeFloat32Payload(stateFloatsBase64);
   if (states.length === 0) return;
-  const offsetFloats = Math.max(0, startInstance | 0) * 4;
-  if (batch.baseStateData && batch.baseStateData.length >= offsetFloats + states.length) {
-    batch.baseStateData.set(states, offsetFloats);
-  }
+  const start = startInstance | 0;
+  if (start < 0 || (states.length % 4) !== 0) throw new Error(`Retained batch '${batchId}' has an invalid state patch range.`);
+  const offsetFloats = start * 4;
+  if (!batch.baseStateData || offsetFloats + states.length > batch.baseStateData.length) throw new Error(`Retained batch '${batchId}' state patch exceeds its allocated instance range.`);
+  batch.baseStateData.set(states, offsetFloats);
   const { gl } = host;
   bindArrayBufferCached(host, batch.stateBuffer);
   gl.bufferSubData(gl.ARRAY_BUFFER, offsetFloats * 4, states);
@@ -1410,18 +1478,26 @@ function drawSkybox(host, packet) {
   uniform3fvFromArray(host, host.skyboxTopColorLocation, host.scratch3, packet.skyboxTopColor, [0.28, 0.45, 0.72]);
   uniform3fvFromArray(host, host.skyboxHorizonColorLocation, host.scratch3, packet.skyboxHorizonColor, [0.62, 0.76, 0.94]);
   uniform3fvFromArray(host, host.skyboxBottomColorLocation, host.scratch3, packet.skyboxBottomColor, [0.82, 0.86, 0.90]);
-  uniform1fCached(host, host.skyboxIntensityLocation, packet.skyboxIntensity || 1.0);
-  uniform1iCached(host, host.skyboxModeLocation, packet.skyboxMode || 2);
+  const skyboxIntensity = Number.isFinite(packet.skyboxIntensity) ? Math.max(0, packet.skyboxIntensity) : 1.0;
+  const defaultProjectionScaleY = Math.tan(55 * Math.PI / 360);
+  const defaultProjectionScaleX = defaultProjectionScaleY * Math.max(1, packet.width || host.width || 1) / Math.max(1, packet.height || host.height || 1);
+  const projectionScaleX = Number.isFinite(packet.skyboxProjectionScaleX) && packet.skyboxProjectionScaleX > 0
+    ? packet.skyboxProjectionScaleX
+    : defaultProjectionScaleX;
+  const projectionScaleY = Number.isFinite(packet.skyboxProjectionScaleY) && packet.skyboxProjectionScaleY > 0
+    ? packet.skyboxProjectionScaleY
+    : defaultProjectionScaleY;
+  uniform1fCached(host, host.skyboxIntensityLocation, skyboxIntensity);
+  uniform1iCached(host, host.skyboxModeLocation, packet.skyboxMode | 0);
   uniform3fvFromArray(host, host.skyboxCameraRightLocation, host.scratch3, packet.cameraRight, [1, 0, 0]);
   uniform3fvFromArray(host, host.skyboxCameraUpLocation, host.scratch3, packet.cameraUp, [0, 1, 0]);
   uniform3fvFromArray(host, host.skyboxCameraForwardLocation, host.scratch3, packet.cameraForward, [0, 0, -1]);
+  uniform1fCached(host, host.skyboxProjectionScaleXLocation, projectionScaleX);
+  uniform1fCached(host, host.skyboxProjectionScaleYLocation, projectionScaleY);
   bindTextureSlot(host, packet.skyboxTextureId || null, host.skyboxTextureLocation, host.skyboxTextureEnabledLocation, gl.TEXTURE0, 0);
   if ((packet.skyboxMode | 0) === 3) bindSkyboxCubemapTextures(host, packet.skyboxCubemapTextureIds || []);
   else uniform1fCached(host, host.skyboxCubemapEnabledLocation, 0);
-  bindArrayBufferCached(host, host.skyboxVertexBuffer);
-  gl.enableVertexAttribArray(host.skyboxPositionLocation);
-  gl.vertexAttribPointer(host.skyboxPositionLocation, 2, gl.FLOAT, false, 0, 0);
-  bindElementArrayBufferCached(host, host.quadIndexBuffer);
+  bindVertexArrayCached(host, host.skyboxVertexArray);
   gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
   setDepthMaskCached(host, true);
   setDepthTestCached(host, true);
@@ -1442,10 +1518,10 @@ function getUniformCache(gl) {
   return cache;
 }
 
-function uniform3fvFromArray(host, location, scratch, source, fallback) {
+function uniform3fvFromArray(host, location, scratch, source, defaultValue) {
   const { gl } = host;
   if (location === null || location === undefined) return;
-  const src = source || fallback;
+  const src = source || defaultValue;
   const x = src[0] || 0;
   const y = src[1] || 0;
   const z = src[2] || 0;
@@ -1459,10 +1535,10 @@ function uniform3fvFromArray(host, location, scratch, source, fallback) {
   else cache.set(location, [x, y, z]);
 }
 
-function uniform4fvFromArray(host, location, scratch, source, fallback) {
+function uniform4fvFromArray(host, location, scratch, source, defaultValue) {
   const { gl } = host;
   if (location === null || location === undefined) return;
-  const src = source || fallback;
+  const src = source || defaultValue;
   const x = src[0] || 0;
   const y = src[1] || 0;
   const z = src[2] || 0;
@@ -1477,10 +1553,89 @@ function uniform4fvFromArray(host, location, scratch, source, fallback) {
   else cache.set(location, [x, y, z, w]);
 }
 
-export function isGpuSkinningSupported(hostId) {
+function resolveGpuTimers(host) {
+  const ext = host && host.gpuTimerExtension;
+  if (!ext || !host.gpuTimerPending || host.gpuTimerPending.length === 0) return;
+  const { gl } = host;
+  const disjoint = !!gl.getParameter(ext.GPU_DISJOINT_EXT);
+  for (let i = 0; i < host.gpuTimerPending.length;) {
+    const query = host.gpuTimerPending[i];
+    const available = !!gl.getQueryParameter(query, gl.QUERY_RESULT_AVAILABLE);
+    if (!available && !disjoint) { i++; continue; }
+    if (!disjoint) {
+      const nanoseconds = Number(gl.getQueryParameter(query, gl.QUERY_RESULT) || 0);
+      if (Number.isFinite(nanoseconds) && nanoseconds >= 0) {
+        host.gpuTimerLastMilliseconds = nanoseconds / 1000000;
+        host.gpuTimerValid = true;
+      }
+    } else {
+      host.gpuTimerLastMilliseconds = -1;
+      host.gpuTimerValid = false;
+    }
+    gl.deleteQuery(query);
+    host.gpuTimerPending.splice(i, 1);
+  }
+}
+
+export function beginGpuFrameTimer(hostId) {
   const host = hosts.get(hostId);
-  if (!host) return false;
-  return !!host.gpuSkinningSupported;
+  if (!host || !host.gpuTimerExtension || host.gpuTimerActive) return false;
+  resolveGpuTimers(host);
+  if (host.gpuTimerPending.length >= 4) return false;
+  const query = host.gl.createQuery();
+  if (!query) throw new Error('WebGL 2 failed to allocate a GPU timer query.');
+  host.gl.beginQuery(host.gpuTimerExtension.TIME_ELAPSED_EXT, query);
+  host.gpuTimerActive = query;
+  return true;
+}
+
+export function endGpuFrameTimer(hostId) {
+  const host = hosts.get(hostId);
+  if (!host || !host.gpuTimerActive || !host.gpuTimerExtension) return;
+  host.gl.endQuery(host.gpuTimerExtension.TIME_ELAPSED_EXT);
+  host.gpuTimerPending.push(host.gpuTimerActive);
+  host.gpuTimerActive = null;
+}
+
+export function getLastGpuFrameMilliseconds(hostId) {
+  const host = hosts.get(hostId);
+  if (!host) return -1;
+  resolveGpuTimers(host);
+  return host.gpuTimerValid ? host.gpuTimerLastMilliseconds : -1;
+}
+
+export function getRhiFeatureMask(hostId) {
+  const host = hosts.get(hostId);
+  if (!host) return 0;
+  let features = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6);
+  if (host.gpuSkinningSupported) features |= (1 << 7) | (1 << 8);
+  if (host.gpuTimerExtension) features |= (1 << 9);
+  return features;
+}
+
+export function getRhiLimit(hostId, index) {
+  const host = hosts.get(hostId);
+  if (!host) return 0;
+  const { gl } = host;
+  switch (index | 0) {
+    case 0: return gl.getParameter(gl.MAX_TEXTURE_SIZE) || 0;
+    case 1: return gl.getParameter(gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS) || 0;
+    case 2: return gl.getParameter(gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS) || 0;
+    case 3: return gl.getParameter(gl.MAX_VERTEX_ATTRIBS) || 0;
+    case 4: return gl.getParameter(gl.MAX_RENDERBUFFER_SIZE) || 0;
+    case 5: return gl.getParameter(gl.MAX_SAMPLES) || 0;
+    case 6: return gl.getParameter(gl.MAX_UNIFORM_BLOCK_SIZE) || 0;
+    case 7: return gl.getParameter(gl.MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS) || 0;
+    default: return 0;
+  }
+}
+
+export function getRhiAdapterName(hostId) {
+  return hosts.get(hostId)?.adapterName || 'Unknown GPU';
+}
+
+export function getRhiApiVersion(hostId) {
+  return hosts.get(hostId)?.apiVersion || 'WebGL 2';
 }
 
 export function uploadRetainedBatchSkinningBytes(hostId, batchId, enabled, boneCount, boneMatrixBytes) {
@@ -1488,26 +1643,24 @@ export function uploadRetainedBatchSkinningBytes(hostId, batchId, enabled, boneC
   if (!host) return;
   const { gl } = host;
   const batch = getOrCreateRetainedBatch(host, batchId);
-  if (!enabled || !host.gpuSkinningSupported || boneCount <= 0) {
+  if (!enabled || boneCount <= 0) {
     batch.skinningEnabled = false;
     batch.boneCount = 0;
     return;
   }
+  if (!host.gpuSkinningSupported) throw new Error('GPU skinning was submitted without required WebGL 2 vertex-texture capability.');
 
   const count = boneCount | 0;
   const expected = count * 16;
   const matrices = decodeFloat32Payload(boneMatrixBytes);
-  if (matrices.length < expected) {
-    batch.skinningEnabled = false;
-    batch.boneCount = 0;
-    return;
+  if (matrices.length !== expected) {
+    throw new Error(`GPU skinning payload for '${batchId}' has ${matrices.length} floats; exactly ${expected} are required.`);
   }
 
-  const upload = matrices.length === expected ? matrices : matrices.subarray(0, expected);
-  const internalFormat = host.isWebGl2 && gl.RGBA32F ? gl.RGBA32F : gl.RGBA;
+  const internalFormat = gl.RGBA32F;
   const needsCreate = !batch.boneTexture;
   if (needsCreate) {
-    batch.boneTexture = gl.createTexture();
+    batch.boneTexture = createRequiredTexture(gl, `retained:${batchId}:bones`);
     batch.boneTextureWidth = 0;
     batch.boneTextureHeight = 0;
   }
@@ -1529,7 +1682,7 @@ export function uploadRetainedBatchSkinningBytes(hostId, batchId, enabled, boneC
     batch.boneTextureWidth = 4;
     batch.boneTextureHeight = count;
   }
-  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 4, count, gl.RGBA, gl.FLOAT, upload);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 4, count, gl.RGBA, gl.FLOAT, matrices);
 
   bindTexture2DCached(host, 0, null);
   resetTextureBindCache(host);
@@ -1537,49 +1690,8 @@ export function uploadRetainedBatchSkinningBytes(hostId, batchId, enabled, boneC
   batch.boneCount = count;
 }
 
-const HIGH_SCALE_COMMAND_PREFIX = '__hs64:';
-
-function decodeHighScaleCommandLayerId(id) {
-  const text = String(id || '');
-  if (!text.startsWith(HIGH_SCALE_COMMAND_PREFIX)) return null;
-  const payload = text.substring(HIGH_SCALE_COMMAND_PREFIX.length);
-  if (!payload) return '';
-  try {
-    const binary = atob(payload);
-    try { return decodeURIComponent(escape(binary)); } catch (_) { return binary; }
-  } catch (_) {
-    return '';
-  }
-}
-
 function isHighScaleCommandRef(ref) {
   return !!ref && ref.kind === 'highScaleLayer';
-}
-
-export function setRetainedDrawOrder(hostId, drawOrder) {
-  const host = hosts.get(hostId);
-  if (!host) return;
-  if (host.glState) host.glState.legacyStringProtocolCalls++;
-  if (!host.allowLegacyStringProtocol) {
-    host.retainedDrawOrder = [];
-    return;
-  }
-  if (!drawOrder) { host.retainedDrawOrder = []; return; }
-  const lines = String(drawOrder).split('\n');
-  const refs = [];
-  for (const line of lines) {
-    if (!line) continue;
-    const sep = line.lastIndexOf('|');
-    const id = sep < 0 ? line : line.substring(0, sep);
-    const layerId = decodeHighScaleCommandLayerId(id);
-    if (layerId !== null) {
-      refs.push({ id, kind: 'highScaleLayer', layerId, transparent: false });
-    } else {
-      const idx = host.retainedBatchIdToIndex.get(id);
-      refs.push({ id, batchIndex: idx === undefined ? -1 : idx, transparent: sep >= 0 && line.substring(sep + 1) === '1' });
-    }
-  }
-  host.retainedDrawOrder = refs;
 }
 
 export function setRetainedDrawOrderBytes(hostId, count, orderBytes) {
@@ -1610,6 +1722,10 @@ export function setRetainedDrawOrderBytes(hostId, count, orderBytes) {
   host.retainedDrawOrder = refs;
 }
 
+function controlTextureKey(controlId) {
+  return 'control-texture:' + controlId;
+}
+
 export function setRetainedControlPlanesDirect(hostId, controlPlaneIds, count, planeBytes) {
   const host = hosts.get(hostId);
   if (!host) return;
@@ -1629,7 +1745,7 @@ export function setRetainedControlPlanesDirect(hostId, controlPlaneIds, count, p
     if (records.length >= offset + 20) source.set(records.subarray(offset, offset + 20));
     planes[i] = {
       id,
-      textureId: id,
+      textureId: controlTextureKey(id),
       source,
       alwaysFaceCamera: (source[0] || 0) > 0.5,
       vertices: new Float32Array(20),
@@ -1707,10 +1823,10 @@ export function renderRetainedSceneFrameDirect(
   styleBytes) {
   const host = hosts.get(hostId);
   if (!host || host.contextLost) return;
-  const view = decodeFloat32Payload(viewProjectionBytes);
-  const camera = decodeFloat32Payload(cameraBytes);
-  const lighting = decodeFloat32Payload(lightingBytes);
-  const style = decodeFloat32Payload(styleBytes);
+  const view = requireExactFloatPayload('retained view-projection', viewProjectionBytes, 16);
+  const camera = requireExactFloatPayload('retained camera', cameraBytes, 12);
+  const lighting = requireExactFloatPayload('retained lighting', lightingBytes, 33);
+  const style = requireExactFloatPayload('retained style', styleBytes, 30);
   const packet = ensureRetainedDirectPacket(host);
   packet.width = width || host.width || 1;
   packet.height = height || host.height || 1;
@@ -1734,7 +1850,9 @@ export function renderRetainedSceneFrameDirect(
   set3(packet.skyboxTopColor, style, 4, 0.28, 0.45, 0.72);
   set3(packet.skyboxHorizonColor, style, 7, 0.62, 0.76, 0.94);
   set3(packet.skyboxBottomColor, style, 10, 0.82, 0.86, 0.9);
-  packet.skyboxIntensity = style[13] || 1;
+  packet.skyboxIntensity = Number.isFinite(style[13]) ? Math.max(0, style[13]) : 1;
+  packet.skyboxProjectionScaleX = style[22] > 0 ? style[22] : 0;
+  packet.skyboxProjectionScaleY = style[23] > 0 ? style[23] : 0;
   packet.skyboxTextureId = skyboxTextureId || null;
   const cubeKey = skyboxCubemapIds || '';
   if (host.retainedCubemapIdsKey !== cubeKey) {
@@ -1746,9 +1864,9 @@ export function renderRetainedSceneFrameDirect(
   packet.hdrEnabled = (flags & 4) !== 0;
   packet.showWireframeOverlay = (flags & 8) !== 0;
   packet.showSilhouetteOverlay = (flags & 16) !== 0;
-  packet.toneMappingMode = toneMappingMode || 0;
-  packet.toneMappingParams[0] = style[14] || 1; packet.toneMappingParams[1] = style[15] || 2.2; packet.toneMappingParams[2] = 0; packet.toneMappingParams[3] = 0;
-  packet.ssaoParams[0] = style[16] || 0; packet.ssaoParams[1] = style[17] || 0.75; packet.ssaoParams[2] = style[18] || 0.025; packet.ssaoParams[3] = style[19] || 16;
+  packet.toneMappingMode = finiteOr(toneMappingMode, 0);
+  packet.toneMappingParams[0] = finiteOr(style[14], 1); packet.toneMappingParams[1] = finiteOr(style[15], 2.2); packet.toneMappingParams[2] = 0; packet.toneMappingParams[3] = 0;
+  packet.ssaoParams[0] = finiteOr(style[16], 0); packet.ssaoParams[1] = finiteOr(style[17], 0.75); packet.ssaoParams[2] = finiteOr(style[18], 0.025); packet.ssaoParams[3] = finiteOr(style[19], 16);
   packet.retainedBatches = host.retainedDrawOrder || packet.retainedBatches;
   packet.controlPlanes = host.controlPlanes || packet.controlPlanes;
   renderScenePacket(host, packet, false);
@@ -1774,17 +1892,21 @@ export function uploadRetainedParticleBatchBytes(hostId, batchId, meshId, lighti
   batch.usePalette = false;
   batch.particleMode = cubeMode ? 2 : 1;
   batch.particleStride = cubeMode ? 20 : 8;
-  if (!batch.particleBuffer) batch.particleBuffer = gl.createBuffer();
   const data = decodeFloat32Payload(particleBytes);
   const floatCount = Math.max(0, particleFloatCount | 0);
-  const uploadData = floatCount > 0 && data.length > floatCount ? data.subarray(0, floatCount) : data;
+  const expectedFloatCount = Math.max(0, batch.instanceCount | 0) * batch.particleStride;
+  if (floatCount !== expectedFloatCount || data.length !== expectedFloatCount) {
+    throw new Error(`Retained particle batch '${batchId}' has ${data.length}/${floatCount} payload floats; exactly ${expectedFloatCount} are required.`);
+  }
+  if (expectedFloatCount === 0) return;
+  if (!batch.particleBuffer) batch.particleBuffer = createRequiredBuffer(gl, `retained:${batchId}:particles`);
   bindArrayBufferCached(host, batch.particleBuffer);
-  const activeBytes = uploadData.byteLength || 0;
+  const activeBytes = data.byteLength;
   if (!batch.particleBufferCapacityBytes || batch.particleBufferCapacityBytes < activeBytes) {
     batch.particleBufferCapacityBytes = nextBufferCapacity(activeBytes);
     trackedBufferData(host, gl.ARRAY_BUFFER, batch.particleBufferCapacityBytes, gl.DYNAMIC_DRAW);
   }
-  if (activeBytes > 0) gl.bufferSubData(gl.ARRAY_BUFFER, 0, uploadData);
+  gl.bufferSubData(gl.ARRAY_BUFFER, 0, data);
   bindArrayBufferCached(host, null);
 }
 
@@ -1822,12 +1944,6 @@ function applyFramePacket(packet, frame) {
   packet.skyboxIntensity = frame.skyboxIntensity;
   packet.skyboxTextureId = frame.skyboxTextureId;
   packet.skyboxCubemapTextureIds = frame.skyboxCubemapTextureIds;
-  packet.directionalShadowEnabled = frame.directionalShadowEnabled;
-  packet.directionalShadowResolution = frame.directionalShadowResolution;
-  packet.directionalShadowStrength = frame.directionalShadowStrength;
-  packet.directionalShadowBias = frame.directionalShadowBias;
-  packet.directionalShadowReason = frame.directionalShadowReason;
-  packet.directionalShadowLightViewProjection = frame.directionalShadowLightViewProjection;
   packet.renderPipelineMode = frame.renderPipelineMode;
   packet.deferredRequested = frame.deferredRequested;
   packet.ssaoEnabled = frame.ssaoEnabled;
@@ -1866,14 +1982,22 @@ function renderScenePacket(host, packet, cleanupLiveResources) {
     if (removedMeshResource) rebuildMeshIndex(host);
     const liveControlIds = new Set(packet.controlPlanes.map(plane => plane.id));
     const liveTextureIds = Array.isArray(packet.liveTextureIds) ? new Set(packet.liveTextureIds) : new Set(packet.controlPlanes.map(plane => plane.textureId));
-    for (const [id, buffer] of host.controlVertexBuffers.entries()) if (!liveControlIds.has(id)) { gl.deleteBuffer(buffer); host.controlVertexBuffers.delete(id); }
+    for (const [id, resource] of host.controlVertexBuffers.entries()) {
+      if (!liveControlIds.has(id)) {
+        gl.deleteVertexArray(resource.vao);
+        gl.deleteBuffer(resource.buffer);
+        host.controlVertexBuffers.delete(id);
+      }
+    }
     for (const [id, texture] of host.textureResources.entries()) if (!liveTextureIds.has(id)) { gl.deleteTexture(texture.texture); host.textureResources.delete(id); }
   }
 
 
   gl.viewport(0, 0, host.width || 1, host.height || 1);
   setDepthTestCached(host, true);
-  setDepthFuncCached(host, gl.LEQUAL);
+  setDepthFuncCached(host, gl.LESS);
+  setDepthMaskCached(host, true);
+  setBlendCached(host, false);
   gl.clearColor(packet.clearColor[0], packet.clearColor[1], packet.clearColor[2], packet.clearColor[3]);
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
   drawSkybox(host, packet);
@@ -1893,11 +2017,11 @@ function renderScenePacket(host, packet, cleanupLiveResources) {
   if (host.meshPostProcessParamsLocation !== null) {
     const tone = packet.toneMappingParams || [1.0, 2.2, 0.0, 0.0];
     const mode = packet.toneMappingMode || 0;
-    uniform4fCached(host, host.meshPostProcessParamsLocation, tone[0] || 1.0, tone[1] || 2.2, packet.hdrEnabled ? 1.0 : 0.0, mode);
+    uniform4fCached(host, host.meshPostProcessParamsLocation, finiteOr(tone[0], 1.0), finiteOr(tone[1], 2.2), packet.hdrEnabled ? 1.0 : 0.0, mode);
   }
   if (host.meshSsaoParamsLocation !== null) {
     const ssao = packet.ssaoParams || [0.0, 0.75, 0.025, 16.0];
-    uniform4fCached(host, host.meshSsaoParamsLocation, packet.ssaoEnabled ? 1.0 : 0.0, ssao[0] || 0.0, ssao[1] || 0.75, ssao[2] || 0.025);
+    uniform4fCached(host, host.meshSsaoParamsLocation, packet.ssaoEnabled ? 1.0 : 0.0, finiteOr(ssao[0], 0.0), finiteOr(ssao[1], 0.75), finiteOr(ssao[2], 0.025));
   }
   uniformMatrix4fvCached(host, host.meshViewProjLocation, viewProj);
   if (host.meshCameraRightUniformLocation !== null) uniform3fvFromArray(host, host.meshCameraRightUniformLocation, host.scratch3, packet.cameraRight, [1, 0, 0]);
@@ -1909,12 +2033,8 @@ function renderScenePacket(host, packet, cleanupLiveResources) {
   if (hasHighScale) beginHighScaleCommandFrame(host);
 
   const legacyBatchCount = Array.isArray(batches) ? batches.length : 0;
-  if (legacyBatchCount > 0 && !host.allowLegacyDrawPath) {
-    if (host.glState) host.glState.legacyDrawPathBlockedCalls += legacyBatchCount;
-  }
-  if (host.allowLegacyDrawPath) for (const batch of batches) if (!batch.transparent) drawMeshBatch(host, batch);
+  if (legacyBatchCount > 0) throw new Error(`Rejected ${legacyBatchCount} legacy per-object draw batches; the RHI requires retained GPU submissions.`);
   for (const ref of retainedRefs) if (!ref || !ref.transparent) drawRetainedCommandRef(host, ref, packet, viewProj);
-  if (host.allowLegacyDrawPath) for (const batch of batches) if (batch.transparent) drawMeshBatch(host, batch);
   for (const ref of retainedRefs) if (ref && ref.transparent) drawRetainedCommandRef(host, ref, packet, viewProj);
   if (hasHighScale) publishHighScaleCommandMetrics(host);
   drawControlPlanes(host, packet, viewProj);
@@ -2041,6 +2161,25 @@ function setDepthMaskCached(host, enabled) {
   }
 }
 
+function setCullModeCached(host, mode) {
+  const { gl } = host;
+  const resolved = Number(mode || 0) | 0;
+  if (resolved < 0 || resolved > 2) throw new Error(`Unsupported CullMode ${resolved}.`);
+  if (!host.glState || host.glState.cullMode !== resolved) {
+    if (resolved === 0) {
+      gl.disable(gl.CULL_FACE);
+    } else {
+      gl.enable(gl.CULL_FACE);
+      const face = resolved === 1 ? gl.BACK : gl.FRONT;
+      if (!host.glState || host.glState.cullFace !== face) {
+        gl.cullFace(face);
+        if (host.glState) host.glState.cullFace = face;
+      }
+    }
+    if (host.glState) { host.glState.cullMode = resolved; host.glState.stateChanges++; }
+  }
+}
+
 function setBlendFuncCached(host, src, dst) {
   const { gl } = host;
   if (!host.glState || host.glState.blendSrc !== src || host.glState.blendDst !== dst) {
@@ -2126,14 +2265,11 @@ function uniformMatrix4fvCached(host, location, value) {
 function bindVertexArrayCached(host, vao) {
   const { gl } = host;
   if (!host.glState) {
-    if (gl.bindVertexArray) gl.bindVertexArray(vao);
-    else if (host.vaoExt) host.vaoExt.bindVertexArrayOES(vao);
+    gl.bindVertexArray(vao);
     return;
   }
   if (host.glState.vao === vao) return;
-  if (gl.bindVertexArray) gl.bindVertexArray(vao);
-  else if (host.vaoExt) host.vaoExt.bindVertexArrayOES(vao);
-  else return;
+  gl.bindVertexArray(vao);
   host.glState.vao = vao;
   host.glState.arrayBuffer = null;
   host.glState.elementArrayBuffer = null;
@@ -2182,46 +2318,35 @@ function trackedBufferData(host, target, dataOrSize, usage) {
 
 function createMeshVaoObject(host) {
   const { gl } = host;
-  if (gl.createVertexArray) return { vao: gl.createVertexArray(), ext: null };
-  if (host.vaoExt && host.vaoExt.createVertexArrayOES) return { vao: host.vaoExt.createVertexArrayOES(), ext: host.vaoExt };
-  return { vao: null, ext: null };
+  const vao = gl.createVertexArray();
+  if (!vao) throw new Error('WebGL 2 failed to allocate a required vertex array.');
+  return vao;
 }
 
 function bindMeshVaoRaw(host, vao) {
-  const { gl } = host;
-  if (gl.bindVertexArray) gl.bindVertexArray(vao);
-  else if (host.vaoExt) host.vaoExt.bindVertexArrayOES(vao);
+  host.gl.bindVertexArray(vao);
 }
 
 function rebuildMeshVao(host, resource) {
   const { gl } = host;
   if (resource.vao) {
-    if (gl.deleteVertexArray) gl.deleteVertexArray(resource.vao);
-    else if (resource.vaoExt && resource.vaoExt.deleteVertexArrayOES) resource.vaoExt.deleteVertexArrayOES(resource.vao);
+    gl.deleteVertexArray(resource.vao);
     resource.vao = null;
-    resource.vaoExt = null;
   }
-  const created = createMeshVaoObject(host);
-  if (!created.vao) return;
-  resource.vao = created.vao;
-  resource.vaoExt = created.ext;
+  resource.vao = createMeshVaoObject(host);
   bindMeshVaoRaw(host, resource.vao);
   resetGlStateCache(host);
-  bindMeshGeometryFallback(host, resource);
+  configureMeshGeometryAttributes(host, resource);
   bindMeshVaoRaw(host, null);
   resetGlStateCache(host);
 }
 
 function bindMeshGeometry(host, resource) {
-  if (resource && resource.vao) {
-    bindVertexArrayCached(host, resource.vao);
-    return;
-  }
-  bindVertexArrayCached(host, null);
-  bindMeshGeometryFallback(host, resource);
+  if (!resource || !resource.vao) throw new Error('A WebGL 2 mesh draw was submitted without a required vertex array.');
+  bindVertexArrayCached(host, resource.vao);
 }
 
-function bindMeshGeometryFallback(host, resource) {
+function configureMeshGeometryAttributes(host, resource) {
   const { gl } = host;
   bindArrayBufferCached(host, resource.normalBuffer);
   gl.enableVertexAttribArray(host.meshNormalLocation);
@@ -2391,8 +2516,19 @@ function prepareVisibleRetainedBatch(host, batch, resource) {
     return { count: 0, transformBuffer: batch.transformBuffer, stateBuffer: batch.stateBuffer };
   }
   const gl = host.gl;
-  if (!batch.culledTransformBuffer) batch.culledTransformBuffer = gl.createBuffer();
-  if (!batch.culledStateBuffer) batch.culledStateBuffer = gl.createBuffer();
+  const createdTransformBuffer = !batch.culledTransformBuffer;
+  if (createdTransformBuffer) batch.culledTransformBuffer = createRequiredBuffer(gl, `retained:${batch.batchId}:culled-transform`);
+  if (!batch.culledStateBuffer) {
+    try {
+      batch.culledStateBuffer = createRequiredBuffer(gl, `retained:${batch.batchId}:culled-state`);
+    } catch (error) {
+      if (createdTransformBuffer) {
+        gl.deleteBuffer(batch.culledTransformBuffer);
+        batch.culledTransformBuffer = null;
+      }
+      throw error;
+    }
+  }
   if (batch.visibleTransformData.length < visible * 16) batch.visibleTransformData = ensureFloatCapacity(batch.visibleTransformData, visible * 16);
   if (states && states.length >= count * 4 && batch.visibleStateData.length < visible * 4) batch.visibleStateData = ensureFloatCapacity(batch.visibleStateData, visible * 4);
   const transformFloats = visible * 16;
@@ -2422,11 +2558,12 @@ function drawRetainedBatch(host, batchId) {
 
 function drawRetainedBatchObject(host, batch) {
   const { gl } = host;
-  if (!batch || batch.instanceCount <= 0 || !host.instancing) return;
+  if (!batch || batch.instanceCount <= 0) return;
   const resource = batch.meshIndex >= 0 ? host.meshResourceList[batch.meshIndex] : host.meshResources.get(batch.meshId);
   if (!resource || resource.indexCount === 0) return;
   const visible = prepareVisibleRetainedBatch(host, batch, resource);
   if (visible.count <= 0) return;
+  setCullModeCached(host, batch.cullMode || 0);
   bindMeshGeometry(host, resource);
   if (batch.transparent && !host.forceAlphaDitherOpaque) {
     setBlendCached(host, true);
@@ -2440,14 +2577,20 @@ function drawRetainedBatchObject(host, batch) {
   uniform1fCached(host, host.meshNormalMapStrengthLocation, batch.normalMapStrength || 0);
   uniform1fCached(host, host.meshUsePaletteLocation, 0);
   bindMaterialTextures(host, batch);
-  uniform4fCached(host, host.meshMaterialParamsLocation, batch.metallic || 0, batch.roughness || 1, 0, 0);
-  uniform4fCached(host, host.meshAlphaParamsLocation, batch.alphaCutoff || 0, (batch.transparent && !host.forceAlphaDitherOpaque) ? 1 : 0, 0, 0);
+  uniform4fCached(host, host.meshMaterialParamsLocation, finiteOr(batch.metallic, 0), finiteOr(batch.roughness, 1), 0, 0);
+  uniform4fCached(host, host.meshAlphaParamsLocation, finiteOr(batch.alphaCutoff, 0), (batch.transparent && !host.forceAlphaDitherOpaque) ? 1 : 0, 0, 0);
   const em = batch.emissiveColor || [0, 0, 0, 0];
   uniform4fCached(host, host.meshEmissiveColorLocation, em[0] || 0, em[1] || 0, em[2] || 0, em[3] || 0);
   uniform1fCached(host, host.meshUseInstancingLocation, 1);
   uniform1fCached(host, host.meshUsePaletteLocation, batch.usePalette ? 1 : 0);
   if (host.meshSkinningEnabledLocation !== null) {
-    const skinActive = batch.skinningEnabled && batch.boneTexture && resource.hasSkinWeights;
+    if (resource.hasSkinWeights && !batch.skinningEnabled) {
+      throw new Error(`Retained batch '${batch.batchId}' contains skinned geometry but no active GPU bone-matrix texture.`);
+    }
+    if (batch.skinningEnabled && (!batch.boneTexture || !resource.hasSkinWeights)) {
+      throw new Error(`Retained batch '${batch.batchId}' requested GPU skinning without a complete bone texture and skin-weight geometry.`);
+    }
+    const skinActive = !!batch.skinningEnabled;
     uniform1fCached(host, host.meshSkinningEnabledLocation, skinActive ? 1 : 0);
     if (skinActive) {
       bindTexture2DCached(host, 6, batch.boneTexture);
@@ -2488,10 +2631,10 @@ function drawRetainedBatchObject(host, batch) {
     bindArrayBufferCached(host, visible.stateBuffer);
     setInstanceAttributeWithStride(host, host.meshInstanceColorLocation, 4, 0, 16);
   }
-  host.instancing.drawElementsInstancedANGLE(gl.TRIANGLES, resource.indexCount, resource.indexType, 0, visible.count);
+  gl.drawElementsInstanced(gl.TRIANGLES, resource.indexCount, resource.indexType, 0, visible.count);
   uniform1fCached(host, host.meshParticleModeLocation, 0);
   uniform1fCached(host, host.meshSkinningEnabledLocation, 0);
-  drawWireframeOverlayForCurrentBatch(host, resource, visible.count, true);
+  drawWireframeOverlayForCurrentBatch(host, resource, visible.count);
   resetInstanceDivisors(host);
   setDepthMaskCached(host, true);
   uniform1fCached(host, host.meshUsePaletteLocation, 0);
@@ -2640,7 +2783,7 @@ function parseHighScaleSnapshotBytes(host, payload) {
       }
       layer.chunks.push(chunk);
     }
-    return cursor.failed ? null : layer;
+    return cursor.failed || cursor.offset !== bytes.byteLength ? null : layer;
   } catch (_) {
     return null;
   }
@@ -2651,12 +2794,7 @@ export function uploadHighScaleLayerSnapshotBytes(hostId, layerId, snapshotBytes
   if (!host) return;
   const layer = parseHighScaleSnapshotBytes(host, snapshotBytes);
   if (!layer) {
-    if (layerId) {
-      const key = handleKeyFromString(layerId);
-      if (key) host.highScaleLayerHandleRefs.delete(key);
-      host.highScaleLayers.delete(layerId);
-    }
-    return;
+    throw new Error(`High-scale layer '${layerId}' has a malformed binary snapshot; the previous GPU state was preserved and the frame is rejected.`);
   }
   host.highScaleLayers.set(layerId || layer.id, layer);
   registerHighScaleLayerHandle(host, layer);
@@ -2705,13 +2843,13 @@ function ensureHighScaleDirectPacket(host) {
 function copy3(dest, src, offset) { dest[0] = src[offset] || 0; dest[1] = src[offset + 1] || 0; dest[2] = src[offset + 2] || 0; }
 function copy4(dest, src, offset) { dest[0] = src[offset] || 0; dest[1] = src[offset + 1] || 0; dest[2] = src[offset + 2] || 0; dest[3] = src[offset + 3] || 0; }
 
-export function syncHighScaleFrameDirect(hostId, width, height, flags, skyboxMode, shadowResolution, shadowReason, viewProjectionBytes, cameraBytes, lightingBytes, styleBytes) {
+export function syncHighScaleFrameDirect(hostId, width, height, flags, skyboxMode, viewProjectionBytes, cameraBytes, lightingBytes, styleBytes) {
   const host = hosts.get(hostId);
   if (!host) return;
-  const view = decodeFloat32Payload(viewProjectionBytes);
-  const camera = decodeFloat32Payload(cameraBytes);
-  const lighting = decodeFloat32Payload(lightingBytes);
-  const style = decodeFloat32Payload(styleBytes);
+  const view = requireExactFloatPayload('high-scale view-projection', viewProjectionBytes, 16);
+  const camera = requireExactFloatPayload('high-scale camera', cameraBytes, 12);
+  const lighting = requireExactFloatPayload('high-scale lighting', lightingBytes, 33);
+  const style = requireExactFloatPayload('high-scale style', styleBytes, 24);
   const p = ensureHighScaleDirectPacket(host);
   p.width = width || host.width || 1;
   p.height = height || host.height || 1;
@@ -2735,17 +2873,14 @@ export function syncHighScaleFrameDirect(hostId, width, height, flags, skyboxMod
   copy3(p.skyboxTopColor, style, 4);
   copy3(p.skyboxHorizonColor, style, 7);
   copy3(p.skyboxBottomColor, style, 10);
-  p.skyboxIntensity = style[13] || 1;
-  p.toneMappingParams[0] = style[14] || 1; p.toneMappingParams[1] = style[15] || 2.2; p.toneMappingParams[2] = 0; p.toneMappingParams[3] = 0;
-  p.ssaoParams[0] = style[16] || 0; p.ssaoParams[1] = style[17] || 0.75; p.ssaoParams[2] = style[18] || 0.025; p.ssaoParams[3] = style[19] || 16;
+  p.skyboxIntensity = Number.isFinite(style[13]) ? Math.max(0, style[13]) : 1;
+  p.toneMappingParams[0] = finiteOr(style[14], 1); p.toneMappingParams[1] = finiteOr(style[15], 2.2); p.toneMappingParams[2] = 0; p.toneMappingParams[3] = 0;
+  p.ssaoParams[0] = finiteOr(style[16], 0); p.ssaoParams[1] = finiteOr(style[17], 0.75); p.ssaoParams[2] = finiteOr(style[18], 0.025); p.ssaoParams[3] = finiteOr(style[19], 16);
   p.clientAnimationEnabled = (flags & 2) !== 0;
   p.clientAnimationTime = style[20] || 0;
   p.clientAnimationAmplitude = style[21] || 0;
-  p.directionalShadowEnabled = (flags & 4) !== 0;
-  p.directionalShadowResolution = shadowResolution || 0;
-  p.directionalShadowStrength = style[22] || 0;
-  p.directionalShadowBias = style[23] || 0;
-  p.directionalShadowReason = shadowReason || '';
+  p.skyboxProjectionScaleX = style[22] > 0 ? style[22] : 0;
+  p.skyboxProjectionScaleY = style[23] > 0 ? style[23] : 0;
   p.ssaoEnabled = (flags & 8) !== 0;
   p.hdrEnabled = (flags & 16) !== 0;
 }
@@ -2761,6 +2896,7 @@ export function getLastHighScaleMetric(hostId, index) {
 function drawHighScaleRuntime(host, packet, clearFrame, passMode = 0, recordMetrics = true, layerFilterId = null, advanceFrame = true) {
   if (!host || !packet) return '';
   const { gl } = host;
+  setCullModeCached(host, 0);
   if (advanceFrame) {
     host.frameId = (host.frameId || 0) + 1;
     host.animationUploadBytes = 0;
@@ -2774,7 +2910,9 @@ function drawHighScaleRuntime(host, packet, clearFrame, passMode = 0, recordMetr
   if (clearFrame) {
     gl.viewport(0, 0, host.width || 1, host.height || 1);
     setDepthTestCached(host, true);
-    setDepthFuncCached(host, gl.LEQUAL);
+    setDepthFuncCached(host, gl.LESS);
+    setDepthMaskCached(host, true);
+    setBlendCached(host, false);
     const clear = packet.clearColor || [0, 0, 0, 1];
     gl.clearColor(clear[0], clear[1], clear[2], clear[3]);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
@@ -2797,11 +2935,11 @@ function drawHighScaleRuntime(host, packet, clearFrame, passMode = 0, recordMetr
   if (host.meshPostProcessParamsLocation !== null) {
     const tone = packet.toneMappingParams || [1.0, 2.2, 0.0, 0.0];
     const mode = packet.toneMappingMode || 0;
-    uniform4fCached(host, host.meshPostProcessParamsLocation, tone[0] || 1.0, tone[1] || 2.2, packet.hdrEnabled ? 1.0 : 0.0, mode);
+    uniform4fCached(host, host.meshPostProcessParamsLocation, finiteOr(tone[0], 1.0), finiteOr(tone[1], 2.2), packet.hdrEnabled ? 1.0 : 0.0, mode);
   }
   if (host.meshSsaoParamsLocation !== null) {
     const ssao = packet.ssaoParams || [0.0, 0.75, 0.025, 16.0];
-    uniform4fCached(host, host.meshSsaoParamsLocation, packet.ssaoEnabled ? 1.0 : 0.0, ssao[0] || 0.0, ssao[1] || 0.75, ssao[2] || 0.025);
+    uniform4fCached(host, host.meshSsaoParamsLocation, packet.ssaoEnabled ? 1.0 : 0.0, finiteOr(ssao[0], 0.0), finiteOr(ssao[1], 0.75), finiteOr(ssao[2], 0.025));
   }
   uniformMatrix4fvCached(host, host.meshViewProjLocation, viewProj);
   uniform1fCached(host, host.meshParticleModeLocation, 0);
@@ -2873,7 +3011,7 @@ function drawHighScaleRuntime(host, packet, clearFrame, passMode = 0, recordMetr
   const metrics = host.highScaleMetricsScratch || (host.highScaleMetricsScratch = new Float64Array(20));
   metrics[0] = visibleChunks; metrics[1] = totalChunks; metrics[2] = culled; metrics[3] = lodD; metrics[4] = lodS; metrics[5] = lodP; metrics[6] = lodB; metrics[7] = lodC;
   metrics[8] = drawCalls; metrics[9] = batches; metrics[10] = Math.round(triangles); metrics[11] = partInstances;
-  metrics[12] = tCull1 - tCull0; metrics[13] = tDraw1 - tDraw0; metrics[14] = performance.now() - t0; metrics[15] = host.isWebGl2 ? 2 : 1;
+  metrics[12] = tCull1 - tCull0; metrics[13] = tDraw1 - tDraw0; metrics[14] = performance.now() - t0; metrics[15] = 2;
   metrics[16] = host.animationUploadBatches || 0; metrics[17] = host.animationUploadBytes || 0; metrics[18] = host.texturePayloadErrors || 0; metrics[19] = host.palettePayloadErrors || 0;
   if (recordMetrics) host.lastHighScaleMetrics = metrics;
   return metrics;
@@ -2973,75 +3111,13 @@ function bindSkyboxCubemapTextures(host, ids) {
   activateTextureUnitCached(host, 0);
 }
 
-function drawMeshBatch(host, batch) {
-  if (host.glState) host.glState.legacyDrawPathCalls++;
-  const { gl } = host;
-  const resource = host.meshResources.get(batch.id);
-  if (!resource || resource.indexCount === 0 || !batch.instanceData || batch.instanceCount <= 0) return;
-  const transparent = !!batch.transparent;
-  if (transparent) {
-    setBlendCached(host, true);
-    setBlendFuncCached(host, gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-    setDepthMaskCached(host, false);
-  } else {
-    setBlendCached(host, false);
-    setDepthMaskCached(host, true);
-  }
-  bindMeshGeometry(host, resource);
-  uniform1fCached(host, host.meshLightingEnabledLocation, batch.lightingEnabled || 0);
-  uniform1fCached(host, host.meshNormalMapStrengthLocation, batch.normalMapStrength || 0);
-  uniform4fCached(host, host.meshMaterialParamsLocation, batch.metallic || 0, batch.roughness === undefined ? 1 : batch.roughness, 0, 0);
-  uniform4fCached(host, host.meshAlphaParamsLocation, batch.alphaCutoff || 0, 0, 0, 0);
-  if (host.meshEmissiveColorLocation !== null) {
-    const em = batch.emissiveColor || [0, 0, 0, 0];
-    uniform4fCached(host, host.meshEmissiveColorLocation, em[0] || 0, em[1] || 0, em[2] || 0, em[3] || 0);
-  }
-  uniform1fCached(host, host.meshUsePaletteLocation, 0);
-  bindMaterialTextures(host, batch);
-
-  if (host.instancing) {
-    const buffer = getOrCreateInstanceBuffer(host, batch.id + '|l:' + (batch.lightingEnabled || 0));
-    bindArrayBufferCached(host, buffer);
-    trackedBufferData(host, gl.ARRAY_BUFFER, batch.instanceData instanceof Float32Array ? batch.instanceData : new Float32Array(batch.instanceData), gl.DYNAMIC_DRAW);
-    setInstanceAttribute(host, host.meshInstanceModel0Location, 4, 0);
-    setInstanceAttribute(host, host.meshInstanceModel1Location, 4, 16);
-    setInstanceAttribute(host, host.meshInstanceModel2Location, 4, 32);
-    setInstanceAttribute(host, host.meshInstanceModel3Location, 4, 48);
-    setInstanceAttribute(host, host.meshInstanceColorLocation, 4, 64);
-    uniform1fCached(host, host.meshUseInstancingLocation, 1);
-    host.instancing.drawElementsInstancedANGLE(gl.TRIANGLES, resource.indexCount, resource.indexType, 0, batch.instanceCount);
-    drawWireframeOverlayForCurrentBatch(host, resource, batch.instanceCount, true);
-    resetInstanceDivisors(host);
-  } else {
-    uniform1fCached(host, host.meshUseInstancingLocation, 0);
-    const data = batch.instanceData;
-    for (let i = 0; i < batch.instanceCount; i++) {
-      const o = i * 20;
-      for (let j = 0; j < 16; j++) host.scratch16[j] = data[o + j] || 0;
-      uniformMatrix4fvCached(host, host.meshModelLocation, host.scratch16);
-      host.scratch4[0] = data[o + 16] || 0; host.scratch4[1] = data[o + 17] || 0; host.scratch4[2] = data[o + 18] || 0; host.scratch4[3] = data[o + 19] || 0;
-      uniform4fvFromArray(host, host.meshColorLocation, host.scratch4, host.scratch4, [1, 1, 1, 1]);
-      gl.drawElements(gl.TRIANGLES, resource.indexCount, resource.indexType, 0);
-      drawWireframeOverlayForCurrentBatch(host, resource, 1, false);
-    }
-  }
-  if (transparent) {
-    setDepthMaskCached(host, true);
-    setBlendCached(host, false);
-  }
-}
-
-function drawWireframeOverlayForCurrentBatch(host, resource, instanceCount, instanced) {
+function drawWireframeOverlayForCurrentBatch(host, resource, instanceCount) {
   if (!host.showWireframeOverlay || !resource || resource.wireframeIndexCount <= 0) return;
   const { gl } = host;
   uniform1fCached(host, host.meshLightingEnabledLocation, 0);
   uniform1fCached(host, host.meshNormalMapStrengthLocation, 0);
   bindElementArrayBufferCached(host, resource.wireframeIndexBuffer);
-  if (instanced && host.instancing) {
-    host.instancing.drawElementsInstancedANGLE(gl.LINES, resource.wireframeIndexCount, resource.wireframeIndexType || gl.UNSIGNED_SHORT, 0, instanceCount);
-  } else {
-    gl.drawElements(gl.LINES, resource.wireframeIndexCount, resource.wireframeIndexType || gl.UNSIGNED_SHORT, 0);
-  }
+  gl.drawElementsInstanced(gl.LINES, resource.wireframeIndexCount, resource.wireframeIndexType || gl.UNSIGNED_SHORT, 0, instanceCount);
   bindElementArrayBufferCached(host, resource.indexBuffer);
 }
 
@@ -3054,14 +3130,13 @@ function setInstanceAttributeWithStride(host, location, size, offset, stride) {
   const { gl } = host;
   gl.enableVertexAttribArray(location);
   gl.vertexAttribPointer(location, size, gl.FLOAT, false, stride, offset);
-  host.instancing.vertexAttribDivisorANGLE(location, 1);
+  gl.vertexAttribDivisor(location, 1);
 }
 
 function resetInstanceDivisors(host) {
-  const inst = host.instancing;
-  if (!inst) return;
+  const { gl } = host;
   for (const location of [host.meshInstanceModel0Location, host.meshInstanceModel1Location, host.meshInstanceModel2Location, host.meshInstanceModel3Location, host.meshInstanceColorLocation]) {
-    if (location >= 0) inst.vertexAttribDivisorANGLE(location, 0);
+    if (location >= 0) gl.vertexAttribDivisor(location, 0);
   }
 }
 
@@ -3148,6 +3223,7 @@ function drawControlPlanes(host, packet, viewProj) {
   const { gl } = host;
   const planes = packet.controlPlanes || host.controlPlanes || [];
   if (!planes || planes.length === 0) return;
+  setCullModeCached(host, 0);
   const drawList = host.controlPlaneDrawList || planes;
   for (let i = 0; i < planes.length; i++) {
     updateControlPlaneForFrame(host, planes[i], packet, viewProj);
@@ -3162,26 +3238,22 @@ function drawControlPlanes(host, packet, viewProj) {
   uniformMatrix4fvCached(host, host.texturedViewProjLocation, viewProj);
   activateTextureUnitCached(host, 0);
   uniform1iCached(host, host.texturedSamplerLocation, 0);
-  bindElementArrayBufferCached(host, host.quadIndexBuffer);
   for (let i = 0; i < drawList.length; i++) {
     const plane = drawList[i];
     const textureResource = host.textureResources.get(plane.textureId);
     if (!textureResource) continue;
-    const vertexBuffer = getOrCreateControlBuffer(host, plane.id);
-    bindArrayBufferCached(host, vertexBuffer);
-    if (!plane.gpuBufferInitialized) {
+    const vertexResource = getOrCreateControlResource(host, plane.id);
+    bindVertexArrayCached(host, vertexResource.vao);
+    bindArrayBufferCached(host, vertexResource.buffer);
+    if (!vertexResource.initialized) {
       trackedBufferData(host, gl.ARRAY_BUFFER, plane.vertices.byteLength, gl.DYNAMIC_DRAW);
-      plane.gpuBufferInitialized = true;
+      vertexResource.initialized = true;
       plane.verticesDirty = true;
     }
     if (plane.alwaysFaceCamera || plane.verticesDirty) {
       gl.bufferSubData(gl.ARRAY_BUFFER, 0, plane.vertices);
       plane.verticesDirty = false;
     }
-    gl.enableVertexAttribArray(host.texturedPositionLocation);
-    gl.vertexAttribPointer(host.texturedPositionLocation, 3, gl.FLOAT, false, 20, 0);
-    gl.enableVertexAttribArray(host.texturedUvLocation);
-    gl.vertexAttribPointer(host.texturedUvLocation, 2, gl.FLOAT, false, 20, 12);
     bindTexture2DCached(host, 0, textureResource.texture);
     gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
   }
@@ -3287,4 +3359,14 @@ export function consumePointerDeltaY(hostId) {
   host.pointerDeltaY = 0;
   return y;
 }
-
+export function downloadTextFile(fileName, text) {
+  const safeName = (fileName || 'Avalonia3D-diagnostics.txt').replace(/[\\/:*?"<>|]+/g, '_');
+  const blob = new Blob([text || ''], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = safeName;
+  anchor.style.display = 'none';
+  document.body.appendChild(anchor);
+  try { anchor.click(); } finally { anchor.remove(); setTimeout(() => URL.revokeObjectURL(url), 0); }
+}

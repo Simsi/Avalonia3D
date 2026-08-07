@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
+using ThreeDEngine.Core.Validation;
 
 namespace ThreeDEngine.Core.Geometry;
 
@@ -8,8 +9,8 @@ public static class MeshFactory
 {
     public static Mesh3D CreateBillboardQuad(float width, float height)
     {
-        width = System.MathF.Max(width, 0.001f);
-        height = System.MathF.Max(height, 0.001f);
+        width = Guard3D.Positive(width, nameof(width));
+        height = Guard3D.Positive(height, nameof(height));
         var hw = width * 0.5f;
         var hh = height * 0.5f;
         var positions = new[]
@@ -35,9 +36,9 @@ public static class MeshFactory
 
     public static Mesh3D CreateExtrudedRectangle(float width, float height, float depth)
     {
-        width = System.MathF.Max(width, 0.001f);
-        height = System.MathF.Max(height, 0.001f);
-        depth = System.MathF.Max(depth, 0.001f);
+        width = Guard3D.Positive(width, nameof(width));
+        height = Guard3D.Positive(height, nameof(height));
+        depth = Guard3D.Positive(depth, nameof(depth));
 
         var hw = width * 0.5f;
         var hh = height * 0.5f;
@@ -79,10 +80,10 @@ public static class MeshFactory
 
     public static Mesh3D CreateExtrudedEllipse(float width, float height, float depth, int segments = 48)
     {
-        width = System.MathF.Max(width, 0.001f);
-        height = System.MathF.Max(height, 0.001f);
-        depth = System.MathF.Max(depth, 0.001f);
-        segments = System.Math.Max(segments, 12);
+        width = Guard3D.Positive(width, nameof(width));
+        height = Guard3D.Positive(height, nameof(height));
+        depth = Guard3D.Positive(depth, nameof(depth));
+        if (segments < 12) throw new ArgumentOutOfRangeException(nameof(segments), segments, "At least 12 segments are required.");
 
         var rx = width * 0.5f;
         var ry = height * 0.5f;
@@ -164,10 +165,10 @@ public static class MeshFactory
 
     public static Mesh3D CreatePlane(float width, float height, int segmentsX = 1, int segmentsY = 1)
     {
-        width = System.MathF.Max(width, 0.001f);
-        height = System.MathF.Max(height, 0.001f);
-        segmentsX = System.Math.Max(1, segmentsX);
-        segmentsY = System.Math.Max(1, segmentsY);
+        width = Guard3D.Positive(width, nameof(width));
+        height = Guard3D.Positive(height, nameof(height));
+        if (segmentsX < 1) throw new ArgumentOutOfRangeException(nameof(segmentsX), segmentsX, "At least one horizontal segment is required.");
+        if (segmentsY < 1) throw new ArgumentOutOfRangeException(nameof(segmentsY), segmentsY, "At least one vertical segment is required.");
 
         var positions = new List<Vector3>((segmentsX + 1) * (segmentsY + 1));
         var normals = new List<Vector3>((segmentsX + 1) * (segmentsY + 1));
@@ -211,9 +212,9 @@ public static class MeshFactory
 
     public static Mesh3D CreateCylinder(float radius, float height, int segments = 32)
     {
-        radius = System.MathF.Max(radius, 0.001f);
-        height = System.MathF.Max(height, 0.001f);
-        segments = System.Math.Max(segments, 12);
+        radius = Guard3D.Positive(radius, nameof(radius));
+        height = Guard3D.Positive(height, nameof(height));
+        if (segments < 12) throw new ArgumentOutOfRangeException(nameof(segments), segments, "At least 12 segments are required.");
 
         var halfHeight = height * 0.5f;
         var positions = new List<Vector3>();
@@ -286,9 +287,9 @@ public static class MeshFactory
 
     public static Mesh3D CreateCone(float radius, float height, int segments = 32)
     {
-        radius = System.MathF.Max(radius, 0.001f);
-        height = System.MathF.Max(height, 0.001f);
-        segments = System.Math.Max(segments, 12);
+        radius = Guard3D.Positive(radius, nameof(radius));
+        height = Guard3D.Positive(height, nameof(height));
+        if (segments < 12) throw new ArgumentOutOfRangeException(nameof(segments), segments, "At least 12 segments are required.");
 
         var halfHeight = height * 0.5f;
         var positions = new List<Vector3>();
@@ -337,9 +338,9 @@ public static class MeshFactory
 
     public static Mesh3D CreateSphere(float radius, int segments = 32, int rings = 16)
     {
-        radius = System.MathF.Max(radius, 0.001f);
-        segments = System.Math.Max(segments, 12);
-        rings = System.Math.Max(rings, 6);
+        radius = Guard3D.Positive(radius, nameof(radius));
+        if (segments < 3) throw new ArgumentOutOfRangeException(nameof(segments), segments, "At least three segments are required.");
+        if (rings < 2) throw new ArgumentOutOfRangeException(nameof(rings), rings, "At least two rings are required.");
 
         var positions = new List<Vector3>();
         var normals = new List<Vector3>();

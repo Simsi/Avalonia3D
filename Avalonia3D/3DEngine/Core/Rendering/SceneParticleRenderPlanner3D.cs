@@ -12,20 +12,22 @@ namespace ThreeDEngine.Core.Rendering;
 /// Shared particle extraction/culling/stats path for all GPU backends.
 /// Backend implementations only pack the resulting particles into their API-specific buffers.
 /// </summary>
-public static class SceneParticleRenderPlanner3D
+internal static class SceneParticleRenderPlanner3D
 {
     public static void BuildVisible(
         SceneRenderFrameContext3D frame,
         List<ParticleRenderItem3D> output,
+        SceneRenderPlanScratch3D scratch,
         RenderStats? stats = null,
         bool frustumCull = true)
     {
         if (frame is null) throw new ArgumentNullException(nameof(frame));
         if (output is null) throw new ArgumentNullException(nameof(output));
+        if (scratch is null) throw new ArgumentNullException(nameof(scratch));
 
         output.Clear();
-        var cameraPosition = frame.Scene.Camera.Position;
-        foreach (var obj in frame.Snapshot.Renderables)
+        var cameraPosition = frame.Published.CameraPosition;
+        foreach (var obj in frame.Snapshot.RenderablesInternal)
         {
             if (obj is not ParticleSystem3D particles)
             {
@@ -43,9 +45,11 @@ public static class SceneParticleRenderPlanner3D
                 continue;
             }
 
-            var parent = frame.Scene.FrameInterpolator.TryGetInterpolatedModel(particles.Id, out var interpolatedParent)
-                ? interpolatedParent
-                : particles.GetModelMatrix();
+            var parent = particles.Settings.SimulationSpace == ParticleSimulationSpace3D.World
+                ? Matrix4x4.Identity
+                : frame.Scene.FrameInterpolator.TryGetInterpolatedModel(particles.Id, out var interpolatedParent)
+                    ? interpolatedParent
+                    : particles.GetModelMatrix();
 
             var localBounds = particles.GetLocalParticleBounds();
             if (frustumCull && !FrustumCuller3D.IntersectsLocalBounds(localBounds, parent, frame.ViewProjection))
@@ -63,7 +67,7 @@ public static class SceneParticleRenderPlanner3D
             var billboard = particles.Settings.RenderMode == ParticleRenderMode3D.CameraFacingQuad;
             var transparent = ResolveTransparency(particles, material, billboard);
             var cameraDependentOrder = transparent || billboard;
-            var batchId = RenderId3D.BuildParticleRetainedBatchId(particles.Id, particles.Settings.RenderMode);
+            var batchId = scratch.GetParticleRetainedBatchId(particles.Id, (int)particles.Settings.RenderMode);
             var center = localBounds.IsValid
                 ? Vector3.Transform(localBounds.Center, parent)
                 : new Vector3(parent.M41, parent.M42, parent.M43);
@@ -75,7 +79,7 @@ public static class SceneParticleRenderPlanner3D
                 billboard,
                 transparent,
                 cameraDependentOrder,
-                ResolveSizeScale(parent),
+                particles.Settings.SimulationSpace == ParticleSimulationSpace3D.World ? 1f : ResolveSizeScale(parent),
                 batchId,
                 Vector3.DistanceSquared(cameraPosition, center),
                 output.Count);

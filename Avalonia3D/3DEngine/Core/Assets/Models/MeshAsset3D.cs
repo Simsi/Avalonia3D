@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using ThreeDEngine.Core.Validation;
 using ThreeDEngine.Core.Collision;
 
 namespace ThreeDEngine.Core.Assets.Models;
@@ -8,9 +10,9 @@ public sealed class MeshAsset3D
 {
     public MeshAsset3D(int index, string name, IReadOnlyList<MeshPrimitiveAsset3D> primitives)
     {
-        Index = index;
+        Index = Guard3D.NonNegative(index, nameof(index));
         Name = string.IsNullOrWhiteSpace(name) ? $"Mesh_{index}" : name;
-        Primitives = primitives ?? Array.Empty<MeshPrimitiveAsset3D>();
+        Primitives = Array.AsReadOnly((primitives ?? throw new ArgumentNullException(nameof(primitives))).ToArray());
         Bounds = ComputeBounds(Primitives);
     }
 

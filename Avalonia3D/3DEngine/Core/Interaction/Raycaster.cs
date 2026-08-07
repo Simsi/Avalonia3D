@@ -12,11 +12,6 @@ namespace ThreeDEngine.Core.Interaction;
 
 public static class Raycaster
 {
-    private const int MaxCachedBvhs = 256;
-    private static readonly object BvhCacheLock = new();
-    private static readonly Dictionary<MeshBvhCacheKey, BvhCacheEntry> BvhCache = new();
-    private static readonly LinkedList<MeshBvhCacheKey> BvhLru = new();
-
     [ThreadStatic]
     private static SpatialQueryScratch3D? _queryScratch;
 
@@ -48,10 +43,7 @@ public static class Raycaster
         PickingResult? closest = null;
 
         var scratch = _queryScratch ??= new SpatialQueryScratch3D();
-        var candidates = scene.Registry.PickableIndex.QueryRay(ray, scratch);
-        IReadOnlyList<Object3D> objects = candidates.Count == 0 && scene.Performance.AllowPickingFullScanFallback && scene.Registry.Pickables.Count <= scene.Performance.MaxPickingFullScanFallbackObjects
-            ? scene.Registry.SnapshotPickables()
-            : candidates;
+        IReadOnlyList<Object3D> objects = scene.Registry.PickableIndex.QueryRay(ray, scratch);
 
         for (var objectIndex = 0; objectIndex < objects.Count; objectIndex++)
         {
@@ -109,7 +101,7 @@ public static class Raycaster
             return null;
         }
 
-        var bvh = GetOrCreateBvh(mesh.ResourceKey, mesh.GeometryVersion, mesh.Positions, mesh.Indices);
+        var bvh = mesh.RenderGeometry.GetBvh();
         if (!bvh.Raycast(localRay, mesh.Positions, mesh.Indices, out var localDistance, out var localPoint, out _))
         {
             return null;
@@ -128,10 +120,10 @@ public static class Raycaster
             return null;
         }
 
-        var useSkinnedFallback = part.IsSkinned && part.CurrentSkinMatrices.Length > 0;
-        if (useSkinnedFallback)
+        var useSkinnedPickingMesh = part.IsSkinned && part.CurrentSkinMatricesInternal.Length > 0;
+        if (useSkinnedPickingMesh)
         {
-            // CPU-skinned fallback meshes and their BVHs are intentionally deferred until the
+            // CPU raycast meshes and their BVHs are intentionally deferred until the
             // cheap conservative world-bounds test passes. This keeps hover picking over large
             // animated models from deforming/rebuilding data for rays that cannot hit the part.
             var worldBounds = part.GetWorldBounds();
@@ -153,7 +145,7 @@ public static class Raycaster
             }
         }
 
-        var mesh = useSkinnedFallback ? part.GetCpuSkinnedFallbackMesh() : part.GetMesh();
+        var mesh = useSkinnedPickingMesh ? part.GetCpuSkinnedPickingMesh() : part.GetMesh();
         var positions = mesh.Positions;
         var indices = mesh.Indices;
         if (indices.Length < 3 || positions.Length == 0)
@@ -166,7 +158,7 @@ public static class Raycaster
             return null;
         }
 
-        var bvh = GetOrCreateBvh(mesh.ResourceKey, mesh.GeometryVersion, positions, indices);
+        var bvh = mesh.RenderGeometry.GetBvh();
         if (!bvh.Raycast(localRay, positions, indices, out _, out var localPoint, out var triangleIndex))
         {
             return null;
@@ -181,15 +173,12 @@ public static class Raycaster
         var p0 = positions[i0];
         var p1 = positions[i1];
         var p2 = positions[i2];
-        var worldNormal = Vector3.TransformNormal(Vector3.Cross(p1 - p0, p2 - p0), model);
-        if (worldNormal.LengthSquared() < 1e-12f && mesh.Normals.Length == positions.Length)
-        {
-            worldNormal = Vector3.TransformNormal(mesh.Normals[i0], model);
-        }
-        if (worldNormal.LengthSquared() > 1e-12f)
-        {
-            worldNormal = Vector3.Normalize(worldNormal);
-        }
+        var normalMatrix = GeometryTransform3D.CreateNormalMatrix(model);
+        var localNormal = Vector3.Cross(p1 - p0, p2 - p0);
+        if (localNormal.LengthSquared() < 1e-12f && mesh.Normals.Length == positions.Length) localNormal = mesh.Normals[i0];
+        var worldNormal = localNormal.LengthSquared() > 1e-12f
+            ? GeometryTransform3D.TransformNormal(localNormal, normalMatrix)
+            : Vector3.UnitY;
 
         var elementId = new ModelElementId3D(
             part.Model.Asset.AssetId,
@@ -197,7 +186,7 @@ public static class Raycaster
             part.Node.Index,
             part.MeshAsset.Index,
             part.PrimitiveIndex,
-            triangleIndex);
+            mesh.RenderGeometry.GetSourceTriangleIndex(triangleIndex));
         var modelHit = new ModelHitResult3D(part.Model, part, elementId, worldPoint, worldNormal, worldDistance);
         return new PickingResult(part, worldPoint, worldDistance, modelHit);
     }
@@ -216,35 +205,6 @@ public static class Raycaster
             part.MeshAsset.Index,
             part.PrimitiveIndex);
         return new ModelHitResult3D(part.Model, part, elementId, point, Vector3.UnitY, distance);
-    }
-
-    private static TriangleBvh GetOrCreateBvh(string resourceKey, int geometryVersion, Vector3[] positions, int[] indices)
-        => GetOrCreateBvh(new MeshBvhCacheKey(resourceKey, geometryVersion), positions, indices);
-
-    private static TriangleBvh GetOrCreateBvh(MeshBvhCacheKey key, Vector3[] positions, int[] indices)
-    {
-        lock (BvhCacheLock)
-        {
-            if (BvhCache.TryGetValue(key, out var entry))
-            {
-                BvhLru.Remove(entry.Node);
-                BvhLru.AddFirst(entry.Node);
-                return entry.Bvh;
-            }
-
-            var bvh = TriangleBvh.Build(positions, indices);
-            var node = new LinkedListNode<MeshBvhCacheKey>(key);
-            BvhLru.AddFirst(node);
-            BvhCache[key] = new BvhCacheEntry(bvh, node);
-            while (BvhCache.Count > MaxCachedBvhs && BvhLru.Last is not null)
-            {
-                var evict = BvhLru.Last;
-                BvhLru.RemoveLast();
-                BvhCache.Remove(evict.Value);
-            }
-
-            return bvh;
-        }
     }
 
     private static bool TryCreateLocalRay(Ray worldRay, Matrix4x4 model, out Ray localRay)
@@ -352,203 +312,4 @@ public static class Raycaster
         return true;
     }
 
-    private readonly struct MeshBvhCacheKey : IEquatable<MeshBvhCacheKey>
-    {
-        private readonly string _resourceKey;
-        private readonly int _version;
-
-        public MeshBvhCacheKey(string resourceKey, int version)
-        {
-            _resourceKey = resourceKey ?? string.Empty;
-            _version = version;
-        }
-
-        public bool Equals(MeshBvhCacheKey other) => _version == other._version && string.Equals(_resourceKey, other._resourceKey, StringComparison.Ordinal);
-        public override bool Equals(object? obj) => obj is MeshBvhCacheKey other && Equals(other);
-        public override int GetHashCode() => HashCode.Combine(_resourceKey, _version);
-    }
-
-    private sealed class BvhCacheEntry
-    {
-        public BvhCacheEntry(TriangleBvh bvh, LinkedListNode<MeshBvhCacheKey> node)
-        {
-            Bvh = bvh;
-            Node = node;
-        }
-
-        public TriangleBvh Bvh { get; }
-        public LinkedListNode<MeshBvhCacheKey> Node { get; }
-    }
-
-    private sealed class TriangleBvh
-    {
-        private const int LeafTriangleCount = 12;
-        private readonly Node[] _nodes;
-        private readonly int[] _triangleIndices;
-
-        private TriangleBvh(Node[] nodes, int[] triangleIndices)
-        {
-            _nodes = nodes;
-            _triangleIndices = triangleIndices;
-        }
-
-        public static TriangleBvh Build(Vector3[] positions, int[] indices)
-        {
-            var triangleCount = indices.Length / 3;
-            if (triangleCount <= 0) return new TriangleBvh(Array.Empty<Node>(), Array.Empty<int>());
-            var triangles = new int[triangleCount];
-            for (var i = 0; i < triangles.Length; i++) triangles[i] = i;
-            var nodes = new List<Node>(triangleCount / LeafTriangleCount + 1);
-            BuildNode(positions, indices, triangles, 0, triangles.Length, nodes);
-            return new TriangleBvh(nodes.ToArray(), triangles);
-        }
-
-        public bool Raycast(Ray ray, Vector3[] positions, int[] indices, out float distance, out Vector3 point, out int triangleIndex)
-        {
-            distance = float.PositiveInfinity;
-            point = default;
-            triangleIndex = -1;
-            if (_nodes.Length == 0) return false;
-            var hit = false;
-            Span<int> stack = stackalloc int[64];
-            var stackCount = 0;
-            stack[stackCount++] = 0;
-            while (stackCount > 0)
-            {
-                var nodeIndex = stack[--stackCount];
-                var node = _nodes[nodeIndex];
-                if (!IntersectsBounds(ray, node.Bounds, out var near, out _) || near > distance) continue;
-                if (node.IsLeaf)
-                {
-                    for (var i = 0; i < node.Count; i++)
-                    {
-                        var tri = _triangleIndices[node.Start + i];
-                        var baseIndex = tri * 3;
-                        var i0 = indices[baseIndex];
-                        var i1 = indices[baseIndex + 1];
-                        var i2 = indices[baseIndex + 2];
-                        if (!IsValidTriangleIndex(positions.Length, i0, i1, i2)) continue;
-                        if (!IntersectTriangle(ray, positions[i0], positions[i1], positions[i2], out var triDistance, out var triPoint)) continue;
-                        if (triDistance >= distance) continue;
-                        distance = triDistance;
-                        point = triPoint;
-                        triangleIndex = tri;
-                        hit = true;
-                    }
-                }
-                else
-                {
-                    if (stackCount + 2 >= stack.Length)
-                    {
-                        continue;
-                    }
-                    stack[stackCount++] = node.Left;
-                    stack[stackCount++] = node.Right;
-                }
-            }
-
-            return hit;
-        }
-
-        private static int BuildNode(Vector3[] positions, int[] indices, int[] triangles, int start, int count, List<Node> nodes)
-        {
-            var nodeIndex = nodes.Count;
-            nodes.Add(default);
-            var bounds = ComputeBounds(positions, indices, triangles, start, count);
-            if (count <= LeafTriangleCount)
-            {
-                nodes[nodeIndex] = new Node(bounds, start, count, -1, -1);
-                return nodeIndex;
-            }
-
-            var centroidBounds = ComputeCentroidBounds(positions, indices, triangles, start, count);
-            var axis = LongestAxis(centroidBounds.Size);
-            Array.Sort(triangles, start, count, new TriangleCentroidComparer(positions, indices, axis));
-            var leftCount = count / 2;
-            var left = BuildNode(positions, indices, triangles, start, leftCount, nodes);
-            var right = BuildNode(positions, indices, triangles, start + leftCount, count - leftCount, nodes);
-            nodes[nodeIndex] = new Node(bounds, start, count, left, right);
-            return nodeIndex;
-        }
-
-        private static Bounds3D ComputeBounds(Vector3[] positions, int[] indices, int[] triangles, int start, int count)
-        {
-            var bounds = Bounds3D.Empty;
-            for (var i = 0; i < count; i++)
-            {
-                var tri = triangles[start + i] * 3;
-                var i0 = indices[tri];
-                var i1 = indices[tri + 1];
-                var i2 = indices[tri + 2];
-                if (!IsValidTriangleIndex(positions.Length, i0, i1, i2)) continue;
-                bounds = bounds.Encapsulate(positions[i0]).Encapsulate(positions[i1]).Encapsulate(positions[i2]);
-            }
-            return bounds;
-        }
-
-        private static Bounds3D ComputeCentroidBounds(Vector3[] positions, int[] indices, int[] triangles, int start, int count)
-        {
-            var bounds = Bounds3D.Empty;
-            for (var i = 0; i < count; i++)
-            {
-                bounds = bounds.Encapsulate(Centroid(positions, indices, triangles[start + i]));
-            }
-            return bounds;
-        }
-
-        private static Vector3 Centroid(Vector3[] positions, int[] indices, int triangle)
-        {
-            var baseIndex = triangle * 3;
-            var i0 = indices[baseIndex];
-            var i1 = indices[baseIndex + 1];
-            var i2 = indices[baseIndex + 2];
-            if (!IsValidTriangleIndex(positions.Length, i0, i1, i2)) return Vector3.Zero;
-            return (positions[i0] + positions[i1] + positions[i2]) / 3f;
-        }
-
-        private static int LongestAxis(Vector3 size)
-            => size.X >= size.Y && size.X >= size.Z ? 0 : size.Y >= size.Z ? 1 : 2;
-
-        private readonly struct Node
-        {
-            public Node(Bounds3D bounds, int start, int count, int left, int right)
-            {
-                Bounds = bounds;
-                Start = start;
-                Count = count;
-                Left = left;
-                Right = right;
-            }
-
-            public Bounds3D Bounds { get; }
-            public int Start { get; }
-            public int Count { get; }
-            public int Left { get; }
-            public int Right { get; }
-            public bool IsLeaf => Left < 0 || Right < 0;
-        }
-
-        private sealed class TriangleCentroidComparer : IComparer<int>
-        {
-            private readonly Vector3[] _positions;
-            private readonly int[] _indices;
-            private readonly int _axis;
-
-            public TriangleCentroidComparer(Vector3[] positions, int[] indices, int axis)
-            {
-                _positions = positions;
-                _indices = indices;
-                _axis = axis;
-            }
-
-            public int Compare(int x, int y)
-            {
-                var cx = Centroid(_positions, _indices, x);
-                var cy = Centroid(_positions, _indices, y);
-                var vx = _axis == 0 ? cx.X : _axis == 1 ? cx.Y : cx.Z;
-                var vy = _axis == 0 ? cy.X : _axis == 1 ? cy.Y : cy.Z;
-                return vx.CompareTo(vy);
-            }
-        }
-    }
 }

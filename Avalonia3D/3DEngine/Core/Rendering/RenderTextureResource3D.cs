@@ -1,20 +1,25 @@
+using System;
+using ThreeDEngine.Core.Resources;
+
 namespace ThreeDEngine.Core.Rendering;
 
 /// <summary>
-/// Backend-neutral texture upload descriptor. The Core render-resource plan owns which
-/// textures are live for the current render plan; backends only decode/upload bytes.
+/// Backend-neutral immutable texture upload descriptor. The physical key is content-derived;
+/// the logical key is retained only for diagnostics and collision reporting.
 /// </summary>
-public readonly struct RenderTextureResource3D
+internal readonly struct RenderTextureResource3D
 {
-    public RenderTextureResource3D(string key, byte[] data, int version)
-    {
-        Key = key ?? string.Empty;
-        Data = data ?? System.Array.Empty<byte>();
-        Version = version;
-    }
+    public RenderTextureResource3D(TextureResource3D resource)
+        => Resource = resource ?? throw new ArgumentNullException(nameof(resource));
 
-    public string Key { get; }
-    public byte[] Data { get; }
-    public int Version { get; }
-    public bool IsValid => !string.IsNullOrWhiteSpace(Key) && Data.Length > 0;
+    public TextureResource3D Resource { get; }
+    public string Key => Resource.ResourceKey;
+    public string LogicalKey => Resource.LogicalKey;
+    public string? MimeType => Resource.MimeType;
+    public ResourceContentHash3D ContentHash => Resource.ContentHash;
+    public long Version => Resource.ContentVersion;
+    public int ByteLength => Resource.ByteLength;
+    public byte[] Data => Resource.CopyEncodedData();
+    internal byte[] DataInternal => Resource.EncodedDataInternal;
+    public bool IsValid => Resource is not null && Resource.ContentHash.IsValid;
 }

@@ -1,0 +1,88 @@
+{
+  "schemaVersion": 1,
+  "selectedBaseline": {
+    "file": "Avalonia3D_3DEngine_0.1.0-alpha.7.9_skybox-frametime-parameterized-stress(1).zip",
+    "sha256": "83dfdb187c06ffe753d1ab6c4f81faffcb54ba3b4b7586b2192300d1d83cdb80",
+    "role": "authoritative alpha.7.9 source for the sequential improvement line"
+  },
+  "comparisonBaseline": {
+    "file": "Avalonia3D(3)(1).zip",
+    "sha256": "2c56bc248cc55fc2e408737349a375eabd8758f3796d7c2c130d009c0dd3eef9",
+    "role": "stable regression reference only"
+  },
+  "policy": "The current tree is derived only from the selected alpha line and reviewed sequential stage archives. No source file is copied from the stable archive unless a later stage explicitly requires and reviews that change.",
+  "derivedStages": [
+    {
+      "version": "0.1.0-alpha.8.0",
+      "file": "Avalonia3D_3DEngine_0.1.0-alpha.8.0_stage1.zip",
+      "sha256": "bd9c0e339336c9346eba7c949b48956ebce4e4c15fbe12ec4192174d63738931",
+      "role": "stage 1 input lineage"
+    },
+    {
+      "version": "0.1.0-alpha.8.1",
+      "file": "Avalonia3D_3DEngine_0.1.0-alpha.8.1_stage2.zip",
+      "sha256": "4c07b2836411c492fc40ab3b5ead15fb472d1d1005b65240c43a618f5d13f601",
+      "role": "stage 2 input lineage"
+    },
+    {
+      "version": "0.1.0-alpha.8.2",
+      "file": "Avalonia3D_3DEngine_0.1.0-alpha.8.2_stage3.zip",
+      "sha256": "94098fff7d3ccd9c811be5426d7b204994175705bfc9348f7007b97f088922a0",
+      "role": "stage 3 input lineage"
+    },
+    {
+      "version": "0.1.0-alpha.8.3",
+      "file": "Avalonia3D_3DEngine_0.1.0-alpha.8.3_stage4.zip",
+      "sha256": "a12331abb02dc98cae795fea099a8351f33e38be047fb2d2bb98fa11c732c565",
+      "role": "stage 4 input for stage 5"
+    },
+    {
+      "version": "0.1.0-alpha.8.4",
+      "file": "Avalonia3D_3DEngine_0.1.0-alpha.8.4_stage5.zip",
+      "sha256": "3721b5595a4cb376551ae106770247f6e9d642675c8450ebdf485ae8ae8aafd4",
+      "role": "direct input for stage 5 compile hotfix"
+    },
+    {
+      "version": "0.1.0-alpha.8.4.1",
+      "file": "Avalonia3D_3DEngine_0.1.0-alpha.8.4.1_stage5-hotfix.zip",
+      "sha256": "ef26f1fb73718219315cba35b0153bdf99649ff7b7141e1051c38f28e0afa62c",
+      "role": "direct input for the source-drop bootstrap hotfix"
+    },
+    {
+      "version": "0.1.0-alpha.8.4.2",
+      "file": "Avalonia3D_3DEngine_0.1.0-alpha.8.4.2_stage5-bootstrap-hotfix.zip",
+      "sha256": "bc07bccef9a2a798b750e8d38dbe276a105338be4ec8a4f390f839663e51cbb5",
+      "role": "direct input for stage 6 allocation-free scene/render planning"
+    },
+    {
+      "version": "0.1.0-alpha.8.5",
+      "file": "Avalonia3D_3DEngine_0.1.0-alpha.8.5_stage6.zip",
+      "sha256": "595ccb96d2ff0226dbeb6a6c5385a57a16252cdfa51a1c2212e71a7d816e866b",
+      "role": "direct input for stage 7 geometry and mesh processing"
+    },
+    {
+      "version": "0.1.0-alpha.8.6",
+      "file": "Avalonia3D_3DEngine_0.1.0-alpha.8.6_stage7.zip",
+      "sha256": "6cc18b131df8389dff06924e74e711350745b98cecc25e9caa9c3dd705d31064",
+      "role": "direct input for stage 7 regression hotfix"
+    },
+    {
+      "version": "0.1.0-alpha.8.6.1",
+      "file": "Avalonia3D_3DEngine_0.1.0-alpha.8.6.1_stage7-hotfix(1).zip",
+      "sha256": "ec2be5f2829ba3f59860399a12538afe93880f160cc8a4a3f86884f6162e966a",
+      "role": "audited alpha input for the new five-stage improvement plan"
+    },
+    {
+      "version": "0.1.0-alpha.8.7.0",
+      "file": "Avalonia3D_3DEngine_0.1.0-alpha.8.7.0_stage1-runtime-diagnostics.zip",
+      "sha256": "837f58790842c32166b390fb3f85dcb8220ac7d154a958cf5c38f5039aa9f5a4",
+      "role": "new-plan stage 1 runtime and diagnostics implementation"
+    },
+    {
+      "version": "0.1.0-alpha.8.7.1",
+      "file": "Avalonia3D_3DEngine_0.1.0-alpha.8.7.1_stage1-debug-pass2.zip",
+      "sha256": "d3f008bd0d7ae46d26943251cdd779c4e8456130aa4cf30a2d01c4a99d8a242e",
+      "role": "direct input for new-plan stage 2 world ownership"
+    }
+  ]
+}

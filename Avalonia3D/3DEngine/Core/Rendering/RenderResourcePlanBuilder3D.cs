@@ -10,24 +10,8 @@ namespace ThreeDEngine.Core.Rendering;
 /// Backends should upload/sweep render meshes and material/environment textures from this
 /// output instead of scanning raw scene snapshots.
 /// </summary>
-public static class RenderResourcePlanBuilder3D
+internal static class RenderResourcePlanBuilder3D
 {
-    public static RenderResourcePlan3D Build(
-        SceneRenderFrameContext3D frame,
-        System.Collections.Generic.IReadOnlyList<OrdinaryRenderBatch3D> ordinaryBatches,
-        System.Collections.Generic.IReadOnlyList<TransparentOrdinaryRenderItem3D> transparentOrdinaryItems,
-        System.Collections.Generic.IReadOnlyList<TransparentOrdinaryBatch3D> transparentOrdinaryBatches,
-        System.Collections.Generic.IReadOnlyList<ParticleRenderItem3D> particleItems,
-        System.Collections.Generic.IReadOnlyList<HighScaleInstanceLayer3D> highScaleLayers,
-        bool includesOrdinary,
-        bool includesParticles,
-        bool includesHighScale)
-    {
-        var plan = new RenderResourcePlan3D(includesOrdinary, includesParticles, includesHighScale);
-        BuildInto(frame, ordinaryBatches, transparentOrdinaryItems, transparentOrdinaryBatches, particleItems, highScaleLayers, includesOrdinary, includesParticles, includesHighScale, plan);
-        return plan;
-    }
-
     public static void BuildInto(
         SceneRenderFrameContext3D frame,
         System.Collections.Generic.IReadOnlyList<OrdinaryRenderBatch3D> ordinaryBatches,
@@ -87,27 +71,28 @@ public static class RenderResourcePlanBuilder3D
         }
 
         AddEnvironmentTextures(plan, frame.Scene.Environment.Skybox);
+        frame.Scene.SynchronizeResourceOwnership(frame.Snapshot);
     }
 
     private static void AddMaterialTextures(RenderResourcePlan3D plan, MaterialBinding3D material)
     {
-        plan.AddTexture(material.BaseColorTextureKey, material.BaseColorTextureData, material.BaseColorTextureVersion);
-        plan.AddTexture(material.NormalMapTextureKey, material.NormalMapTextureData, material.NormalMapTextureVersion);
-        plan.AddTexture(material.MetallicRoughnessTextureKey, material.MetallicRoughnessTextureData, material.MetallicRoughnessTextureVersion);
-        plan.AddTexture(material.EmissiveTextureKey, material.EmissiveTextureData, material.EmissiveTextureVersion);
+        plan.AddTexture(material.BaseColorTextureResource);
+        plan.AddTexture(material.NormalMapTextureResource);
+        plan.AddTexture(material.MetallicRoughnessTextureResource);
+        plan.AddTexture(material.EmissiveTextureResource);
     }
 
     private static void AddEnvironmentTextures(RenderResourcePlan3D plan, Skybox3D skybox)
     {
         if (skybox.HasEquirectangularTexture)
         {
-            plan.AddTexture(skybox.EquirectangularTextureKey, skybox.EquirectangularTextureData, skybox.EnvironmentTextureVersion);
+            plan.AddTexture(skybox.EquirectangularTextureInternal);
         }
 
         if (!skybox.HasCubemapTextures) return;
-        for (var i = 0; i < 6 && i < skybox.CubemapTextureKeys.Count && i < skybox.CubemapTextureData.Count; i++)
+        for (var i = 0; i < 6 && i < skybox.CubemapTexturesInternal.Count; i++)
         {
-            plan.AddTexture(skybox.CubemapTextureKeys[i], skybox.CubemapTextureData[i], skybox.EnvironmentTextureVersion);
+            plan.AddTexture(skybox.CubemapTexturesInternal[i]);
         }
     }
 

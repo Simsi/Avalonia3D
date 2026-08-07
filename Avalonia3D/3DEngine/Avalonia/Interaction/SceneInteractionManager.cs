@@ -52,8 +52,9 @@ public sealed class SceneInteractionManager
             return;
         }
 
-        HoveredObject.IsHovered = false;
+        var oldHovered = HoveredObject;
         HoveredObject = null;
+        Scene.World.Mutate(_ => oldHovered.IsHovered = false);
         _hoveredModelHit = null;
         _requestRender();
     }
@@ -160,12 +161,17 @@ public sealed class SceneInteractionManager
 
         if (_rightPressed)
         {
-            Scene.Camera.Orbit(delta.X * 0.35f, delta.Y * 0.35f);
+            var yaw = delta.X * 0.35f;
+            var pitch = delta.Y * 0.35f;
+            Scene.World.Mutate(scene => scene.Camera.Orbit(yaw, pitch));
             _requestRender();
         }
         else if (_middlePressed)
         {
-            Scene.Camera.Pan(delta.X, delta.Y, (float)System.Math.Max(owner.Bounds.Height, 1.0));
+            var panX = delta.X;
+            var panY = delta.Y;
+            var viewportHeight = (float)System.Math.Max(owner.Bounds.Height, 1.0);
+            Scene.World.Mutate(scene => scene.Camera.Pan(panX, panY, viewportHeight));
             _requestRender();
         }
         else if (_leftPressed && SelectedObject is { IsManipulationEnabled: true } && _pressedPick?.Object == SelectedObject)
@@ -206,7 +212,8 @@ public sealed class SceneInteractionManager
 
     public void HandlePointerWheel(Control owner, PointerWheelEventArgs e)
     {
-        Scene.Camera.Dolly((float)e.Delta.Y * 0.5f);
+        var distance = (float)e.Delta.Y * 0.5f;
+        Scene.World.Mutate(scene => scene.Camera.Dolly(distance));
         _requestRender();
     }
 
@@ -217,16 +224,19 @@ public sealed class SceneInteractionManager
             return;
         }
 
+        var selected = SelectedObject!;
         var viewportHeight = (float)System.Math.Max(owner.Bounds.Height, 1.0);
-        var distance = System.Math.Max((Scene.Camera.Position - SelectedObject.Position).Length(), 0.1f);
-        var worldUnitsPerPixel =
-            (2f * MathF.Tan(Scene.Camera.FieldOfViewDegrees * (MathF.PI / 180f) / 2f) * distance) / viewportHeight;
-
-        var translation =
-            (Scene.Camera.Right * delta.X * worldUnitsPerPixel) +
-            (-Scene.Camera.SafeUp * delta.Y * worldUnitsPerPixel);
-
-        SelectedObject.Position += translation;
+        var dragDelta = delta;
+        Scene.World.Mutate(scene =>
+        {
+            var distance = System.Math.Max((scene.Camera.Position - selected.Position).Length(), 0.1f);
+            var worldUnitsPerPixel =
+                (2f * MathF.Tan(scene.Camera.FieldOfViewDegrees * (MathF.PI / 180f) / 2f) * distance) / viewportHeight;
+            var translation =
+                (scene.Camera.Right * dragDelta.X * worldUnitsPerPixel) +
+                (-scene.Camera.SafeUp * dragDelta.Y * worldUnitsPerPixel);
+            selected.Position += translation;
+        });
     }
 
     private PickingResult? UpdateHover(Control owner, Vector2 position, SceneMouseButton button)
@@ -244,7 +254,7 @@ public sealed class SceneInteractionManager
 
         if (oldHovered is not null && hoverTargetChanged)
         {
-            oldHovered.IsHovered = false;
+            Scene.World.Mutate(_ => oldHovered.IsHovered = false);
             oldHovered.RaisePointerExited(new ScenePointerEventArgs(oldHovered, position, oldHovered.Position, button, _hoveredModelHit));
         }
 
@@ -253,7 +263,8 @@ public sealed class SceneInteractionManager
 
         if (HoveredObject is not null && pick is not null && hoverTargetChanged)
         {
-            HoveredObject.IsHovered = true;
+            var newHovered = HoveredObject!;
+            Scene.World.Mutate(_ => newHovered.IsHovered = true);
             HoveredObject.RaisePointerEntered(CreatePointerArgs(pick, position, button));
         }
 
@@ -269,17 +280,12 @@ public sealed class SceneInteractionManager
         }
 
         var oldSelection = SelectedObject;
-        if (oldSelection is not null)
-        {
-            oldSelection.IsSelected = false;
-        }
-
         SelectedObject = newSelection;
-
-        if (SelectedObject is not null)
+        Scene.World.Mutate(_ =>
         {
-            SelectedObject.IsSelected = true;
-        }
+            if (oldSelection is not null) oldSelection.IsSelected = false;
+            if (newSelection is not null) newSelection.IsSelected = true;
+        });
 
         SelectionChanged?.Invoke(this, new SceneSelectionChangedEventArgs(oldSelection, SelectedObject));
         _requestRender();
@@ -287,6 +293,7 @@ public sealed class SceneInteractionManager
 
     private PickingResult? Pick(Control owner, Vector2 position)
     {
+        using var sceneAccess = Scene.EnterRenderReadScope();
         var viewport = _getViewportSize?.Invoke() ??
                        new Vector2((float)System.Math.Max(owner.Bounds.Width, 1.0), (float)System.Math.Max(owner.Bounds.Height, 1.0));
         var pick = Raycaster.Pick(Scene, position, viewport);

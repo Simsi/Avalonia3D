@@ -1,6 +1,8 @@
+using System;
 using System.Numerics;
 using ThreeDEngine.Core.Collision;
 using ThreeDEngine.Core.Geometry;
+using ThreeDEngine.Core.Validation;
 
 namespace ThreeDEngine.Core.Scene;
 
@@ -21,7 +23,7 @@ public sealed class Cylinder3D : Object3D
         get => _radius;
         set
         {
-            var clamped = System.MathF.Max(value, 0.001f);
+            var clamped = Guard3D.Positive(value, nameof(Radius));
             if (System.MathF.Abs(_radius - clamped) < 0.0001f) return;
             _radius = clamped;
             UpdateCollider();
@@ -34,7 +36,7 @@ public sealed class Cylinder3D : Object3D
         get => _height;
         set
         {
-            var clamped = System.MathF.Max(value, 0.001f);
+            var clamped = Guard3D.Positive(value, nameof(Height));
             if (System.MathF.Abs(_height - clamped) < 0.0001f) return;
             _height = clamped;
             UpdateCollider();
@@ -47,14 +49,14 @@ public sealed class Cylinder3D : Object3D
         get => _segments;
         set
         {
-            var clamped = System.Math.Max(12, value);
+            var clamped = value >= 12 ? value : throw new ArgumentOutOfRangeException(nameof(Segments), value, "Cylinder segments must be at least 12.");
             if (_segments == clamped) return;
             _segments = clamped;
             MarkGeometryDirty();
         }
     }
 
-    protected override Mesh3D BuildMesh() => MeshCache3D.Shared.GetOrCreate(
+    protected override Mesh3D BuildMesh() => GetOrCreateCachedMesh(
         MeshResourceKey.Cylinder(Radius, Height, Segments),
         () => MeshFactory.CreateCylinder(Radius, Height, Segments));
 

@@ -2,6 +2,7 @@ using System;
 using System.Numerics;
 using ThreeDEngine.Core.Collision;
 using ThreeDEngine.Core.Geometry;
+using ThreeDEngine.Core.Validation;
 
 namespace ThreeDEngine.Core.Scene;
 
@@ -21,7 +22,7 @@ public class Rectangle3D : Object3D
         get => _width;
         set
         {
-            value = System.MathF.Max(value, 0.01f);
+            value = Guard3D.Positive(value, nameof(Width));
             if (System.MathF.Abs(_width - value) < float.Epsilon) return;
             _width = value;
             UpdateColliderSize();
@@ -34,7 +35,7 @@ public class Rectangle3D : Object3D
         get => _height;
         set
         {
-            value = System.MathF.Max(value, 0.01f);
+            value = Guard3D.Positive(value, nameof(Height));
             if (System.MathF.Abs(_height - value) < float.Epsilon) return;
             _height = value;
             UpdateColliderSize();
@@ -47,7 +48,7 @@ public class Rectangle3D : Object3D
         get => _depth;
         set
         {
-            value = System.MathF.Max(value, 0.001f);
+            value = Guard3D.Positive(value, nameof(Depth));
             if (System.MathF.Abs(_depth - value) < float.Epsilon) return;
             _depth = value;
             UpdateColliderSize();
@@ -55,7 +56,7 @@ public class Rectangle3D : Object3D
         }
     }
 
-    protected override Mesh3D BuildMesh() => MeshCache3D.Shared.GetOrCreate(
+    protected override Mesh3D BuildMesh() => GetOrCreateCachedMesh(
         MeshResourceKey.Box(Width, Height, Depth),
         () => MeshFactory.CreateExtrudedRectangle(Width, Height, Depth));
 

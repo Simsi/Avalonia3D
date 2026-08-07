@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using ThreeDEngine.Core.Geometry;
 
 namespace ThreeDEngine.Core.Rendering;
@@ -8,15 +9,21 @@ namespace ThreeDEngine.Core.Rendering;
 /// too many draw calls. Items are grouped by depth bin and material/mesh while Core still
 /// owns the command order. Small transparent scenes keep exact object-level sorting.
 /// </summary>
-public sealed class TransparentOrdinaryBatch3D
+internal sealed class TransparentOrdinaryBatch3D
 {
     private readonly List<OrdinaryRenderItem3D> _items = new(16);
+    private readonly ReadOnlyCollection<OrdinaryRenderItem3D> _itemsView;
+
+    public TransparentOrdinaryBatch3D()
+    {
+        _itemsView = _items.AsReadOnly();
+    }
 
     public string BatchId { get; private set; } = string.Empty;
     public string LogicalMeshBatchKey { get; private set; } = string.Empty;
     public Mesh3D Mesh { get; private set; } = Mesh3D.Empty;
     public MaterialBinding3D Material { get; private set; }
-    public IReadOnlyList<OrdinaryRenderItem3D> Items => _items;
+    public IReadOnlyList<OrdinaryRenderItem3D> Items => _itemsView;
     public float SortDistanceSquared { get; private set; }
     public int SourceOrder { get; private set; }
     public int DepthBin { get; private set; }

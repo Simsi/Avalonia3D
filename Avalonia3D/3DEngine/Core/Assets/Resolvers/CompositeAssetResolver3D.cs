@@ -1,4 +1,6 @@
+using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.IO;
 
 namespace ThreeDEngine.Core.Assets.Resolvers;
@@ -6,21 +8,23 @@ namespace ThreeDEngine.Core.Assets.Resolvers;
 public sealed class CompositeAssetResolver3D : IAssetResolver3D
 {
     private readonly List<IAssetResolver3D> _resolvers = new();
+    private readonly ReadOnlyCollection<IAssetResolver3D> _resolversView;
 
     public CompositeAssetResolver3D(params IAssetResolver3D[] resolvers)
     {
-        if (resolvers is null) return;
+        _resolversView = _resolvers.AsReadOnly();
+        if (resolvers is null) throw new ArgumentNullException(nameof(resolvers));
         foreach (var resolver in resolvers)
         {
-            if (resolver is not null) _resolvers.Add(resolver);
+            _resolvers.Add(resolver ?? throw new ArgumentNullException(nameof(resolver)));
         }
     }
 
-    public IReadOnlyList<IAssetResolver3D> Resolvers => _resolvers;
+    public IReadOnlyList<IAssetResolver3D> Resolvers => _resolversView;
 
     public void Add(IAssetResolver3D resolver)
     {
-        if (resolver is not null) _resolvers.Add(resolver);
+        _resolvers.Add(resolver ?? throw new ArgumentNullException(nameof(resolver)));
     }
 
     public Stream? Open(string baseUri, string relativeUri)

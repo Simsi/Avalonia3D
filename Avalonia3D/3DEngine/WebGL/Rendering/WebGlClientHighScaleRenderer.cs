@@ -11,7 +11,6 @@ using ThreeDEngine.Core.Lighting;
 using ThreeDEngine.Core.Materials;
 using ThreeDEngine.Core.Primitives;
 using ThreeDEngine.Core.Rendering;
-using ThreeDEngine.Core.Rendering.Shadows;
 using ThreeDEngine.Core.Scene;
 
 namespace ThreeDEngine.Avalonia.WebGL.Rendering;
@@ -42,7 +41,6 @@ internal sealed class WebGlClientHighScaleRenderer
     private readonly List<BatchRuntime> _touchedStateBatches = new(256);
     private int[] _dirtyTransformScratch = Array.Empty<int>();
     private int _patchMarker;
-    private readonly Stopwatch _animationClock = Stopwatch.StartNew();
     private readonly byte[] _viewProjectionBytes = new byte[16 * sizeof(float)];
     private readonly byte[] _cameraBytes = new byte[12 * sizeof(float)];
     private readonly byte[] _lightingBytes = new byte[33 * sizeof(float)];
@@ -69,17 +67,13 @@ internal sealed class WebGlClientHighScaleRenderer
         _version++;
     }
 
-    public void SyncFrame(int hostId, Scene3D scene, IReadOnlyList<HighScaleInstanceLayer3D> visibleLayers, float width, float height, Matrix4x4 viewProjection, DirectionalShadowSnapshot3D shadow, RenderStats stats)
+    public void SyncFrame(int hostId, Scene3D scene, IReadOnlyList<HighScaleInstanceLayer3D> visibleLayers, float width, float height, Matrix4x4 viewProjection, RenderStats stats)
     {
         stats.WebGlClientHighScaleRuntime = true;
         stats.WebGlClientGpuTransformAnimation = scene.Performance.EnableWebGlClientGpuTransformAnimation;
         stats.SkyboxEnabled = scene.Environment.Skybox.Mode != SkyboxMode3D.None;
         stats.SkyboxMode = (int)scene.Environment.Skybox.Mode;
         if (visibleLayers is null) throw new ArgumentNullException(nameof(visibleLayers));
-        if (shadow is null) throw new ArgumentNullException(nameof(shadow));
-        stats.DirectionalShadowEnabled = shadow.IsEnabled;
-        stats.ShadowMapResolution = shadow.Resolution;
-        stats.ShadowMapReason = shadow.Reason;
         EnsureSnapshots(hostId, scene, visibleLayers, stats);
         ApplyPatches(hostId, scene, visibleLayers, stats);
 
@@ -119,17 +113,16 @@ internal sealed class WebGlClientHighScaleRenderer
         style[17] = scene.RenderPipeline.Ssao.Radius;
         style[18] = scene.RenderPipeline.Ssao.Bias;
         style[19] = scene.RenderPipeline.Ssao.SampleCount;
-        style[20] = scene.Performance.EnableWebGlClientGpuTransformAnimation ? (float)_animationClock.Elapsed.TotalSeconds : 0f;
+        style[20] = scene.Performance.EnableWebGlClientGpuTransformAnimation ? (float)scene.UpdateLoop.RenderTimeSeconds : 0f;
         style[21] = scene.Performance.WebGlClientGpuTransformAnimationAmplitude;
-        style[22] = shadow.Strength;
-        style[23] = shadow.Bias;
+        var verticalProjectionScale = MathF.Tan(scene.Camera.FieldOfViewDegrees * (MathF.PI / 360f));
+        style[22] = verticalProjectionScale * MathF.Max(width, 1f) / MathF.Max(height, 1f);
+        style[23] = verticalProjectionScale;
 
         var flags = 0;
         if (skybox.Mode != SkyboxMode3D.None) flags |= 1;
         if (scene.Performance.EnableWebGlClientGpuTransformAnimation) flags |= 2;
-        if (shadow.IsEnabled) flags |= 4;
-        if (scene.RenderPipeline.Ssao.Enabled) flags |= 8;
-        if (scene.RenderPipeline.EnableHdr || scene.RenderPipeline.ToneMapping.Enabled) flags |= 16;
+        if (scene.RenderPipeline.ToneMapping.Enabled) flags |= 16;
 
         WebGlInterop.SyncHighScaleFrameDirect(
             hostId,
@@ -137,8 +130,6 @@ internal sealed class WebGlClientHighScaleRenderer
             height,
             flags,
             (int)skybox.Mode,
-            shadow.Resolution,
-            shadow.Reason ?? string.Empty,
             CopyFloatsToFrameBuffer(view, _viewProjectionBytes),
             CopyFloatsToFrameBuffer(camera, _cameraBytes),
             CopyFloatsToFrameBuffer(lighting, _lightingBytes),
@@ -161,13 +152,9 @@ internal sealed class WebGlClientHighScaleRenderer
             // shader-side and must not mutate the retained transform buffers.
             if (scene.Performance.EnableWebGlClientGpuTransformAnimation &&
                 hasRuntime &&
+                !layer.Chunks.RebuildRequested &&
                 runtime!.CanReuseForGpuAnimation(layer, scene))
             {
-                if (layer.Chunks.RebuildRequested)
-                {
-                    layer.Chunks.ClearRebuildRequested();
-                }
-
                 ClearDirtyTransformsForGpuAnimation(layer, runtime);
                 continue;
             }

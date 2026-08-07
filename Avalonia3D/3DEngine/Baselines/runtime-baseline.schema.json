@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://avalonia3d.local/schemas/runtime-baseline.schema.json",
+  "title": "Avalonia3D runtime baseline",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "engineVersion",
+    "capturedUtc",
+    "platform",
+    "backend",
+    "device",
+    "workload",
+    "metrics",
+    "artifacts"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "engineVersion": { "type": "string", "minLength": 1 },
+    "capturedUtc": { "type": "string", "format": "date-time" },
+    "platform": { "enum": ["windows", "linux", "macos", "browser"] },
+    "backend": { "enum": ["opengl", "webgl2"] },
+    "device": {
+      "type": "object",
+      "required": ["os", "architecture", "cpu", "gpu", "driver"],
+      "properties": {
+        "os": { "type": "string" },
+        "architecture": { "type": "string" },
+        "cpu": { "type": "string" },
+        "gpu": { "type": "string" },
+        "driver": { "type": "string" },
+        "browser": { "type": ["string", "null"] },
+        "powerProfile": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "workload": {
+      "type": "object",
+      "required": ["id", "parameters", "viewportWidth", "viewportHeight", "durationSeconds"],
+      "properties": {
+        "id": { "type": "string" },
+        "parameters": { "type": "object" },
+        "viewportWidth": { "type": "integer", "minimum": 1 },
+        "viewportHeight": { "type": "integer", "minimum": 1 },
+        "durationSeconds": { "type": "number", "exclusiveMinimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "metrics": {
+      "type": "object",
+      "required": [
+        "presentedFramesPerSecond",
+        "frameTotalMilliseconds",
+        "cpuPreparationMilliseconds",
+        "uploadMilliseconds",
+        "backendSubmissionMilliseconds",
+        "gpuFrameMilliseconds",
+        "drawCalls",
+        "triangles",
+        "uploadBytes"
+      ],
+      "properties": {
+        "presentedFramesPerSecond": { "type": "number", "minimum": 0 },
+        "frameTotalMilliseconds": { "type": "number", "minimum": 0 },
+        "cpuPreparationMilliseconds": { "type": "number", "minimum": 0 },
+        "uploadMilliseconds": { "type": "number", "minimum": 0 },
+        "backendSubmissionMilliseconds": { "type": "number", "minimum": 0 },
+        "gpuFrameMilliseconds": { "type": ["number", "null"], "minimum": 0 },
+        "drawCalls": { "type": "integer", "minimum": 0 },
+        "batches": { "type": "integer", "minimum": 0 },
+        "triangles": { "type": "integer", "minimum": 0 },
+        "uploadBytes": { "type": "integer", "minimum": 0 },
+        "rhiResidentBytes": { "type": "integer", "minimum": 0 },
+        "managedAllocatedBytesPerFrame": { "type": ["number", "null"], "minimum": 0 },
+        "longFrameCount": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "artifacts": {
+      "type": "object",
+      "required": ["diagnosticReport"],
+      "properties": {
+        "diagnosticReport": { "type": "string" },
+        "trace": { "type": ["string", "null"] },
+        "screenshot": { "type": ["string", "null"] },
+        "gpuCapture": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "notes": { "type": ["string", "null"] }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net8.0-browser</TargetFrameworks>
+    <RootNamespace>ThreeDEngine</RootNamespace>
+    <AssemblyName>Avalonia3D.Core</AssemblyName>
+    <PackageId>Avalonia3D.Core</PackageId>
+    <Description>Backend-neutral scene, geometry, materials, resources and engine composition contracts.</Description>
+    <IsPackable>true</IsPackable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Core/**/*.cs"
+             Exclude="Core/Assets/Models/ModelAssetCache3D.cs;Core/Importers/Gltf/**/*.cs;Core/Physics/Jitter2/**/*.cs;Core/Preview/**/*.cs;Core/Demos/**/*.cs;Core/Diagnostics/Avalonia3DSelfTestRunner.cs;Core/Diagnostics/Avalonia3DSelfTestResult.cs" />
+  </ItemGroup>
+</Project>

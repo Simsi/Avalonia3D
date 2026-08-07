@@ -14,7 +14,9 @@ using ThreeDEngine.Avalonia.Hosting;
 using ThreeDEngine.Avalonia.WebGL.Interop;
 using ThreeDEngine.Avalonia.WebGL.Rendering;
 using ThreeDEngine.Core.Assets.Models;
+using ThreeDEngine.Core.Diagnostics;
 using ThreeDEngine.Core.Rendering;
+using ThreeDEngine.Core.Rendering.Rhi;
 using ThreeDEngine.Core.Environment;
 using ThreeDEngine.Core.Rendering.Pipeline;
 using ThreeDEngine.Core.Geometry;
@@ -22,24 +24,31 @@ using ThreeDEngine.Core.Lighting;
 using ThreeDEngine.Core.Particles;
 using ThreeDEngine.Core.Primitives;
 using ThreeDEngine.Core.Scene;
+using ThreeDEngine.Core.Resources;
 
 namespace ThreeDEngine.Avalonia.WebGL.Controls;
 
-public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformanceMetricsOverlayPresenter, ICenterCursorOverlayPresenter, IPointerLockPresenter, IBrowserPageVisibilityPresenter
+internal sealed partial class WebGlScenePresenter : Control, IRhiCommandExecutor3D, IScenePresenter, IScenePresenterDiagnostics3D, IBrowserDiagnosticExportPresenter3D, IPerformanceMetricsOverlayPresenter, ICenterCursorOverlayPresenter, IPointerLockPresenter, IBrowserPageVisibilityPresenter
 {
-    private readonly Dictionary<string, int> _textureVersions = new();
-    private readonly Dictionary<string, int> _meshGeometryVersions = new();
+    private const string ControlTextureKeyPrefix = "control-texture:";
+    private readonly Dictionary<string, long> _textureVersions = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, RhiResourceHandle3D> _textureHandles = new(StringComparer.Ordinal);
+    private readonly GpuDeferredReleaseQueue3D<DeferredTextureRelease> _deferredTextureReleases = new();
+    private readonly string _rhiResourceOwnerId = "webgl-presenter:" + Guid.NewGuid().ToString("N");
+    private readonly Dictionary<string, long> _meshGeometryVersions = new();
     private readonly Dictionary<string, bool> _meshWireframeUploaded = new(StringComparer.Ordinal);
-    private Scene3D _scene = new();
+    private Scene3D? _scene;
     private int _hostId = -1;
     private bool _moduleReady;
     private bool _initializing;
     private bool _renderPending;
     private bool _invalidateScheduled;
+    private bool _rendering;
+    private bool _frameRenderedDispatchScheduled;
     private bool _attached;
     private bool _disposed;
-    private int _lastSweptUploadRegistryVersion = -1;
-    private int _lastSweptUploadBatchContentVersion = -1;
+    private long _lastSweptUploadRegistryVersion = -1;
+    private long _lastSweptUploadBatchContentVersion = -1;
     private string? _performanceMetricsText;
     private bool _performanceMetricsVisible;
     private bool _centerCursorVisible;
@@ -56,6 +65,14 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
     private readonly WebGlRetainedHighScaleRenderer _retainedHighScale = new();
     private readonly WebGlClientHighScaleRenderer _clientHighScale = new();
     private readonly List<WebGlRetainedBatchPacket> _retainedBatches = new(256);
+    private readonly List<WebGlRetainedBatchPacket> _retainedBatchPacketPool = new(256);
+    private readonly Dictionary<string, WebGlRetainedBatchPacket> _ordinaryPacketMap = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, WebGlRetainedBatchPacket> _particlePacketMap = new(StringComparer.Ordinal);
+    private readonly Dictionary<int, List<WebGlRetainedBatchPacket>> _highScalePacketsByDrawOrder = new();
+    private readonly List<List<WebGlRetainedBatchPacket>> _highScalePacketListPool = new(32);
+    private int _retainedBatchPacketPoolCursor;
+    private int _highScalePacketListPoolCursor;
+    private readonly SceneRenderFrameScratch3D _renderFrameScratch = new();
     private readonly SceneRenderPlanScratch3D _renderPlanScratch = new();
     private readonly Dictionary<string, byte[]> _controlTexturePixelBuffers = new(StringComparer.Ordinal);
     private readonly HashSet<string> _liveTextureSweepScratch = new(StringComparer.Ordinal);
@@ -77,39 +94,57 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
     private ulong _lastControlPlaneUploadVersion;
     private int _cachedCubemapCsvVersion = -1;
     private string _cachedCubemapCsv = string.Empty;
-    private bool _clientHighScaleRuntimeFailed;
     private int _renderFailureCount;
+    private long _renderRequestCount;
+    private long _renderedFrameCount;
+    private long _faultCount;
+    private long _lastRequestTimestamp;
+    private long _lastFrameTimestamp;
+    private long _lastFaultTimestamp;
+    private Exception? _lastFault;
+    private bool _fatalFaultPublished;
+    private RhiDevice3D? _rhiDevice;
+    private EngineResourceConfiguration3D? _resourceConfiguration;
+    private SceneFrameRenderedEventArgs? _pendingFrameRendered;
+    private readonly Action _applyScheduledInvalidation;
+    private readonly Action _dispatchPendingFrameRendered;
 
     public WebGlScenePresenter()
     {
+        _applyScheduledInvalidation = ApplyScheduledInvalidation;
+        _dispatchPendingFrameRendered = DispatchPendingFrameRendered;
         Focusable = false;
         ClipToBounds = true;
         //Background = Brushes.Transparent;
-        LayoutUpdated += (_, _) =>
-        {
-            if (_moduleReady && _hostId >= 0)
-            {
-                UpdateHostRect();
-            }
-        };
+        LayoutUpdated += OnLayoutUpdated;
     }
 
     public event EventHandler<SceneFrameRenderedEventArgs>? FrameRendered;
+    public event EventHandler<ScenePresenterFaultedEventArgs3D>? Faulted;
 
     public BackendKind Kind => BackendKind.WebGlBrowser;
+    public IRenderDeviceDiagnostics3D? RenderDevice => _rhiDevice;
     public Control View => this;
 
     public Scene3D Scene
     {
-        get => _scene;
+        get => _scene ?? throw new InvalidOperationException("A scene must be assigned before rendering.");
         set
         {
-            if (!ReferenceEquals(_scene, null))
+            ThrowIfDisposed();
+            if (_scene is not null)
             {
                 _scene.SceneChangedDetailed -= OnSceneChangedDetailed;
             }
 
-            _scene = value ?? throw new ArgumentNullException(nameof(value));
+            if (value is null) throw new ArgumentNullException(nameof(value));
+            var nextConfiguration = value.Engine.Configuration.Resources;
+            if (_hostId >= 0 && _resourceConfiguration is not null && !Equals(_resourceConfiguration, nextConfiguration))
+            {
+                DestroyHost();
+            }
+            _resourceConfiguration = nextConfiguration;
+            _scene = value;
             _scene.SceneChangedDetailed += OnSceneChangedDetailed;
             InvalidateRetainedDrawListCache();
             _lastControlPlaneUploadVersion = 0UL;
@@ -124,6 +159,37 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
             }
             RequestRender();
         }
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        LayoutUpdated -= OnLayoutUpdated;
+        if (_scene is not null)
+        {
+            _scene.SceneChangedDetailed -= OnSceneChangedDetailed;
+            _scene = null;
+        }
+
+        DestroyHost();
+        _pendingFrameRendered = null;
+        FrameRendered = null;
+        Faulted = null;
+        EngineLog3D.Information("WebGL", "Presenter disposed; host and scene references released.");
+    }
+
+    private void OnLayoutUpdated(object? sender, EventArgs e)
+    {
+        if (!_disposed && _moduleReady && _hostId >= 0)
+        {
+            UpdateHostRect();
+        }
+    }
+
+    private void ThrowIfDisposed()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
     }
 
     public void SetPerformanceMetricsOverlay(string? text, bool visible)
@@ -189,8 +255,10 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         // Route those changes only to the particle retained renderer; otherwise a particle-heavy
         // scene invalidates ordinary mesh batches every tick even though particles are excluded
         // from the ordinary renderer.
+        var particleOnlyKinds = SceneChangeFlags3D.Transform | SceneChangeFlags3D.Geometry;
         if (e.Source is ParticleSystem3D &&
-            (e.Kind == SceneChangeKind.Transform || e.Kind == SceneChangeKind.Geometry))
+            (e.Kinds & particleOnlyKinds) != 0 &&
+            (e.Kinds & ~particleOnlyKinds) == 0)
         {
             _retainedParticles.MarkDirty(e);
         }
@@ -201,7 +269,9 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
             _retainedHighScale.MarkDirty(e);
         }
 
-        if (e.Kind == SceneChangeKind.Structure || e.Kind == SceneChangeKind.Visibility || e.Kind == SceneChangeKind.Control)
+        if (e.Contains(SceneChangeKind.Structure) ||
+            e.Contains(SceneChangeKind.Visibility) ||
+            e.Contains(SceneChangeKind.Control))
         {
             _lastControlPlaneUploadVersion = 0UL;
         }
@@ -209,13 +279,47 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
 
     public void RequestRender()
     {
-        if (_disposed)
+        if (_disposed) return;
+        if (_attached && !_moduleReady && !_initializing) _ = EnsureHostAsync();
+        System.Threading.Interlocked.Increment(ref _renderRequestCount);
+        System.Threading.Volatile.Write(ref _lastRequestTimestamp, Stopwatch.GetTimestamp());
+
+        if (_renderPending) return;
+        _renderPending = true;
+        if (Dispatcher.UIThread.CheckAccess() && !_rendering)
         {
+            InvalidateVisual();
             return;
         }
 
-        _renderPending = true;
         ScheduleInvalidateVisual();
+    }
+
+    public ScenePresenterSnapshot3D CapturePresenterSnapshot()
+        => new(Kind, _attached, _moduleReady && _hostId >= 0, _disposed, _rendering, _renderPending,
+            System.Threading.Interlocked.Read(ref _renderRequestCount),
+            System.Threading.Interlocked.Read(ref _renderedFrameCount),
+            System.Threading.Interlocked.Read(ref _faultCount),
+            System.Threading.Volatile.Read(ref _lastRequestTimestamp),
+            System.Threading.Volatile.Read(ref _lastFrameTimestamp),
+            System.Threading.Volatile.Read(ref _lastFaultTimestamp),
+            $"host={_hostId}; moduleReady={_moduleReady}; initializing={_initializing}; invalidateScheduled={_invalidateScheduled}; failures={_renderFailureCount}; bounds={Bounds.Width:0.##}x{Bounds.Height:0.##}; visible={IsVisible}",
+            _lastFault?.GetType().FullName, _lastFault?.Message);
+
+    public void ResetFaultState()
+    {
+        _fatalFaultPublished = false;
+        _lastFault = null;
+        _renderFailureCount = 0;
+        _renderPending = false;
+        _pendingFrameRendered = null;
+        if (_attached && !_moduleReady && !_initializing) _ = EnsureHostAsync();
+    }
+
+    public void ExportTextFile(string fileName, string text)
+    {
+        if (!_moduleReady) throw new InvalidOperationException("The WebGL module is not initialized.");
+        WebGlInterop.DownloadTextFile(fileName, text);
     }
 
     private void ScheduleInvalidateVisual()
@@ -226,21 +330,24 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         }
 
         _invalidateScheduled = true;
-        Dispatcher.UIThread.Post(() =>
-        {
-            _invalidateScheduled = false;
-            if (!_disposed)
-            {
-                InvalidateVisual();
-            }
-        }, DispatcherPriority.Render);
+        Dispatcher.UIThread.Post(_applyScheduledInvalidation, DispatcherPriority.Render);
     }
 
+    private void ApplyScheduledInvalidation()
+    {
+        _invalidateScheduled = false;
+        if (!_disposed)
+        {
+            InvalidateVisual();
+        }
+    }
 
     protected override void OnAttachedToVisualTree(VisualTreeAttachmentEventArgs e)
     {
         base.OnAttachedToVisualTree(e);
+        if (_disposed) return;
         _attached = true;
+        EngineLog3D.Information("WebGL.Lifecycle", $"Presenter attached; bounds={Bounds.Width:0.##}x{Bounds.Height:0.##}.");
         _ = EnsureHostAsync();
     }
 
@@ -248,6 +355,7 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
     {
         base.OnDetachedFromVisualTree(e);
         _attached = false;
+        EngineLog3D.Information("WebGL.Lifecycle", "Presenter detached; destroying browser host.");
         DestroyHost();
     }
 
@@ -260,12 +368,24 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
             return;
         }
 
-        UpdateHostRect();
-
-        if (_renderPending)
+        _rendering = true;
+        try
         {
-            _renderPending = false;
-            RenderToWebGl();
+            UpdateHostRect();
+
+            if (_renderPending)
+            {
+                _renderPending = false;
+                RenderToWebGl();
+            }
+        }
+        catch (Exception exception)
+        {
+            PublishFault(exception, "WebGL presentation callback failed.");
+        }
+        finally
+        {
+            _rendering = false;
         }
     }
 
@@ -295,15 +415,24 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
             }
 
             _hostId = WebGlInterop.CreateHost();
+            _rhiDevice = CreateRhiDevice(_hostId, _resourceConfiguration ?? Scene.Engine.Configuration.Resources);
+            RegisterStaticRhiResources();
             _moduleReady = true;
+            ResetFaultState();
+            EngineLog3D.Information("WebGL", $"Backend initialized; host={_hostId}.");
             UpdateHostRect(force: true);
             UpdateMetricsIfChanged(force: true);
             UpdateCenterCursorIfChanged(force: true);
+            // Requests made while the module was loading are represented by _renderPending,
+            // but their early Avalonia invalidation may already have been consumed. Re-arm
+            // exactly one invalidation now that a live host exists.
+            _renderPending = false;
             RequestRender();
         }
         catch (Exception ex)
         {
-            Debug.WriteLine("3DEngine WebGL backend initialization failed: " + ex);
+            PublishFault(ex, "Backend initialization failed.");
+            DestroyHost();
         }
         finally
         {
@@ -320,12 +449,14 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         }
         catch (Exception ex)
         {
+            _rhiDevice?.AbortFrame();
             HandleRenderFailure(ex);
         }
     }
 
     private void RenderToWebGlCore()
     {
+        var scene = Scene;
         if (_hostId < 0 || Bounds.Width <= 0 || Bounds.Height <= 0)
         {
             return;
@@ -333,41 +464,48 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
 
         if (WebGlInterop.ConsumeContextResetFlag(_hostId))
         {
+            EngineLog3D.Warning("WebGL", $"Graphics context reset detected for host {_hostId}; GPU resources will be recreated.");
+            _rhiDevice?.InvalidateContext("browser reported webglcontextrestored");
+            _rhiDevice?.Dispose();
+            _rhiDevice = CreateRhiDevice(_hostId, _resourceConfiguration ?? scene.Engine.Configuration.Resources);
+            RegisterStaticRhiResources();
             ResetUploadCachesAfterContextRestore();
         }
 
+        DrainDeferredTextureReleases(_rhiDevice?.FrameIndex ?? 0);
         var start = Stopwatch.GetTimestamp();
         var width = (float)global::System.Math.Max(Bounds.Width, 1d);
         var height = (float)global::System.Math.Max(Bounds.Height, 1d);
-        var frame = SceneRenderFrameContext3D.Build(Scene, width, height, BackendKind.WebGlBrowser);
+        using var frame = _renderFrameScratch.Begin(scene, width, height, BackendKind.WebGlBrowser);
         var snapshot = frame.Snapshot;
         var viewProjection = frame.ViewProjection;
         var pipeline = frame.Pipeline;
         var stats = frame.CreateBaseStats();
+        var device = _rhiDevice ?? throw new InvalidOperationException("WebGL RHI device is not initialized.");
+        var gpuSkinningSupported = device.Capabilities.Supports(RhiFeature3D.VertexTextureFetch | RhiFeature3D.FloatTextures);
+        EnsureGpuSkinningAvailable(snapshot, device);
         var ordinaryNeedsPlan = _retainedOrdinary.RequiresScenePlan(frame);
         var particleNeedsPlan = _retainedParticles.RequiresScenePlan(frame);
         var plan = SceneRenderPlanBuilder3D.Build(
             frame,
             _renderPlanScratch,
-            requiresCpuSkinFallback: null,
             stats: stats,
             includeOrdinary: ordinaryNeedsPlan,
             includeParticles: particleNeedsPlan,
             includeHighScale: true);
+        device.BeginFrame(plan.RhiSubmission);
         var hasVisibleHighScale = plan.HasVisibleHighScale;
         var useClientHighScale = hasVisibleHighScale &&
-            !_clientHighScaleRuntimeFailed &&
-            Scene.Performance.EnableRetainedInstanceBuffers &&
-            Scene.Performance.EnableWebGlClientHighScaleRuntime;
+            scene.Performance.EnableRetainedInstanceBuffers &&
+            scene.Performance.EnableWebGlClientHighScaleRuntime;
 
-        if (Scene.Debug.ShowPerformanceMetrics)
+        if (scene.Debug.ShowPerformanceMetrics)
         {
-            var gpuSkinningSupported = WebGlInterop.IsGpuSkinningSupported(_hostId);
-            ApplyAnimationStats(stats, snapshot, gpuSkinningActive: gpuSkinningSupported, fallbackReason: gpuSkinningSupported ? string.Empty : "WebGL GPU skinning unavailable on this context; static bind-pose fallback");
+            ApplyAnimationStats(stats, snapshot, gpuSkinningActive: gpuSkinningSupported);
         }
 
-        SweepUnusedUploadState(Scene, plan.Resources, snapshot);
-        SceneRenderStats3D.ApplyPipelineStats(stats, Scene, pipeline);
+        SweepUnusedUploadState(scene, plan.Resources, snapshot);
+        SceneRenderStats3D.ApplyPipelineStats(stats, scene, pipeline);
 
         var uploadStart = Stopwatch.GetTimestamp();
         UploadDirtyMeshGeometry(plan.Resources, stats);
@@ -380,24 +518,12 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         {
             try
             {
-                _clientHighScale.SyncFrame(_hostId, Scene, plan.HighScaleLayers, width, height, viewProjection, plan.Shadow, stats);
+                _clientHighScale.SyncFrame(_hostId, scene, plan.HighScaleLayers, width, height, viewProjection, stats);
             }
             catch (Exception ex)
             {
-                _clientHighScaleRuntimeFailed = true;
-                useClientHighScale = false;
-                Debug.WriteLine("3DEngine WebGL client high-scale runtime failed; falling back to retained upload path: " + ex);
-                try
-                {
-                    if (_clientHighScale.HasRuntimeState)
-                    {
-                        _clientHighScale.Reset(_hostId);
-                    }
-                }
-                catch (Exception resetEx)
-                {
-                    Debug.WriteLine("3DEngine WebGL client high-scale reset after failure also failed: " + resetEx);
-                }
+                EngineLog3D.Critical("WebGL.HighScale", "Client-owned GPU high-scale runtime failed. The frame is aborted; no runtime fallback is permitted.", ex);
+                throw new InvalidOperationException("WebGL client-owned high-scale runtime failed.", ex);
             }
         }
         else if (_clientHighScale.HasRuntimeState)
@@ -409,7 +535,8 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         var particleDraws = _retainedParticles.BuildAndUpload(_hostId, plan, stats);
         List<WebGlRetainedBatchPacket>? highScaleDraws = null;
 
-        // Retained high-scale is reserved for the explicit fallback path when the JS-owned runtime is disabled.
+        // Retained high-scale is an explicitly selected configuration path. Runtime failure
+        // of the client-owned path is never allowed to switch to it silently.
         if (hasVisibleHighScale && !useClientHighScale)
         {
             highScaleDraws = _retainedHighScale.BuildAndUpload(_hostId, plan, stats);
@@ -422,8 +549,12 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         RebuildRetainedDrawListIfNeeded(plan, ordinaryDraws, particleDraws, highScaleDraws, useClientHighScale);
         UploadRetainedDrawOrderIfNeeded(_retainedBatches, stats);
         UploadControlPlanesIfNeeded(snapshot, stats);
-        RenderRetainedFrameDirect(stats, frame);
-        if (Scene.Debug.ShowPerformanceMetrics)
+        var retainedFrameState = CaptureRetainedFrameState(frame);
+        var showPerformanceMetrics = scene.Debug.ShowPerformanceMetrics;
+        frame.ReleaseSceneAccess();
+        // RHI ForwardScene executes RenderRetainedFrameDirect(stats, in retainedFrameState) only after this release.
+        ExecuteRhiFrame(plan, stats, in retainedFrameState, device);
+        if (showPerformanceMetrics)
         {
             if (useClientHighScale)
             {
@@ -431,26 +562,40 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
             }
             ApplyWebGlStateMetrics(_hostId, stats);
         }
+        device.ApplyStats(stats);
         stats.PacketBuildMilliseconds = GetElapsedMilliseconds(packetStart);
         stats.BackendMilliseconds = GetElapsedMilliseconds(start);
 
-        var renderedFrame = new SceneFrameRenderedEventArgs(Kind, stats.BackendMilliseconds, stats);
-        Dispatcher.UIThread.Post(() =>
+        _fatalFaultPublished = false;
+        _lastFault = null;
+        System.Threading.Interlocked.Increment(ref _renderedFrameCount);
+        System.Threading.Volatile.Write(ref _lastFrameTimestamp, Stopwatch.GetTimestamp());
+        _pendingFrameRendered = new SceneFrameRenderedEventArgs(Kind, stats.BackendMilliseconds, stats);
+        if (!_frameRenderedDispatchScheduled)
         {
-            if (_disposed)
-            {
-                return;
-            }
+            _frameRenderedDispatchScheduled = true;
+            Dispatcher.UIThread.Post(_dispatchPendingFrameRendered, DispatcherPriority.Render);
+        }
+    }
 
-            try
-            {
-                FrameRendered?.Invoke(this, renderedFrame);
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine("3DEngine WebGL FrameRendered subscriber failed: " + ex);
-            }
-        }, DispatcherPriority.Render);
+    private void DispatchPendingFrameRendered()
+    {
+        _frameRenderedDispatchScheduled = false;
+        var renderedFrame = _pendingFrameRendered;
+        _pendingFrameRendered = null;
+        if (_disposed || renderedFrame is null)
+        {
+            return;
+        }
+
+        try
+        {
+            FrameRendered?.Invoke(this, renderedFrame);
+        }
+        catch (Exception ex)
+        {
+            EngineLog3D.Error("WebGL", "FrameRendered subscriber failed.", ex);
+        }
     }
 
 
@@ -484,6 +629,7 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         }
 
         _retainedBatches.Clear();
+        _retainedBatchPacketPoolCursor = 0;
         BuildUnifiedRetainedDrawList(plan, ordinaryDraws, particleDraws, highScaleDraws, useClientHighScale, _retainedBatches);
         _retainedBatches.Sort(CompareRetainedBatchDrawOrder);
 
@@ -495,7 +641,7 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
     }
 
 
-    private static void BuildUnifiedRetainedDrawList(
+    private void BuildUnifiedRetainedDrawList(
         SceneRenderPlan3D plan,
         List<WebGlRetainedBatchPacket> ordinaryDraws,
         List<WebGlRetainedBatchPacket> particleDraws,
@@ -503,11 +649,21 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         bool useClientHighScale,
         List<WebGlRetainedBatchPacket> output)
     {
-        var ordinaryById = plan.IncludesOrdinary ? BuildPacketMap(ordinaryDraws) : null;
-        var particleById = plan.IncludesParticles ? BuildPacketMap(particleDraws) : null;
-        var fallbackHighScaleByOrder = !useClientHighScale && highScaleDraws is not null
-            ? BuildPacketsByDrawOrder(highScaleDraws)
-            : null;
+        Dictionary<string, WebGlRetainedBatchPacket>? ordinaryById = null;
+        Dictionary<string, WebGlRetainedBatchPacket>? particleById = null;
+        Dictionary<int, List<WebGlRetainedBatchPacket>>? retainedHighScaleByOrder = null;
+        if (plan.IncludesOrdinary)
+        {
+            ordinaryById = BuildPacketMap(ordinaryDraws, _ordinaryPacketMap);
+        }
+        if (plan.IncludesParticles)
+        {
+            particleById = BuildPacketMap(particleDraws, _particlePacketMap);
+        }
+        if (!useClientHighScale && highScaleDraws is not null)
+        {
+            retainedHighScaleByOrder = BuildPacketsByDrawOrder(highScaleDraws);
+        }
 
         if (!plan.IncludesOrdinary)
         {
@@ -541,7 +697,7 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
                     };
                     if (!string.IsNullOrEmpty(ordinaryId) && ordinaryById.TryGetValue(ordinaryId, out var ordinaryPacket))
                     {
-                        output.Add(ClonePacketForCommand(ordinaryPacket, command));
+                        output.Add(RentPacket(ordinaryPacket.Id, command.Transparent, ordinaryPacket.IsHighScaleLayer, command.SortDistanceSquared, command.SourceOrder));
                     }
                     break;
 
@@ -554,7 +710,7 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
                     var particleId = command.Particle?.RetainedBatchId;
                     if (!string.IsNullOrEmpty(particleId) && particleById.TryGetValue(particleId, out var particlePacket))
                     {
-                        output.Add(ClonePacketForCommand(particlePacket, command));
+                        output.Add(RentPacket(particlePacket.Id, command.Transparent, particlePacket.IsHighScaleLayer, command.SortDistanceSquared, command.SourceOrder));
                     }
                     break;
 
@@ -563,30 +719,16 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
                     {
                         if (command.HighScaleLayer is not null)
                         {
-                            output.Add(new WebGlRetainedBatchPacket
-                            {
-                                Id = command.HighScaleLayer.Id,
-                                Transparent = false,
-                                IsHighScaleLayer = true,
-                                SortDistanceSquared = command.SortDistanceSquared,
-                                DrawOrder = command.SourceOrder
-                            });
+                            output.Add(RentPacket(command.HighScaleLayer.Id, transparent: false, isHighScaleLayer: true, command.SortDistanceSquared, command.SourceOrder));
                         }
                     }
-                    else if (fallbackHighScaleByOrder is not null &&
-                             fallbackHighScaleByOrder.TryGetValue(command.SourceOrder, out var packets))
+                    else if (retainedHighScaleByOrder is not null &&
+                             retainedHighScaleByOrder.TryGetValue(command.SourceOrder, out var packets))
                     {
                         for (var p = 0; p < packets.Count; p++)
                         {
                             var packet = packets[p];
-                            output.Add(new WebGlRetainedBatchPacket
-                            {
-                                Id = packet.Id,
-                                Transparent = packet.Transparent,
-                                IsHighScaleLayer = packet.IsHighScaleLayer,
-                                SortDistanceSquared = command.SortDistanceSquared,
-                                DrawOrder = command.SourceOrder
-                            });
+                            output.Add(RentPacket(packet.Id, packet.Transparent, packet.IsHighScaleLayer, command.SortDistanceSquared, command.SourceOrder));
                         }
                     }
                     break;
@@ -594,9 +736,11 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         }
     }
 
-    private static Dictionary<string, WebGlRetainedBatchPacket> BuildPacketMap(List<WebGlRetainedBatchPacket> packets)
+    private static Dictionary<string, WebGlRetainedBatchPacket> BuildPacketMap(
+        List<WebGlRetainedBatchPacket> packets,
+        Dictionary<string, WebGlRetainedBatchPacket> map)
     {
-        var map = new Dictionary<string, WebGlRetainedBatchPacket>(packets.Count, StringComparer.Ordinal);
+        map.Clear();
         for (var i = 0; i < packets.Count; i++)
         {
             var packet = packets[i];
@@ -606,49 +750,68 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         return map;
     }
 
-    private static Dictionary<int, List<WebGlRetainedBatchPacket>> BuildPacketsByDrawOrder(List<WebGlRetainedBatchPacket> packets)
+    private Dictionary<int, List<WebGlRetainedBatchPacket>> BuildPacketsByDrawOrder(List<WebGlRetainedBatchPacket> packets)
     {
-        var map = new Dictionary<int, List<WebGlRetainedBatchPacket>>();
+        _highScalePacketsByDrawOrder.Clear();
+        _highScalePacketListPoolCursor = 0;
         for (var i = 0; i < packets.Count; i++)
         {
             var packet = packets[i];
-            if (!map.TryGetValue(packet.DrawOrder, out var list))
+            if (!_highScalePacketsByDrawOrder.TryGetValue(packet.DrawOrder, out var list))
             {
-                list = new List<WebGlRetainedBatchPacket>();
-                map[packet.DrawOrder] = list;
+                list = RentHighScalePacketList();
+                _highScalePacketsByDrawOrder[packet.DrawOrder] = list;
             }
 
             list.Add(packet);
         }
 
-        return map;
+        return _highScalePacketsByDrawOrder;
     }
 
-    private static void AppendCachedPackets(List<WebGlRetainedBatchPacket> output, List<WebGlRetainedBatchPacket> packets)
+    private void AppendCachedPackets(List<WebGlRetainedBatchPacket> output, List<WebGlRetainedBatchPacket> packets)
     {
         for (var i = 0; i < packets.Count; i++)
         {
             var packet = packets[i];
-            output.Add(new WebGlRetainedBatchPacket
-            {
-                Id = packet.Id,
-                Transparent = packet.Transparent,
-                IsHighScaleLayer = packet.IsHighScaleLayer,
-                SortDistanceSquared = packet.SortDistanceSquared,
-                DrawOrder = packet.DrawOrder
-            });
+            output.Add(RentPacket(packet.Id, packet.Transparent, packet.IsHighScaleLayer, packet.SortDistanceSquared, packet.DrawOrder));
         }
     }
 
-    private static WebGlRetainedBatchPacket ClonePacketForCommand(WebGlRetainedBatchPacket packet, SceneRenderCommand3D command)
-        => new()
+    private WebGlRetainedBatchPacket RentPacket(
+        string id,
+        bool transparent,
+        bool isHighScaleLayer,
+        float sortDistanceSquared,
+        int drawOrder)
+    {
+        var index = _retainedBatchPacketPoolCursor++;
+        while (_retainedBatchPacketPool.Count <= index)
         {
-            Id = packet.Id,
-            Transparent = command.Transparent,
-            IsHighScaleLayer = packet.IsHighScaleLayer,
-            SortDistanceSquared = command.SortDistanceSquared,
-            DrawOrder = command.SourceOrder
-        };
+            _retainedBatchPacketPool.Add(new WebGlRetainedBatchPacket { Id = string.Empty });
+        }
+
+        var packet = _retainedBatchPacketPool[index];
+        packet.Id = id;
+        packet.Transparent = transparent;
+        packet.IsHighScaleLayer = isHighScaleLayer;
+        packet.SortDistanceSquared = sortDistanceSquared;
+        packet.DrawOrder = drawOrder;
+        return packet;
+    }
+
+    private List<WebGlRetainedBatchPacket> RentHighScalePacketList()
+    {
+        var index = _highScalePacketListPoolCursor++;
+        while (_highScalePacketListPool.Count <= index)
+        {
+            _highScalePacketListPool.Add(new List<WebGlRetainedBatchPacket>());
+        }
+
+        var list = _highScalePacketListPool[index];
+        list.Clear();
+        return list;
+    }
 
     private static int CompareRetainedBatchDrawOrder(WebGlRetainedBatchPacket? a, WebGlRetainedBatchPacket? b)
     {
@@ -946,22 +1109,54 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         WriteUInt32(destination, byteOffset, (uint)bits);
     }
 
-    private void RenderRetainedFrameDirect(RenderStats stats, SceneRenderFrameContext3D frame)
+    private RetainedFrameState CaptureRetainedFrameState(SceneRenderFrameContext3D frame)
     {
-        var pipeline = frame.Pipeline;
-        var width = frame.Width;
-        var height = frame.Height;
-        var viewProjection = frame.ViewProjection;
-        var lighting = SceneLightingResolver3D.Resolve(Scene);
-        var skybox = Scene.Environment.Skybox;
+        var scene = frame.Scene;
+        var skybox = scene.Environment.Skybox;
+        return new RetainedFrameState(
+            frame.Pipeline,
+            frame.Width,
+            frame.Height,
+            frame.ViewProjection,
+            SceneLightingResolver3D.Resolve(scene),
+            scene.Camera.Position,
+            scene.Camera.Right,
+            scene.Camera.SafeUp,
+            scene.Camera.Forward,
+            scene.Camera.FieldOfViewDegrees,
+            scene.BackgroundColor,
+            skybox.Mode,
+            skybox.TopColor,
+            skybox.HorizonColor,
+            skybox.BottomColor,
+            skybox.Intensity,
+            skybox.HasEquirectangularTexture ? skybox.EquirectangularTextureResourceKey ?? string.Empty : string.Empty,
+            BuildCubemapCsv(skybox),
+            scene.RenderPipeline.ToneMapping.Exposure,
+            scene.RenderPipeline.ToneMapping.Gamma,
+            scene.RenderPipeline.Ssao.Strength,
+            scene.RenderPipeline.Ssao.Radius,
+            scene.RenderPipeline.Ssao.Bias,
+            scene.RenderPipeline.Ssao.SampleCount,
+            scene.Debug.ShowWireframeOverlay,
+            scene.Debug.ShowSilhouetteOverlay);
+    }
+
+    private void RenderRetainedFrameDirect(RenderStats stats, in RetainedFrameState state)
+    {
+        var pipeline = state.Pipeline;
+        var width = state.Width;
+        var height = state.Height;
+        var viewProjection = state.ViewProjection;
+        var lighting = state.Lighting;
 
         Span<float> view = stackalloc float[16];
         WriteMatrix(view, viewProjection);
         Span<float> camera = stackalloc float[12];
-        WriteVector3(camera, 0, Scene.Camera.Position);
-        WriteVector3(camera, 3, Scene.Camera.Right);
-        WriteVector3(camera, 6, Scene.Camera.SafeUp);
-        WriteVector3(camera, 9, Scene.Camera.Forward);
+        WriteVector3(camera, 0, state.CameraPosition);
+        WriteVector3(camera, 3, state.CameraRight);
+        WriteVector3(camera, 6, state.CameraUp);
+        WriteVector3(camera, 9, state.CameraForward);
 
         Span<float> light = stackalloc float[33];
         WriteVector3(light, 0, lighting.Ambient);
@@ -975,40 +1170,70 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         WriteVector4(light, 29, lighting.SpotCone);
 
         Span<float> style = stackalloc float[30];
-        WriteColor(style, 0, Scene.BackgroundColor);
-        WriteVector3(style, 4, skybox.TopColor.ToVector3());
-        WriteVector3(style, 7, skybox.HorizonColor.ToVector3());
-        WriteVector3(style, 10, skybox.BottomColor.ToVector3());
-        style[13] = skybox.Intensity;
-        style[14] = Scene.RenderPipeline.ToneMapping.Exposure;
-        style[15] = Scene.RenderPipeline.ToneMapping.Gamma;
-        style[16] = Scene.RenderPipeline.Ssao.Strength;
-        style[17] = Scene.RenderPipeline.Ssao.Radius;
-        style[18] = Scene.RenderPipeline.Ssao.Bias;
-        style[19] = Scene.RenderPipeline.Ssao.SampleCount;
-        // Reserved slots keep the binary ABI stable for future retained frame state.
+        WriteColor(style, 0, state.BackgroundColor);
+        WriteVector3(style, 4, state.SkyboxTopColor.ToVector3());
+        WriteVector3(style, 7, state.SkyboxHorizonColor.ToVector3());
+        WriteVector3(style, 10, state.SkyboxBottomColor.ToVector3());
+        style[13] = state.SkyboxIntensity;
+        style[14] = state.Exposure;
+        style[15] = state.Gamma;
+        style[16] = state.SsaoStrength;
+        style[17] = state.SsaoRadius;
+        style[18] = state.SsaoBias;
+        style[19] = state.SsaoSampleCount;
+        var verticalProjectionScale = MathF.Tan(state.FieldOfViewDegrees * (MathF.PI / 360f));
+        style[22] = verticalProjectionScale * MathF.Max(width, 1f) / MathF.Max(height, 1f);
+        style[23] = verticalProjectionScale;
 
         var flags = 0;
-        if (skybox.Mode != SkyboxMode3D.None) flags |= 1;
+        if (state.SkyboxMode != SkyboxMode3D.None) flags |= 1;
         if (pipeline.SsaoActive) flags |= 2;
-        if (pipeline.HdrActive) flags |= 4;
-        if (Scene.Debug.ShowWireframeOverlay) flags |= 8;
-        if (Scene.Debug.ShowSilhouetteOverlay) flags |= 16;
+        if (pipeline.ToneMappingActive) flags |= 4;
+        if (state.ShowWireframeOverlay) flags |= 8;
+        if (state.ShowSilhouetteOverlay) flags |= 16;
 
         WebGlInterop.RenderRetainedSceneFrameDirect(
             _hostId,
             width,
             height,
             flags,
-            (int)skybox.Mode,
+            (int)state.SkyboxMode,
             (int)pipeline.ToneMappingMode,
-            skybox.HasEquirectangularTexture ? skybox.EquirectangularTextureKey ?? string.Empty : string.Empty,
-            BuildCubemapCsv(skybox),
+            state.EquirectangularTextureResourceKey,
+            state.CubemapResourceKeys,
             CopyFloatsToFrameBuffer(view, _viewProjectionBytes),
             CopyFloatsToFrameBuffer(camera, _cameraBytes),
             CopyFloatsToFrameBuffer(light, _lightingBytes),
             CopyFloatsToFrameBuffer(style, _styleBytes));
     }
+
+    private readonly record struct RetainedFrameState(
+        RenderPipelinePlan3D Pipeline,
+        float Width,
+        float Height,
+        Matrix4x4 ViewProjection,
+        SceneLightingSnapshot3D Lighting,
+        Vector3 CameraPosition,
+        Vector3 CameraRight,
+        Vector3 CameraUp,
+        Vector3 CameraForward,
+        float FieldOfViewDegrees,
+        ColorRgba BackgroundColor,
+        SkyboxMode3D SkyboxMode,
+        ColorRgba SkyboxTopColor,
+        ColorRgba SkyboxHorizonColor,
+        ColorRgba SkyboxBottomColor,
+        float SkyboxIntensity,
+        string EquirectangularTextureResourceKey,
+        string CubemapResourceKeys,
+        float Exposure,
+        float Gamma,
+        float SsaoStrength,
+        float SsaoRadius,
+        float SsaoBias,
+        int SsaoSampleCount,
+        bool ShowWireframeOverlay,
+        bool ShowSilhouetteOverlay);
 
     private string BuildCubemapCsv(Skybox3D skybox)
     {
@@ -1025,7 +1250,7 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         }
 
         _cachedCubemapCsvVersion = skybox.EnvironmentTextureVersion;
-        _cachedCubemapCsv = string.Join("\n", skybox.CubemapTextureKeys);
+        _cachedCubemapCsv = string.Join("\n", skybox.CubemapTextureResourceKeys);
         return _cachedCubemapCsv;
     }
 
@@ -1091,7 +1316,21 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         stats.WebGlDynamicBufferDataCalls = WebGlInterop.GetWebGlStateMetric(hostId, 9);
     }
 
-    private static void ApplyAnimationStats(RenderStats stats, SceneFrameSnapshot3D snapshot, bool gpuSkinningActive, string fallbackReason)
+    private static void EnsureGpuSkinningAvailable(SceneFrameSnapshot3D snapshot, RhiDevice3D device)
+    {
+        foreach (var obj in snapshot.AllObjectsInternal)
+        {
+            if (obj is not ModelPart3D { IsSkinned: true } part) continue;
+            var boneCount = part.CurrentGpuSkinMatricesInternal.Length;
+            if (boneCount == 0)
+                throw new InvalidOperationException($"Skinned model part '{part.Name}' has no GPU bone matrices; rendering an undeformed bind pose is forbidden.");
+            device.Capabilities.Require(RhiFeature3D.VertexTextureFetch | RhiFeature3D.FloatTextures, $"GPU skinning for '{part.Name}'");
+            if (boneCount > device.Capabilities.Limits.MaxTextureSize)
+                throw new RhiDeviceLimitException3D(RhiBackendApi3D.WebGl2, $"GPU skinning for '{part.Name}'", $"bone count <= {device.Capabilities.Limits.MaxTextureSize}", device.Capabilities);
+        }
+    }
+
+    private static void ApplyAnimationStats(RenderStats stats, SceneFrameSnapshot3D snapshot, bool gpuSkinningActive)
     {
         var imported = 0;
         var skinned = 0;
@@ -1099,7 +1338,7 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         var skinMatrices = 0;
         var skinnedPrimitives = 0;
         long skinPayloadBytes = 0;
-        foreach (var obj in snapshot.AllObjects)
+        foreach (var obj in snapshot.AllObjectsInternal)
         {
             if (obj is not ImportedModel3D model) continue;
             imported++;
@@ -1125,7 +1364,6 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         stats.SkinningVertexPayloadBytes = skinPayloadBytes;
         stats.GpuSkinningRequested = skinned > 0;
         stats.GpuSkinningActive = gpuSkinningActive && skinned > 0;
-        stats.SkinningFallbackReason = (gpuSkinningActive && skinned > 0) || skinned == 0 ? string.Empty : fallbackReason;
     }
 
     private void UploadDirtyMeshGeometry(RenderResourcePlan3D resources, RenderStats stats)
@@ -1137,6 +1375,81 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         {
             UploadMeshIfNeeded(meshes[i], stats);
         }
+    }
+
+    private static RhiDevice3D CreateRhiDevice(int hostId, EngineResourceConfiguration3D resourceConfiguration)
+    {
+        var features = (RhiFeature3D)(uint)WebGlInterop.GetRhiFeatureMask(hostId);
+        features |= RhiFeature3D.CommandBuffers;
+        return new RhiDevice3D(new RhiDeviceCapabilities3D(
+            RhiBackendApi3D.WebGl2,
+            WebGlInterop.GetRhiAdapterName(hostId),
+            WebGlInterop.GetRhiApiVersion(hostId),
+            features,
+            new RhiDeviceLimits3D(
+                WebGlInterop.GetRhiLimit(hostId, 0),
+                WebGlInterop.GetRhiLimit(hostId, 1),
+                WebGlInterop.GetRhiLimit(hostId, 2),
+                WebGlInterop.GetRhiLimit(hostId, 3),
+                WebGlInterop.GetRhiLimit(hostId, 4),
+                WebGlInterop.GetRhiLimit(hostId, 5),
+                WebGlInterop.GetRhiLimit(hostId, 6))),
+            resourceConfiguration);
+    }
+
+    private void RegisterStaticRhiResources()
+    {
+        var resources = _rhiDevice?.Resources ?? throw new InvalidOperationException("WebGL RHI device is not initialized.");
+        resources.RegisterBuffer("utility:skybox:vertices", new RhiBufferDescriptor3D(8L * sizeof(float), RhiBufferUsage3D.Vertex, sizeof(float) * 2), 1);
+        resources.RegisterBuffer("utility:quad:indices", new RhiBufferDescriptor3D(6L * sizeof(ushort), RhiBufferUsage3D.Index, sizeof(ushort)), 1);
+        resources.RegisterAllocation("utility:skybox:vao", RhiResourceKind3D.VertexArray, 0, 1);
+        resources.RegisterAllocation("pipeline:mesh", RhiResourceKind3D.Pipeline, 0, 1);
+        resources.RegisterAllocation("pipeline:skybox", RhiResourceKind3D.Pipeline, 0, 1);
+        resources.RegisterAllocation("pipeline:textured", RhiResourceKind3D.Pipeline, 0, 1);
+    }
+
+    private void RegisterMeshResources(string meshKey, RenderGeometry3D geometry, bool includeWireframe)
+    {
+        var resources = _rhiDevice?.Resources ?? throw new InvalidOperationException("WebGL RHI device is not initialized.");
+        var version = geometry.GeometryVersion;
+        RegisterBuffer("position", geometry.Positions.LongLength * sizeof(float) * 3L, RhiBufferUsage3D.Vertex, sizeof(float) * 3);
+        RegisterBuffer("normal", geometry.Normals.LongLength * sizeof(float) * 3L, RhiBufferUsage3D.Vertex, sizeof(float) * 3);
+        RegisterOptionalBuffer("uv0", geometry.HasTexCoords0, geometry.TexCoords0.LongLength * sizeof(float) * 2L, sizeof(float) * 2);
+        RegisterOptionalBuffer("tangent", geometry.HasTangents, geometry.Tangents.LongLength * sizeof(float) * 4L, sizeof(float) * 4);
+        RegisterOptionalBuffer("color0", geometry.HasColors0, geometry.Colors0.LongLength * sizeof(float) * 4L, sizeof(float) * 4);
+        RegisterOptionalBuffer("material-slot", geometry.HasMaterialSlots, geometry.MaterialSlots.LongLength * sizeof(float), sizeof(float));
+        RegisterOptionalBuffer("bone-index", geometry.HasSkinWeights, geometry.BoneIndices0.LongLength * sizeof(float) * 4L, sizeof(float) * 4);
+        RegisterOptionalBuffer("bone-weight", geometry.HasSkinWeights, geometry.BoneWeights0.LongLength * sizeof(float) * 4L, sizeof(float) * 4);
+        RegisterBuffer("index", geometry.Indices.ByteCount, RhiBufferUsage3D.Index, geometry.Indices.ElementSizeBytes);
+        if (includeWireframe)
+        {
+            RegisterBuffer("wireframe-index", geometry.WireframeIndices.ByteCount, RhiBufferUsage3D.Index, geometry.WireframeIndices.ElementSizeBytes);
+        }
+        else
+        {
+            resources.Release($"mesh:{meshKey}:wireframe-index", RhiResourceKind3D.Buffer);
+        }
+        resources.RegisterAllocation($"mesh:{meshKey}:vao", RhiResourceKind3D.VertexArray, 0, version);
+
+        void RegisterBuffer(string suffix, long byteSize, RhiBufferUsage3D usage, int stride)
+            => resources.RegisterBuffer($"mesh:{meshKey}:{suffix}", new RhiBufferDescriptor3D(byteSize, usage, stride), version);
+
+        void RegisterOptionalBuffer(string suffix, bool present, long byteSize, int stride)
+        {
+            if (present) RegisterBuffer(suffix, byteSize, RhiBufferUsage3D.Vertex, stride);
+            else resources.Release($"mesh:{meshKey}:{suffix}", RhiResourceKind3D.Buffer);
+        }
+    }
+
+    private void ReleaseMeshResources(string meshKey)
+    {
+        var resources = _rhiDevice?.Resources;
+        if (resources is null) return;
+        foreach (var suffix in new[] { "position", "normal", "uv0", "tangent", "color0", "material-slot", "bone-index", "bone-weight", "index", "wireframe-index" })
+        {
+            resources.Release($"mesh:{meshKey}:{suffix}", RhiResourceKind3D.Buffer);
+        }
+        resources.Release($"mesh:{meshKey}:vao", RhiResourceKind3D.VertexArray);
     }
 
     private void UploadMeshIfNeeded(Mesh3D mesh, RenderStats stats)
@@ -1158,17 +1471,17 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
             meshKey,
             payload.VertexCount,
             payload.IndexCount,
-            payload.Positions,
-            payload.Normals,
-            payload.TexCoords0,
-            payload.Tangents,
-            payload.Colors0,
-            payload.MaterialSlots,
-            payload.BoneIndices0,
-            payload.BoneWeights0,
-            payload.Indices,
+            payload.PositionStorage,
+            payload.NormalStorage,
+            payload.TexCoordStorage,
+            payload.TangentStorage,
+            payload.ColorStorage,
+            payload.MaterialSlotStorage,
+            payload.BoneIndexStorage,
+            payload.BoneWeightStorage,
+            payload.IndexStorage,
             payload.IndexElementSize,
-            payload.WireframeIndices,
+            payload.WireframeIndexStorage,
             payload.WireframeIndexElementSize,
             payload.HasTexCoords0,
             payload.HasTangents,
@@ -1179,13 +1492,14 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
 
         _meshGeometryVersions[meshKey] = mesh.GeometryVersion;
         _meshWireframeUploaded[meshKey] = includeWireframe;
+        RegisterMeshResources(meshKey, geometry, includeWireframe);
         stats.DirtyMeshUploads++;
         stats.RenderGeometryCount++;
         stats.VertexBufferUploadCount += 2 + (geometry.HasTexCoords0 ? 1 : 0) + (geometry.HasTangents ? 1 : 0) + (geometry.HasColors0 ? 1 : 0) + (geometry.HasMaterialSlots ? 1 : 0) + (geometry.HasSkinWeights ? 2 : 0);
         stats.IndexBufferUploadCount += includeWireframe ? 2 : 1;
-        stats.VertexBufferUploadBytes += geometry.EstimatedVertexUploadBytes;
+        stats.VertexBufferUploadBytes += payload.VertexUploadByteCount;
         stats.IndexBufferUploadBytes += geometry.EstimatedIndexUploadBytes;
-        stats.MeshUploadBytes += geometry.EstimatedUploadBytes;
+        stats.MeshUploadBytes += payload.VertexUploadByteCount + geometry.EstimatedIndexUploadBytes;
         stats.TangentUploadBytes += geometry.HasTangents ? geometry.Tangents.LongLength * sizeof(float) * 4L : 0L;
         stats.WireframeIndexUploadBytes += includeWireframe ? geometry.EstimatedWireframeIndexUploadBytes : 0L;
         if (geometry.HasTangentSpace) stats.TangentSpaceMeshCount++;
@@ -1199,37 +1513,35 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         var textures = resources.Textures;
         for (var i = 0; i < textures.Count; i++)
         {
-            var texture = textures[i];
-            UploadTextureIfDirty(texture.Key, texture.Data, texture.Version, stats);
+            UploadTextureIfDirty(textures[i], stats);
         }
     }
 
-    private void UploadTextureIfDirty(string? textureKey, byte[]? textureData, int version, RenderStats stats)
+    private void UploadTextureIfDirty(RenderTextureResource3D texture, RenderStats stats)
     {
-        if (string.IsNullOrWhiteSpace(textureKey) || textureData is not { Length: > 0 })
-        {
-            return;
-        }
+        if (!texture.IsValid) return;
+        var textureKey = texture.Key;
+        RestoreDeferredTexture(textureKey);
+        if (_textureVersions.TryGetValue(textureKey, out var knownVersion) && knownVersion == texture.Version) return;
 
-        if (_textureVersions.TryGetValue(textureKey, out var knownVersion) && knownVersion == version)
-        {
-            return;
-        }
+        if (!TextureDecodeHelper3D.TryDecodeRgba(texture.DataInternal, out var decoded, out var error))
+            throw new InvalidOperationException($"Texture '{texture.LogicalKey}' ({texture.ContentHash}) could not be decoded: {error}. Missing GPU texture data is not rendered through a fallback material.");
 
-        if (!TextureDecodeHelper3D.TryDecodeRgba(textureData, out var decoded, out _))
-        {
-            return;
-        }
-
+        var descriptor = new RhiTextureDescriptor3D(decoded.Width, decoded.Height, RhiTextureFormat3D.Rgba8Unorm, RhiTextureUsage3D.Sampled, GetWebGlMipLevelCount(decoded.Width, decoded.Height));
+        var device = _rhiDevice ?? throw new InvalidOperationException("WebGL RHI device is not initialized.");
+        device.ValidateTexture(descriptor, $"texture '{texture.LogicalKey}'");
+        device.Resources.ValidateTextureRegistration(textureKey, descriptor, texture.Version);
         WebGlInterop.UploadTextureBytes(_hostId, textureKey, decoded.Width, decoded.Height, decoded.RgbaPixels);
-        _textureVersions[textureKey] = version;
+        var handle = device.Resources.RegisterTexture(textureKey, descriptor, texture.Version, _rhiResourceOwnerId);
+        _textureVersions[textureKey] = texture.Version;
+        _textureHandles[textureKey] = handle;
         stats.DirtyTextureUploads++;
         stats.TextureUploadBytes += decoded.ByteLength;
     }
 
     private void UploadDirtyControlTextures(SceneFrameSnapshot3D snapshot, RenderStats stats)
     {
-        foreach (var obj in snapshot.AllObjects)
+        foreach (var obj in snapshot.AllObjectsInternal)
         {
             if (obj is not ControlPlane3D plane || !plane.IsVisible)
             {
@@ -1242,7 +1554,9 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
                 continue;
             }
 
-            if (_textureVersions.TryGetValue(plane.Id, out var knownVersion) && knownVersion == plane.SnapshotVersion)
+            var textureKey = GetControlTextureKey(plane.Id);
+            RestoreDeferredTexture(textureKey);
+            if (_textureVersions.TryGetValue(textureKey, out var knownVersion) && knownVersion == plane.SnapshotVersion)
             {
                 continue;
             }
@@ -1251,10 +1565,14 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
             var pixelHeight = System.Math.Max(plane.RenderPixelHeight, 1);
             var stride = pixelWidth * 4;
             var bufferSize = stride * pixelHeight;
-            if (!_controlTexturePixelBuffers.TryGetValue(plane.Id, out var pixels) || pixels.Length != bufferSize)
+            var descriptor = new RhiTextureDescriptor3D(pixelWidth, pixelHeight, RhiTextureFormat3D.Rgba8Unorm, RhiTextureUsage3D.Sampled, GetWebGlMipLevelCount(pixelWidth, pixelHeight));
+            var device = _rhiDevice ?? throw new InvalidOperationException("WebGL RHI device is not initialized.");
+            device.ValidateTexture(descriptor, $"control-plane texture '{plane.Id}'");
+            device.Resources.ValidateTextureRegistration(textureKey, descriptor, plane.SnapshotVersion);
+            if (!_controlTexturePixelBuffers.TryGetValue(textureKey, out var pixels) || pixels.Length != bufferSize)
             {
                 pixels = new byte[bufferSize];
-                _controlTexturePixelBuffers[plane.Id] = pixels;
+                _controlTexturePixelBuffers[textureKey] = pixels;
             }
 
             try
@@ -1266,15 +1584,30 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
                         bitmap.CopyPixels(new PixelRect(0, 0, pixelWidth, pixelHeight), (IntPtr)ptr, bufferSize, stride);
                     }
                 }
+            }
+            catch (Exception ex)
+            {
+                EngineLog3D.Critical("WebGL.ControlPlane", $"Snapshot read failed for control plane '{plane.Id}'; the frame is aborted.", ex);
+                throw;
+            }
 
-                WebGlInterop.UploadTextureBytes(_hostId, plane.Id, pixelWidth, pixelHeight, pixels);
-                _textureVersions[plane.Id] = plane.SnapshotVersion;
+            try
+            {
+                WebGlInterop.UploadTextureBytes(_hostId, textureKey, pixelWidth, pixelHeight, pixels);
+                var handle = device.Resources.RegisterTexture(
+                    textureKey,
+                    descriptor,
+                    plane.SnapshotVersion,
+                    _rhiResourceOwnerId);
+                _textureVersions[textureKey] = plane.SnapshotVersion;
+                _textureHandles[textureKey] = handle;
                 stats.DirtyTextureUploads++;
                 stats.TextureUploadBytes += bufferSize;
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"3DEngine WebGL skipped control-plane texture '{plane.Id}' after upload failure: {ex}");
+                EngineLog3D.Critical("WebGL.ControlPlane", $"Texture upload failed for control plane '{plane.Id}'; the frame is aborted because no placeholder-texture fallback is permitted.", ex);
+                throw;
             }
         }
 
@@ -1301,11 +1634,11 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         var liveTextures = _liveTextureSweepScratch;
         liveTextures.Clear();
 
-        foreach (var obj in snapshot.AllObjects)
+        foreach (var obj in snapshot.AllObjectsInternal)
         {
             if (obj is ControlPlane3D plane && plane.IsVisible && plane.Snapshot is not null)
             {
-                liveTextures.Add(plane.Id);
+                liveTextures.Add(GetControlTextureKey(plane.Id));
             }
         }
 
@@ -1328,7 +1661,7 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         }
         foreach (var key in _sweepRemovalScratch)
         {
-            TryDestroyTexture(key);
+            QueueDestroyTexture(key);
             _textureVersions.Remove(key);
             _controlTexturePixelBuffers.Remove(key);
         }
@@ -1346,23 +1679,50 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         try
         {
             WebGlInterop.DestroyMeshGeometry(_hostId, meshKey);
+            ReleaseMeshResources(meshKey);
         }
         catch (Exception ex)
         {
-            Debug.WriteLine("3DEngine WebGL mesh resource destruction failed: " + ex);
+            EngineLog3D.Error("WebGL.Resources", "Mesh resource destruction failed.", ex);
         }
     }
 
-    private void TryDestroyTexture(string textureKey)
+    private static string GetControlTextureKey(string planeId)
+        => ControlTextureKeyPrefix + planeId;
+
+    private void QueueDestroyTexture(string textureKey)
+    {
+        _textureHandles.Remove(textureKey, out var handle);
+        _textureVersions.TryGetValue(textureKey, out var version);
+        _deferredTextureReleases.Enqueue(
+            new DeferredTextureRelease(textureKey, version, handle),
+            _rhiDevice?.FrameIndex ?? 0,
+            _resourceConfiguration?.DeferredReleaseFrames ?? 0);
+    }
+
+    private void RestoreDeferredTexture(string textureKey)
+    {
+        if (!_deferredTextureReleases.TryCancel(
+                candidate => string.Equals(candidate.TextureKey, textureKey, StringComparison.Ordinal),
+                out var release)) return;
+        _textureVersions[textureKey] = release.Version;
+        if (release.Handle.IsValid) _textureHandles[textureKey] = release.Handle;
+    }
+
+    private void DrainDeferredTextureReleases(long completedFrame)
+        => _deferredTextureReleases.DrainReady(completedFrame, ReleaseTextureNow);
+
+    private void ReleaseTextureNow(DeferredTextureRelease release)
     {
         if (_hostId < 0) return;
         try
         {
-            WebGlInterop.DestroyTexture(_hostId, textureKey);
+            WebGlInterop.DestroyTexture(_hostId, release.TextureKey);
+            if (release.Handle.IsValid) _rhiDevice?.Resources.ReleaseOwner(release.Handle, _rhiResourceOwnerId);
         }
         catch (Exception ex)
         {
-            Debug.WriteLine("3DEngine WebGL texture resource destruction failed: " + ex);
+            EngineLog3D.Error("WebGL.Resources", "Texture resource destruction failed.", ex);
         }
     }
 
@@ -1394,8 +1754,7 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
             }
             catch (Exception ex)
             {
-                Debug.WriteLine("3DEngine WebGL host rectangle update failed: " + ex);
-                return;
+                throw new InvalidOperationException("WebGL host rectangle update failed.", ex);
             }
         }
 
@@ -1421,7 +1780,7 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         }
         catch (Exception ex)
         {
-            Debug.WriteLine("3DEngine WebGL metrics overlay update failed: " + ex);
+            EngineLog3D.Error("WebGL.Overlay", "Metrics overlay update failed.", ex);
         }
     }
 
@@ -1441,7 +1800,7 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         }
         catch (Exception ex)
         {
-            Debug.WriteLine("3DEngine WebGL center-cursor overlay update failed: " + ex);
+            EngineLog3D.Error("WebGL.Overlay", "Center-cursor overlay update failed.", ex);
         }
     }
 
@@ -1510,15 +1869,18 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
     private void HandleRenderFailure(Exception ex)
     {
         _renderFailureCount++;
-        Debug.WriteLine($"3DEngine WebGL render failed ({_renderFailureCount}): {ex}");
+        _lastFault = ex;
+        System.Threading.Interlocked.Increment(ref _faultCount);
+        System.Threading.Volatile.Write(ref _lastFaultTimestamp, Stopwatch.GetTimestamp());
+        EngineLog3D.Critical("WebGL", $"Frame rendering failed (consecutive failures: {_renderFailureCount}).", ex);
 
         try
         {
-            ResetUploadCachesAfterContextRestore();
+            ResetUploadCachesAfterContextRestore(discardDeferredReleases: false);
         }
         catch (Exception resetEx)
         {
-            Debug.WriteLine("3DEngine WebGL cache reset after render failure failed: " + resetEx);
+            EngineLog3D.Error("WebGL.Resources", "Cache reset after render failure failed.", resetEx);
         }
 
         if (_hostId >= 0)
@@ -1532,7 +1894,7 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
             }
             catch (Exception metricsEx)
             {
-                Debug.WriteLine("3DEngine WebGL failed to publish render failure overlay: " + metricsEx);
+                EngineLog3D.Error("WebGL.Overlay", "Failed to publish render failure overlay.", metricsEx);
             }
         }
 
@@ -1540,7 +1902,22 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         {
             _renderPending = true;
             ScheduleInvalidateVisual();
+            return;
         }
+
+        PublishFault(ex, $"WebGL rendering remained faulted after {_renderFailureCount} consecutive attempts.", countFault: false);
+    }
+
+    private void PublishFault(Exception exception, string message, bool countFault = true)
+    {
+        if (_fatalFaultPublished) return;
+        _fatalFaultPublished = true;
+        _lastFault = exception;
+        if (countFault) System.Threading.Interlocked.Increment(ref _faultCount);
+        System.Threading.Volatile.Write(ref _lastFaultTimestamp, Stopwatch.GetTimestamp());
+        EngineLog3D.Critical("WebGL", message, exception);
+        try { Faulted?.Invoke(this, new ScenePresenterFaultedEventArgs3D(exception, CapturePresenterSnapshot())); }
+        catch (Exception subscriberException) { EngineLog3D.Error("WebGL", "Presenter Faulted subscriber failed.", subscriberException); }
     }
 
     private static string BuildRenderFailureOverlayText(Exception ex)
@@ -1555,9 +1932,11 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         return text.Length <= maxLength ? text : text[..maxLength] + "…";
     }
 
-    private void ResetUploadCachesAfterContextRestore()
+    private void ResetUploadCachesAfterContextRestore(bool discardDeferredReleases = true)
     {
         _textureVersions.Clear();
+        _textureHandles.Clear();
+        if (discardDeferredReleases) _deferredTextureReleases.ClearWithoutRelease();
         _meshGeometryVersions.Clear();
         _meshWireframeUploaded.Clear();
         _controlTexturePixelBuffers.Clear();
@@ -1567,7 +1946,6 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
         _lastControlPlaneUploadVersion = 0UL;
         _cachedCubemapCsvVersion = -1;
         _cachedCubemapCsv = string.Empty;
-        _clientHighScaleRuntimeFailed = false;
         if (_hostId >= 0)
         {
             _retainedOrdinary.Reset(_hostId);
@@ -1581,18 +1959,40 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
     {
         if (_hostId >= 0)
         {
-            _retainedOrdinary.Reset(_hostId);
-            _retainedParticles.Reset(_hostId);
-            _retainedHighScale.Reset(_hostId);
-            _clientHighScale.Reset(_hostId);
-            WebGlInterop.DestroyHost(_hostId);
-            _hostId = -1;
+            var destroyedHostId = _hostId;
+            var nativeDestroyed = false;
+            try
+            {
+                _retainedOrdinary.Reset(_hostId);
+                _retainedParticles.Reset(_hostId);
+                _retainedHighScale.Reset(_hostId);
+                _clientHighScale.Reset(_hostId);
+                WebGlInterop.DestroyHost(_hostId);
+                nativeDestroyed = true;
+                EngineLog3D.Information("WebGL", $"Backend host {destroyedHostId} destroyed.");
+            }
+            finally
+            {
+                if (nativeDestroyed && _rhiDevice is not null && !_rhiDevice.IsDisposed)
+                    _rhiDevice.InvalidateContext("WebGL native host destroyed");
+                _rhiDevice?.Dispose();
+                _rhiDevice = null;
+                _hostId = -1;
+            }
+        }
+        else
+        {
+            _rhiDevice?.Dispose();
+            _rhiDevice = null;
         }
 
         _moduleReady = false;
         _renderPending = false;
         _invalidateScheduled = false;
+        _pendingFrameRendered = null;
         _textureVersions.Clear();
+        _textureHandles.Clear();
+        _deferredTextureReleases.ClearWithoutRelease();
         _meshGeometryVersions.Clear();
         _meshWireframeUploaded.Clear();
         _controlTexturePixelBuffers.Clear();
@@ -1616,4 +2016,15 @@ public sealed class WebGlScenePresenter : Control, IScenePresenter, IPerformance
     {
         return (Stopwatch.GetTimestamp() - startTimestamp) * 1000d / Stopwatch.Frequency;
     }
+
+    private static int GetWebGlMipLevelCount(int width, int height)
+    {
+        if (width <= 0 || height <= 0 || (width & (width - 1)) != 0 || (height & (height - 1)) != 0) return 1;
+        var levels = 1;
+        for (var size = Math.Max(width, height); size > 1; size >>= 1) levels++;
+        return levels;
+    }
+
+    private readonly record struct DeferredTextureRelease(string TextureKey, long Version, RhiResourceHandle3D Handle);
+
 }

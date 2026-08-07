@@ -26,9 +26,9 @@ internal sealed class WebGlRetainedParticleRenderer
     private readonly HashSet<string> _liveBatchIds = new(StringComparer.Ordinal);
     private readonly List<string> _deadScratch = new(16);
     private readonly List<WebGlRetainedBatchPacket> _drawRefs = new(32);
-    private int _lastPlannedParticleVersion = -1;
-    private int _lastPlannedRegistryVersion = -1;
-    private int _lastPlannedCameraVersion = -1;
+    private long _lastPlannedParticleVersion = -1;
+    private long _lastPlannedRegistryVersion = -1;
+    private long _lastPlannedCameraVersion = -1;
     private bool _hasCameraDependentParticleBatches;
     private bool _sceneDirty = true;
     private ulong _version;
@@ -37,10 +37,10 @@ internal sealed class WebGlRetainedParticleRenderer
 
     public void MarkDirty(SceneChangedEventArgs change)
     {
-        if (change.Kind == SceneChangeKind.Structure ||
-            change.Kind == SceneChangeKind.Visibility ||
-            change.Kind == SceneChangeKind.Geometry ||
-            (change.Source is ParticleSystem3D && change.Kind == SceneChangeKind.Transform))
+        if (change.Contains(SceneChangeKind.Structure) ||
+            change.Contains(SceneChangeKind.Visibility) ||
+            change.Contains(SceneChangeKind.Geometry) ||
+            (change.Source is ParticleSystem3D && change.Contains(SceneChangeKind.Transform)))
         {
             _sceneDirty = true;
             _version++;
@@ -229,10 +229,10 @@ internal sealed class WebGlRetainedParticleRenderer
                     hostId,
                     batchId,
                     material.NormalMapStrength,
-                    material.HasBaseColorTexture ? material.BaseColorTextureKey ?? string.Empty : string.Empty,
-                    material.HasNormalMap ? material.NormalMapTextureKey ?? string.Empty : string.Empty,
-                    material.HasMetallicRoughnessTexture ? material.MetallicRoughnessTextureKey ?? string.Empty : string.Empty,
-                    material.HasEmissiveTexture ? material.EmissiveTextureKey ?? string.Empty : string.Empty,
+                    material.HasBaseColorTexture ? material.BaseColorTextureResourceKey ?? string.Empty : string.Empty,
+                    material.HasNormalMap ? material.NormalMapTextureResourceKey ?? string.Empty : string.Empty,
+                    material.HasMetallicRoughnessTexture ? material.MetallicRoughnessTextureResourceKey ?? string.Empty : string.Empty,
+                    material.HasEmissiveTexture ? material.EmissiveTextureResourceKey ?? string.Empty : string.Empty,
                     material.Metallic,
                     material.Roughness,
                     0f,
@@ -240,7 +240,8 @@ internal sealed class WebGlRetainedParticleRenderer
                     material.EmissiveColor.R,
                     material.EmissiveColor.G,
                     material.EmissiveColor.B,
-                    material.EmissiveColor.A);
+                    material.EmissiveColor.A,
+                    (int)material.CullMode);
                 _lastMaterialKey = material.Key;
             }
 

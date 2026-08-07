@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using ThreeDEngine.Core.Validation;
 using ThreeDEngine.Core.Collision;
 
 namespace ThreeDEngine.Core.Assets.Models;
@@ -17,15 +19,15 @@ public sealed class ModelAsset3D
         IReadOnlyList<SkinAsset3D>? skins = null,
         IReadOnlyList<AnimationClip3D>? animations = null)
     {
-        AssetId = string.IsNullOrWhiteSpace(assetId) ? "model:" + Guid.NewGuid().ToString("N") : assetId;
-        SourcePath = sourcePath ?? string.Empty;
-        Nodes = nodes ?? Array.Empty<ModelNode3D>();
-        Meshes = meshes ?? Array.Empty<MeshAsset3D>();
-        Materials = materials is { Count: > 0 } ? materials : new[] { ModelMaterialAsset3D.Default };
-        Textures = textures ?? Array.Empty<ModelTextureAsset3D>();
-        Diagnostics = diagnostics ?? new ModelImportDiagnostics();
-        Skins = skins ?? Array.Empty<SkinAsset3D>();
-        Animations = animations ?? Array.Empty<AnimationClip3D>();
+        AssetId = Guard3D.RequiredText(assetId, nameof(assetId));
+        SourcePath = sourcePath ?? throw new ArgumentNullException(nameof(sourcePath));
+        Nodes = Array.AsReadOnly((nodes ?? throw new ArgumentNullException(nameof(nodes))).ToArray());
+        Meshes = Array.AsReadOnly((meshes ?? throw new ArgumentNullException(nameof(meshes))).ToArray());
+        Materials = Array.AsReadOnly((materials ?? throw new ArgumentNullException(nameof(materials))).ToArray());
+        Textures = Array.AsReadOnly((textures ?? throw new ArgumentNullException(nameof(textures))).ToArray());
+        Diagnostics = diagnostics ?? throw new ArgumentNullException(nameof(diagnostics));
+        Skins = Array.AsReadOnly((skins ?? Array.Empty<SkinAsset3D>()).ToArray());
+        Animations = Array.AsReadOnly((animations ?? Array.Empty<AnimationClip3D>()).ToArray());
         Bounds = ComputeBounds(Nodes);
     }
 
@@ -70,14 +72,18 @@ public sealed class ModelAsset3D
 
     public SkinAsset3D? ResolveSkin(int? skinIndex)
     {
-        if (skinIndex.HasValue && skinIndex.Value >= 0 && skinIndex.Value < Skins.Count) return Skins[skinIndex.Value];
-        return null;
+        if (!skinIndex.HasValue || skinIndex.Value == -1) return null;
+        if ((uint)skinIndex.Value >= (uint)Skins.Count)
+            throw new ArgumentOutOfRangeException(nameof(skinIndex), skinIndex, "Skin index is outside the asset skin catalog.");
+        return Skins[skinIndex.Value];
     }
 
     public ModelMaterialAsset3D ResolveMaterial(int materialIndex)
     {
-        if (materialIndex >= 0 && materialIndex < Materials.Count) return Materials[materialIndex];
-        return Materials.Count > 0 ? Materials[0] : ModelMaterialAsset3D.Default;
+        if (materialIndex == -1) return ModelMaterialAsset3D.Default;
+        if ((uint)materialIndex >= (uint)Materials.Count)
+            throw new ArgumentOutOfRangeException(nameof(materialIndex), materialIndex, "Material index is outside the asset material catalog.");
+        return Materials[materialIndex];
     }
 
     private static Bounds3D ComputeBounds(IReadOnlyList<ModelNode3D> nodes)

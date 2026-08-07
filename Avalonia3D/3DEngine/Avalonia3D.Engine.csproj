@@ -1,0 +1,49 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net8.0-browser</TargetFrameworks>
+    <RootNamespace>ThreeDEngine</RootNamespace>
+    <AssemblyName>Avalonia3D.Engine</AssemblyName>
+    <PackageId>Avalonia3D.Engine</PackageId>
+    <Description>Convenience aggregate package for the Avalonia3D runtime stack.</Description>
+    <IsPackable>true</IsPackable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageReleaseNotes>See CHANGELOG.md.</PackageReleaseNotes>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <DefineConstants>$(DefineConstants);AVALONIA3D_ENGINE_AGGREGATE</DefineConstants>
+    <DefineConstants Condition="'$(TargetFramework)' == 'net8.0-browser'">$(DefineConstants);AVALONIA3D_BROWSER</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Compatibility/**/*.cs" />
+    <ProjectReference Include="Avalonia3D.Core.csproj" />
+    <ProjectReference Include="Avalonia3D.Assets.Gltf.csproj" />
+    <ProjectReference Include="Avalonia3D.Physics.Jitter2.csproj" />
+    <ProjectReference Include="Avalonia3D.Avalonia.csproj" />
+    <ProjectReference Include="Avalonia3D.OpenGL.csproj" Condition="'$(TargetFramework)' == 'net8.0'" />
+    <ProjectReference Include="Avalonia3D.WebGL.csproj" Condition="'$(TargetFramework)' == 'net8.0-browser'" />
+    <None Update="README.md" Pack="true" PackagePath="/" />
+    <None Update="CHANGELOG.md" Pack="true" PackagePath="/" />
+    <None Update="DEVELOPMENT_STATE.md" Pack="true" PackagePath="/" />
+    <None Update="PERFORMANCE.md" Pack="true" PackagePath="/" />
+    <None Update="BUILDING.md" Pack="true" PackagePath="/" />
+    <None Update="WORLD_OWNERSHIP.md" Pack="true" PackagePath="/" />
+    <None Update="KNOWN_PERFORMANCE_ISSUES.md" Pack="true" PackagePath="/" />
+    <None Update="STAGE1_HANDOFF.md" Pack="true" PackagePath="/" />
+    <None Update="STAGE1_DEBUG_PASS2_HANDOFF.md" Pack="true" PackagePath="/" />
+    <None Update="STAGE2_HANDOFF.md" Pack="true" PackagePath="/" />
+    <None Update="STAGE3_HANDOFF.md" Pack="true" PackagePath="/" />
+    <None Update="STAGE4_HANDOFF.md" Pack="true" PackagePath="/" />
+    <None Update="STAGE5_HANDOFF.md" Pack="true" PackagePath="/" />
+    <None Update="FINAL_HARDENING_HANDOFF.md" Pack="true" PackagePath="/" />
+    <None Update="source-manifest.sha256" Pack="true" PackagePath="/" />
+    <None Update="RHI_ARCHITECTURE.md" Pack="true" PackagePath="/" />
+    <None Update="GPU_DRIVEN_RENDERER.md" Pack="true" PackagePath="/" />
+    <None Update="ASSET_STREAMING.md" Pack="true" PackagePath="/" />
+    <None Update="EXTENSIONS.md" Pack="true" PackagePath="/" />
+    <None Update="SCENE_SERIALIZATION.md" Pack="true" PackagePath="/" />
+    <None Update="GPU_PICKING.md" Pack="true" PackagePath="/" />
+    <None Update="PRODUCTION_ACCEPTANCE.md" Pack="true" PackagePath="/" />
+    <None Update="RELEASE_CHECKLIST.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+</Project>

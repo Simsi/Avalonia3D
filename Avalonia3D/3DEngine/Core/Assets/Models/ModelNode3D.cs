@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using ThreeDEngine.Core.Validation;
 using System.Numerics;
 using ThreeDEngine.Core.Collision;
 
@@ -18,15 +20,23 @@ public sealed class ModelNode3D
         string path,
         int? skinIndex = null)
     {
-        Index = index;
+        Index = Guard3D.NonNegative(index, nameof(index));
         Name = string.IsNullOrWhiteSpace(name) ? $"Node_{index}" : name;
-        ParentIndex = parentIndex;
-        MeshIndex = meshIndex;
-        LocalTransform = localTransform;
-        WorldTransform = worldTransform;
-        ChildIndices = childIndices ?? Array.Empty<int>();
+        ParentIndex = ValidateOptionalIndex(parentIndex, nameof(parentIndex));
+        MeshIndex = ValidateOptionalIndex(meshIndex, nameof(meshIndex));
+        LocalTransform = Guard3D.FiniteMatrix(localTransform, nameof(localTransform), requireInvertible: true);
+        WorldTransform = Guard3D.FiniteMatrix(worldTransform, nameof(worldTransform), requireInvertible: true);
+        var children = (childIndices ?? throw new ArgumentNullException(nameof(childIndices))).ToArray();
+        for (var i = 0; i < children.Length; i++) Guard3D.NonNegative(children[i], nameof(childIndices));
+        ChildIndices = Array.AsReadOnly(children);
         Path = string.IsNullOrWhiteSpace(path) ? Name : path;
-        SkinIndex = skinIndex;
+        SkinIndex = ValidateOptionalIndex(skinIndex, nameof(skinIndex));
+    }
+
+    private static int? ValidateOptionalIndex(int? value, string name)
+    {
+        if (!value.HasValue || value.Value == -1) return null;
+        return Guard3D.NonNegative(value.Value, name);
     }
 
     public int Index { get; }

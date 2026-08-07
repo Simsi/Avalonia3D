@@ -2,20 +2,62 @@ using System;
 using System.Numerics;
 using ThreeDEngine.Core.Math;
 using ThreeDEngine.Core.Scene;
+using ThreeDEngine.Core.Validation;
 
 namespace ThreeDEngine.Core.Collision;
 
 public sealed class PlaneCollider3D : Collider3D
 {
-    public Vector3 LocalNormal { get; set; } = Vector3.UnitY;
-    public float Offset { get; set; }
-    public Vector2 Size { get; set; } = new Vector2(10f, 10f);
-    public float Thickness { get; set; } = 0.01f;
+    private Vector3 _localNormal = Vector3.UnitY;
+    private float _offset;
+    private Vector2 _size = new(10f, 10f);
+    private float _thickness = 0.01f;
+
+    public Vector3 LocalNormal
+    {
+        get => _localNormal;
+        set
+        {
+            using var mutation = EnterMutationScope();
+            value = Guard3D.Finite(value, nameof(value));
+            if (value.LengthSquared() <= 0.000001f) throw new ArgumentOutOfRangeException(nameof(value), value, "Plane normal must be non-zero.");
+            value = Vector3.Normalize(value);
+            if (_localNormal == value) return;
+            _localNormal = value;
+            RaiseChanged();
+        }
+    }
+
+    public float Offset
+    {
+        get => _offset;
+        set { using var mutation = EnterMutationScope(); value = Guard3D.Finite(value, nameof(value)); if (MathF.Abs(_offset - value) < 0.000001f) return; _offset = value; RaiseChanged(); }
+    }
+
+    public Vector2 Size
+    {
+        get => _size;
+        set
+        {
+            using var mutation = EnterMutationScope();
+            value = Guard3D.Finite(value, nameof(value));
+            if (value.X <= 0f || value.Y <= 0f) throw new ArgumentOutOfRangeException(nameof(value), value, "Plane dimensions must be positive.");
+            if (_size == value) return;
+            _size = value;
+            RaiseChanged();
+        }
+    }
+
+    public float Thickness
+    {
+        get => _thickness;
+        set { using var mutation = EnterMutationScope(); value = Guard3D.Positive(value, nameof(value)); if (MathF.Abs(_thickness - value) < 0.000001f) return; _thickness = value; RaiseChanged(); }
+    }
 
     public override Bounds3D GetWorldBounds(Object3D owner)
     {
         var normal = GetSafeNormal();
-        var thickness = System.MathF.Max(Thickness, 0.001f) * 0.5f;
+        var thickness = Thickness * 0.5f;
         Vector3 half;
         if (System.MathF.Abs(normal.Z) >= System.MathF.Abs(normal.X) && System.MathF.Abs(normal.Z) >= System.MathF.Abs(normal.Y))
         {
@@ -81,10 +123,7 @@ public sealed class PlaneCollider3D : Collider3D
         return true;
     }
 
-    private Vector3 GetSafeNormal()
-    {
-        return LocalNormal.LengthSquared() < 0.000001f ? Vector3.UnitY : Vector3.Normalize(LocalNormal);
-    }
+    private Vector3 GetSafeNormal() => LocalNormal;
 
     private bool IsInsidePlaneArea(Vector3 p, Vector3 normal)
     {

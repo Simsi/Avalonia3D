@@ -1,5 +1,6 @@
 using System;
 using System.Numerics;
+using ThreeDEngine.Core.Validation;
 
 namespace ThreeDEngine.Core.Assets.Models;
 
@@ -79,6 +80,7 @@ internal sealed class ModelAnimationEvaluatorRuntime3D
 
     public ModelAnimationPose3D Evaluate(AnimationClip3D? clip, float timeSeconds)
     {
+        Guard3D.Finite(timeSeconds, nameof(timeSeconds));
         var nodeCount = _asset.Nodes.Count;
         if (nodeCount == 0) return ModelAnimationPose3D.Empty;
 
@@ -98,7 +100,10 @@ internal sealed class ModelAnimationEvaluatorRuntime3D
             foreach (var channel in clip.Channels)
             {
                 var nodeIndex = channel.TargetNodeIndex;
-                if ((uint)nodeIndex >= (uint)nodeCount || !_baseHasTrs[nodeIndex]) continue;
+                if ((uint)nodeIndex >= (uint)nodeCount)
+                    throw new InvalidOperationException($"Animation channel targets node index {nodeIndex}, which is outside the asset node catalog.");
+                if (!_baseHasTrs[nodeIndex])
+                    throw new InvalidOperationException($"Animation channel targets node '{_asset.Nodes[nodeIndex].Name}', whose local matrix cannot be decomposed into TRS components.");
                 switch (channel.Path)
                 {
                     case AnimationPath3D.Translation:
@@ -137,7 +142,9 @@ internal sealed class ModelAnimationEvaluatorRuntime3D
             for (var b = 0; b < skin.BoneCount && b < matrices.Length; b++)
             {
                 var bone = skin.Bones[b];
-                var jointWorld = bone.NodeIndex >= 0 && bone.NodeIndex < _world.Length ? _world[bone.NodeIndex] : Matrix4x4.Identity;
+                if ((uint)bone.NodeIndex >= (uint)_world.Length)
+                    throw new InvalidOperationException($"Skin {skin.Index} bone {bone.Index} targets node index {bone.NodeIndex}, which is outside the evaluated pose.");
+                var jointWorld = _world[bone.NodeIndex];
                 // System.Numerics is used consistently as row-vector math in this engine
                 // (local * parent for hierarchical transforms). The glTF column-vector
                 // skinning formula is jointGlobal * inverseBind. The row-vector equivalent
@@ -147,6 +154,7 @@ internal sealed class ModelAnimationEvaluatorRuntime3D
             }
         }
 
+        _pose.Reset(_world, _skinMatrices);
         return _pose;
 
         void Visit(int index)
@@ -154,18 +162,17 @@ internal sealed class ModelAnimationEvaluatorRuntime3D
             if ((uint)index >= (uint)nodeCount) return;
             if (_visitState[index] == 2) return;
             if (_visitState[index] == 1)
-            {
-                _world[index] = _local[index];
-                _visitState[index] = 2;
-                return;
-            }
+                throw new InvalidOperationException($"Model node hierarchy contains a cycle at node {index} ('{_asset.Nodes[index].Name}').");
 
             _visitState[index] = 1;
             var node = _asset.Nodes[index];
-            if (node.ParentIndex.HasValue && node.ParentIndex.Value >= 0 && node.ParentIndex.Value < nodeCount && node.ParentIndex.Value != index)
+            if (node.ParentIndex.HasValue)
             {
-                Visit(node.ParentIndex.Value);
-                _world[index] = _local[index] * _world[node.ParentIndex.Value];
+                var parentIndex = node.ParentIndex.Value;
+                if ((uint)parentIndex >= (uint)nodeCount || parentIndex == index)
+                    throw new InvalidOperationException($"Model node {index} ('{node.Name}') has invalid parent index {parentIndex}.");
+                Visit(parentIndex);
+                _world[index] = _local[index] * _world[parentIndex];
             }
             else
             {

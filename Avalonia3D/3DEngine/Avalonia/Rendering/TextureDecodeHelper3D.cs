@@ -12,8 +12,6 @@ internal readonly record struct DecodedTexture3D(int Width, int Height, byte[] R
 
 internal static class TextureDecodeHelper3D
 {
-    private const int MaxTextureDimension = 4096;
-
     public static bool TryDecodeRgba(byte[]? encoded, out DecodedTexture3D decoded, out string error)
     {
         decoded = default;
@@ -35,12 +33,6 @@ internal static class TextureDecodeHelper3D
                 error = "Decoded texture has invalid dimensions.";
                 return false;
             }
-            if (width > MaxTextureDimension || height > MaxTextureDimension)
-            {
-                error = $"Decoded texture {width}x{height} exceeds {MaxTextureDimension}x{MaxTextureDimension}.";
-                return false;
-            }
-
             var stride = width * 4;
             var bufferSize = stride * height;
             var bgraPixels = new byte[bufferSize];

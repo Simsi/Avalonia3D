@@ -23,8 +23,6 @@ public sealed class ScenePerformanceOptions
     // picking returns a conservative bounds hit without touching CPU skinning buffers.
     public bool UseConservativeSkinnedPicking { get; set; }
 
-    public bool AllowPickingFullScanFallback { get; set; } = true;
-    public int MaxPickingFullScanFallbackObjects { get; set; } = 5000;
     public bool EnableRegistryHotPath { get; set; } = true;
     public bool EnableSpatialBroadphase { get; set; } = true;
     public bool EnableHighScaleChunks { get; set; } = true;
@@ -95,8 +93,6 @@ public sealed class ScenePerformanceOptions
         EnableDistanceFade = true,
         PreferColliderPicking = true,
         UseConservativeSkinnedPicking = true,
-        AllowPickingFullScanFallback = false,
-        MaxPickingFullScanFallbackObjects = 5000,
         EnableRegistryHotPath = true,
         EnableSpatialBroadphase = true,
         EnableHighScaleChunks = true,

@@ -24,7 +24,7 @@ namespace ThreeDEngine.Core.Physics.Jitter2;
 /// Avalonia3D production physics backend backed by Jitter Physics 2.
 /// Rendering stays owned by Avalonia3D; this class owns the physics world and synchronizes transforms.
 /// </summary>
-public sealed class Jitter2PhysicsCore : IPhysicsCore, IDisposable
+public sealed class Jitter2PhysicsCore : IPhysicsCore
 {
     private readonly JWorld _world = new();
     private readonly Dictionary<Object3D, BodyEntry> _entries = new();
@@ -36,87 +36,82 @@ public sealed class Jitter2PhysicsCore : IPhysicsCore, IDisposable
     private float _fixedTimeStep = 1f / 120f;
     private int _maxStepsPerFrame = 8;
     private float _maxFrameDeltaSeconds = 0.25f;
-    private int _lastRegistryVersion = -1;
+    private long _lastRegistryVersion = -1;
     private bool _disposed;
 
     public Jitter2PhysicsCore()
     {
         _world.AllowDeactivation = true;
-        if (OperatingSystem.IsBrowser())
-        {
-            // WASM/browser must use a lower-cost default physics profile. This is an engine-level
-            // backend profile, not demo content trimming: the same rigid bodies remain active, but
-            // Jitter2 avoids the desktop-only 120Hz/4-substep contact budget and the post-step
-            // ground probe pass unless callers explicitly re-enable them.
-            _world.SubstepCount = 1;
-            _world.SolverIterations = (solver: 7, relaxation: 2);
-            FixedTimeStep = 1f / 60f;
-            MaxStepsPerFrame = 2;
-            MaxFrameDeltaSeconds = 1f / 20f;
-            EnableGroundProbe = false;
-        }
-        else
-        {
-            _world.SubstepCount = 4;
-            _world.SolverIterations = (solver: 12, relaxation: 4);
-        }
+        _world.SubstepCount = 4;
+        _world.SolverIterations = (solver: 12, relaxation: 4);
     }
 
     public Vector3 Gravity { get; set; } = new(0f, -9.81f, 0f);
 
-    /// <summary>Fixed physics integration step. 1/120 gives stable contact stacks without excessive latency.</summary>
+    /// <summary>Fixed physics integration step shared by desktop and browser.</summary>
     public float FixedTimeStep
     {
         get => _fixedTimeStep;
-        set => _fixedTimeStep = OperatingSystem.IsBrowser()
-            ? global::System.Math.Clamp(value, 1f / 60f, 1f / 30f)
-            : global::System.Math.Clamp(value, 1f / 500f, 1f / 30f);
+        set
+        {
+            if (!float.IsFinite(value) || value < 1f / 500f || value > 1f / 30f)
+                throw new ArgumentOutOfRangeException(nameof(value), value, "Fixed physics step must be finite and between 1/500 and 1/30 second.");
+            _fixedTimeStep = value;
+        }
     }
 
     public int MaxStepsPerFrame
     {
         get => _maxStepsPerFrame;
-        set => _maxStepsPerFrame = OperatingSystem.IsBrowser()
-            ? global::System.Math.Clamp(value, 1, 2)
-            : global::System.Math.Max(1, value);
+        set
+        {
+            if (value < 1 || value > 128) throw new ArgumentOutOfRangeException(nameof(value));
+            _maxStepsPerFrame = value;
+        }
     }
 
     public float MaxFrameDeltaSeconds
     {
         get => _maxFrameDeltaSeconds;
-        set => _maxFrameDeltaSeconds = OperatingSystem.IsBrowser()
-            ? global::System.Math.Clamp(value, 1f / 60f, 1f / 20f)
-            : global::System.Math.Clamp(value, 1f / 240f, 0.25f);
+        set
+        {
+            if (!float.IsFinite(value) || value < 1f / 240f || value > 0.25f)
+                throw new ArgumentOutOfRangeException(nameof(value), value, "Maximum physics frame delta must be finite and between 1/240 and 0.25 second.");
+            _maxFrameDeltaSeconds = value;
+        }
     }
 
     public bool UseMultithreading { get; set; }
 
-    /// <summary>
-    /// Ground probing is useful for person navigation, but it is an O(dynamic * collider)
-    /// raycast pass after every physics frame. Browser defaults disable it for substantially
-    /// lower WASM CPU cost; person-navigation scenes can opt back in.
-    /// </summary>
+    /// <summary>Enables support-surface probing after physics integration.</summary>
     public bool EnableGroundProbe { get; set; } = true;
 
     public int SubstepCount
     {
         get => _world.SubstepCount;
-        set => _world.SubstepCount = OperatingSystem.IsBrowser()
-            ? global::System.Math.Clamp(value, 1, 2)
-            : global::System.Math.Max(1, value);
+        set
+        {
+            if (value < 1 || value > 32) throw new ArgumentOutOfRangeException(nameof(value));
+            _world.SubstepCount = value;
+        }
     }
 
     public (int solver, int relaxation) SolverIterations
     {
         get => _world.SolverIterations;
-        set => _world.SolverIterations = OperatingSystem.IsBrowser()
-            ? (global::System.Math.Clamp(value.solver, 1, 8), global::System.Math.Clamp(value.relaxation, 0, 2))
-            : (global::System.Math.Max(1, value.solver), global::System.Math.Max(0, value.relaxation));
+        set
+        {
+            if (value.solver < 1 || value.solver > 128) throw new ArgumentOutOfRangeException(nameof(value));
+            if (value.relaxation < 0 || value.relaxation > 128) throw new ArgumentOutOfRangeException(nameof(value));
+            _world.SolverIterations = value;
+        }
     }
 
     public void Step(Scene3D scene, float deltaSeconds)
     {
-        if (_disposed || scene is null || deltaSeconds <= 0f || !float.IsFinite(deltaSeconds)) return;
+        ThrowIfDisposed();
+        if (scene is null) throw new ArgumentNullException(nameof(scene));
+        if (deltaSeconds <= 0f || !float.IsFinite(deltaSeconds)) return;
 
         EnsureBodies(scene);
 
@@ -132,7 +127,9 @@ public sealed class Jitter2PhysicsCore : IPhysicsCore, IDisposable
         while (_accumulator >= fixedDt && steps < MaxStepsPerFrame)
         {
             ApplyPendingForcesAndImpulses();
+            CaptureAngularVelocitiesBeforeStep();
             _world.Step(fixedDt, UseMultithreading);
+            ApplyAngularResponseControls(fixedDt);
             ClampJitterVelocities();
             _accumulator -= fixedDt;
             steps++;
@@ -152,8 +149,10 @@ public sealed class Jitter2PhysicsCore : IPhysicsCore, IDisposable
 
     public IReadOnlyList<RaycastHit3D> RaycastAll(Scene3D scene, Ray ray)
     {
+        ThrowIfDisposed();
+        if (scene is null) throw new ArgumentNullException(nameof(scene));
         _raycastBuffer.Clear();
-        if (_disposed || scene is null || ray.Direction.LengthSquared() <= 0.0000001f) return Array.Empty<RaycastHit3D>();
+        if (ray.Direction.LengthSquared() <= 0.0000001f) return Array.Empty<RaycastHit3D>();
 
         EnsureBodies(scene);
         PushApplicationStateToJitter(0f);
@@ -190,6 +189,11 @@ public sealed class Jitter2PhysicsCore : IPhysicsCore, IDisposable
         _disposed = true;
         _entries.Clear();
         _world.Dispose();
+    }
+
+    private void ThrowIfDisposed()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
     }
 
     private void EnsureBodies(Scene3D scene)
@@ -459,6 +463,64 @@ public sealed class Jitter2PhysicsCore : IPhysicsCore, IDisposable
         }
     }
 
+    private void CaptureAngularVelocitiesBeforeStep()
+    {
+        foreach (var pair in _entries)
+        {
+            var entry = pair.Value;
+            entry.AngularVelocityBeforeStep = ToSystem(entry.Body.AngularVelocity);
+        }
+    }
+
+    private void ApplyAngularResponseControls(float deltaSeconds)
+    {
+        foreach (var pair in _entries)
+        {
+            var entry = pair.Value;
+            var rb = pair.Key.Rigidbody;
+            if (rb is null || rb.IsKinematic || entry.Body.MotionType != JMotionType.Dynamic) continue;
+
+            var angular = ToSystem(entry.Body.AngularVelocity);
+            if (!NearlyEqual(rb.CollisionTorqueScale, 1f))
+            {
+                angular = entry.AngularVelocityBeforeStep +
+                    (angular - entry.AngularVelocityBeforeStep) * rb.CollisionTorqueScale;
+            }
+
+            if (rb.RollingFriction > 0f && rb.IsGrounded)
+            {
+                var normal = rb.GroundNormal.LengthSquared() > 0.000001f
+                    ? Vector3.Normalize(rb.GroundNormal)
+                    : Vector3.UnitY;
+                var gravityAlongNormal = global::System.Math.Abs(Vector3.Dot(Gravity, normal));
+                if (gravityAlongNormal <= 0.0001f) gravityAlongNormal = Gravity.Length();
+
+                var linear = ToSystem(entry.Body.Velocity);
+                var normalVelocity = normal * Vector3.Dot(linear, normal);
+                var tangentVelocity = linear - normalVelocity;
+                var linearDrop = rb.RollingFriction * gravityAlongNormal * deltaSeconds;
+                tangentVelocity = MoveTowardsZero(tangentVelocity, linearDrop);
+                entry.Body.Velocity = ToJ(normalVelocity + tangentVelocity);
+
+                var radius = rb.RollingRadius > 0f ? rb.RollingRadius : entry.EstimatedRollingRadius;
+                angular = MoveTowardsZero(angular, linearDrop / global::System.Math.Max(radius, 0.0001f));
+            }
+
+            entry.Body.AngularVelocity = rb.FreezeRotation ? JVector.Zero : ToJ(angular);
+        }
+    }
+
+    private static Vector3 MoveTowardsZero(Vector3 value, float maximumDelta)
+    {
+        if (maximumDelta <= 0f) return value;
+        var length = value.Length();
+        if (length <= maximumDelta || length <= 0.000001f) return Vector3.Zero;
+        return value * ((length - maximumDelta) / length);
+    }
+
+    private static bool NearlyEqual(float left, float right)
+        => global::System.Math.Abs(left - right) <= 0.000001f;
+
     private void ClampJitterVelocities()
     {
         foreach (var pair in _entries)
@@ -663,6 +725,10 @@ public sealed class Jitter2PhysicsCore : IPhysicsCore, IDisposable
             ColliderReference = collider;
             RigidbodyReference = rigidbody;
             Signature = signature;
+            var bounds = obj.GetWorldBounds();
+            var size = bounds.IsValid ? Vector3.Abs(bounds.Size) : Vector3.One;
+            var horizontalDiameter = global::System.Math.Min(size.X, size.Z);
+            EstimatedRollingRadius = global::System.Math.Max(0.0001f, horizontalDiameter * 0.5f);
         }
 
         public JRigidBody Body { get; }
@@ -676,6 +742,8 @@ public sealed class Jitter2PhysicsCore : IPhysicsCore, IDisposable
         public int LastConfigurationVersion { get; set; } = -1;
         public int LastVelocityVersionApplied { get; set; } = -1;
         public int LastForceVersionApplied { get; set; } = -1;
+        public float EstimatedRollingRadius { get; }
+        public Vector3 AngularVelocityBeforeStep { get; set; }
         public Vector3 LastKinematicPosition { get; set; }
         public Quaternion LastKinematicRotation { get; set; } = Quaternion.Identity;
     }

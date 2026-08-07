@@ -6,7 +6,7 @@ namespace ThreeDEngine.Core.Rendering;
 /// <summary>
 /// Future instancing key: renderers should group instances by mesh/material/lighting state.
 /// </summary>
-public readonly struct RenderBatchKey : IEquatable<RenderBatchKey>
+internal readonly struct RenderBatchKey : IEquatable<RenderBatchKey>
 {
     public RenderBatchKey(MeshResourceKey meshKey, string materialKey, int lightingMode, int surfaceMode)
     {

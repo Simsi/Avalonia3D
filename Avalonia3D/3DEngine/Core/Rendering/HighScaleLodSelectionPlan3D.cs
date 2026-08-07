@@ -7,7 +7,7 @@ namespace ThreeDEngine.Core.Rendering;
 /// Backend-neutral high-scale LOD selection result. It is reused as scratch to avoid
 /// duplicating detailed/simplified/proxy/billboard partitioning in renderer backends.
 /// </summary>
-public sealed class HighScaleLodSelectionPlan3D
+internal sealed class HighScaleLodSelectionPlan3D
 {
     public List<int> Detailed { get; } = new(256);
     public List<int> Simplified { get; } = new(256);

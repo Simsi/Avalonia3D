@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>Avalonia3D.Engine.Benchmarks</AssemblyName>
+    <IsPackable>false</IsPackable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <Optimize>true</Optimize>
+    <TieredPGO>true</TieredPGO>
+    <DefineConstants>$(DefineConstants);AVALONIA3D_BENCHMARK_HOST</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <ProjectReference Include="../Avalonia3D.Engine.csproj" />
+  </ItemGroup>
+</Project>

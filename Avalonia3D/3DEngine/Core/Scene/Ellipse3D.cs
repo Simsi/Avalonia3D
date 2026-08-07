@@ -1,6 +1,7 @@
 using System;
 using ThreeDEngine.Core.Collision;
 using ThreeDEngine.Core.Geometry;
+using ThreeDEngine.Core.Validation;
 
 namespace ThreeDEngine.Core.Scene;
 
@@ -21,7 +22,7 @@ public sealed class Ellipse3D : Object3D
         get => _width;
         set
         {
-            value = System.MathF.Max(value, 0.01f);
+            value = Guard3D.Positive(value, nameof(Width));
             if (System.MathF.Abs(_width - value) < float.Epsilon) return;
             _width = value;
             UpdateColliderSize();
@@ -34,7 +35,7 @@ public sealed class Ellipse3D : Object3D
         get => _height;
         set
         {
-            value = System.MathF.Max(value, 0.01f);
+            value = Guard3D.Positive(value, nameof(Height));
             if (System.MathF.Abs(_height - value) < float.Epsilon) return;
             _height = value;
             UpdateColliderSize();
@@ -45,13 +46,13 @@ public sealed class Ellipse3D : Object3D
     public float RadiusX
     {
         get => Width * 0.5f;
-        set => Width = System.MathF.Max(value, 0.005f) * 2f;
+        set => Width = Guard3D.Positive(value, nameof(RadiusX)) * 2f;
     }
 
     public float RadiusY
     {
         get => Height * 0.5f;
-        set => Height = System.MathF.Max(value, 0.005f) * 2f;
+        set => Height = Guard3D.Positive(value, nameof(RadiusY)) * 2f;
     }
 
     public float Depth
@@ -59,7 +60,7 @@ public sealed class Ellipse3D : Object3D
         get => _depth;
         set
         {
-            value = System.MathF.Max(value, 0.001f);
+            value = Guard3D.Positive(value, nameof(Depth));
             if (System.MathF.Abs(_depth - value) < float.Epsilon) return;
             _depth = value;
             UpdateColliderSize();
@@ -72,14 +73,14 @@ public sealed class Ellipse3D : Object3D
         get => _segments;
         set
         {
-            value = System.Math.Max(value, 12);
+            value = value >= 12 ? value : throw new ArgumentOutOfRangeException(nameof(Segments), value, "Ellipse segments must be at least 12.");
             if (_segments == value) return;
             _segments = value;
             MarkGeometryDirty();
         }
     }
 
-    protected override Mesh3D BuildMesh() => MeshCache3D.Shared.GetOrCreate(
+    protected override Mesh3D BuildMesh() => GetOrCreateCachedMesh(
         MeshResourceKey.Ellipse(Width, Height, Depth, Segments),
         () => MeshFactory.CreateExtrudedEllipse(Width, Height, Depth, Segments));
 

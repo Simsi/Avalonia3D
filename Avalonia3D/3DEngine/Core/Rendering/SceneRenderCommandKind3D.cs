@@ -1,6 +1,6 @@
 namespace ThreeDEngine.Core.Rendering;
 
-public enum SceneRenderCommandKind3D
+internal enum SceneRenderCommandKind3D
 {
     OrdinaryBatch = 0,
     TransparentOrdinaryItem = 1,

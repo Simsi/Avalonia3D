@@ -14,5 +14,6 @@ public enum SceneChangeKind
     Lighting = 9,
     Debug = 10,
     HighScaleState = 11,
-    AnimationPose = 12
+    AnimationPose = 12,
+    Metadata = 13
 }

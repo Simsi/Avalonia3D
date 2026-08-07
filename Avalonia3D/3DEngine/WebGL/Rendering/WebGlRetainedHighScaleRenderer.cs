@@ -37,7 +37,9 @@ internal sealed class WebGlRetainedHighScaleRenderer
 
     public void MarkDirty(SceneChangedEventArgs change)
     {
-        if (change.Kind == SceneChangeKind.Structure || change.Kind == SceneChangeKind.Visibility || change.Kind == SceneChangeKind.HighScaleState)
+        if (change.Contains(SceneChangeKind.Structure) ||
+            change.Contains(SceneChangeKind.Visibility) ||
+            change.Contains(SceneChangeKind.HighScaleState))
         {
             _version++;
         }
@@ -59,7 +61,7 @@ internal sealed class WebGlRetainedHighScaleRenderer
 
             SceneHighScaleRenderPlanner3D.EnsureChunks(layer);
 
-            var visibleChunks = layer.Chunks.QueryVisible(viewProjection);
+            var visibleChunks = layer.QueryVisibleChunks(viewProjection);
             stats.TotalChunkCount += layer.Chunks.Chunks.Count;
             var visibleChunkLimit = SceneHighScaleRenderPlanner3D.ResolveVisibleChunkLimit(scene.Performance, visibleChunks.Count);
             stats.VisibleChunkCount += visibleChunkLimit;

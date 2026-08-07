@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Numerics;
 
 namespace ThreeDEngine.Core.Geometry.Surfaces;
@@ -9,11 +10,11 @@ namespace ThreeDEngine.Core.Geometry.Surfaces;
 /// </summary>
 public static class TangentGenerator3D
 {
-    public static Vector3[] GenerateNormals(Vector3[] positions, int[] indices)
+    public static Vector3[] GenerateNormals(Vector3[] positions, IReadOnlyList<int> indices)
     {
         if (positions.Length == 0) return Array.Empty<Vector3>();
         var normals = new Vector3[positions.Length];
-        for (var i = 0; i + 2 < indices.Length; i += 3)
+        for (var i = 0; i + 2 < indices.Count; i += 3)
         {
             var i0 = indices[i];
             var i1 = indices[i + 1];
@@ -38,14 +39,14 @@ public static class TangentGenerator3D
         return normals;
     }
 
-    public static Vector4[] GenerateTangents(Vector3[] positions, Vector3[] normals, Vector2[] texCoords0, int[] indices)
+    public static Vector4[] GenerateTangents(Vector3[] positions, Vector3[] normals, Vector2[] texCoords0, IReadOnlyList<int> indices)
     {
         if (positions.Length == 0 || texCoords0.Length != positions.Length) return Array.Empty<Vector4>();
         var resolvedNormals = normals.Length == positions.Length ? normals : GenerateNormals(positions, indices);
         var tan1 = new Vector3[positions.Length];
         var tan2 = new Vector3[positions.Length];
 
-        for (var i = 0; i + 2 < indices.Length; i += 3)
+        for (var i = 0; i + 2 < indices.Count; i += 3)
         {
             var i1 = indices[i];
             var i2 = indices[i + 1];
@@ -99,22 +100,32 @@ public static class TangentGenerator3D
         return result;
     }
 
-    public static int[] BuildWireframeIndices(int[] triangleIndices)
+    public static int[] BuildWireframeIndices(IReadOnlyList<int> triangleIndices)
     {
-        if (triangleIndices.Length < 3) return Array.Empty<int>();
-        var edges = new int[(triangleIndices.Length / 3) * 6];
-        var cursor = 0;
-        for (var i = 0; i + 2 < triangleIndices.Length; i += 3)
+        if (triangleIndices.Count < 3) return Array.Empty<int>();
+        var unique = new HashSet<long>();
+        var edges = new List<int>(triangleIndices.Count * 2);
+        for (var i = 0; i + 2 < triangleIndices.Count; i += 3)
         {
             var a = triangleIndices[i];
             var b = triangleIndices[i + 1];
             var c = triangleIndices[i + 2];
-            edges[cursor++] = a; edges[cursor++] = b;
-            edges[cursor++] = b; edges[cursor++] = c;
-            edges[cursor++] = c; edges[cursor++] = a;
+            AddEdge(a, b);
+            AddEdge(b, c);
+            AddEdge(c, a);
         }
 
-        return edges;
+        return edges.ToArray();
+
+        void AddEdge(int first, int second)
+        {
+            var min = global::System.Math.Min(first, second);
+            var max = global::System.Math.Max(first, second);
+            var key = ((long)min << 32) | (uint)max;
+            if (!unique.Add(key)) return;
+            edges.Add(first);
+            edges.Add(second);
+        }
     }
 
     private static bool IsValidTriangleIndex(int i0, int i1, int i2, int vertexCount)

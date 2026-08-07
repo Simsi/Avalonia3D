@@ -39,5 +39,7 @@ public readonly struct MeshResourceKey : IEquatable<MeshResourceKey>
     public static MeshResourceKey Sphere(float radius, int segments, int rings)
         => new("sphere:" + F(radius) + ":" + segments + ":" + rings);
 
-    private static string F(float value) => MathF.Round(value, 4).ToString("0.####", CultureInfo.InvariantCulture);
+    // Round-trip formatting preserves every distinct finite Single value. Quantizing cache keys
+    // silently reused geometry with different dimensions (for example 1.00001f and 1.00002f).
+    private static string F(float value) => value.ToString("R", CultureInfo.InvariantCulture);
 }

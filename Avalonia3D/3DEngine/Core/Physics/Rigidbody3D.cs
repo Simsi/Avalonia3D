@@ -1,4 +1,7 @@
+using System;
 using System.Numerics;
+using ThreeDEngine.Core.Validation;
+using ThreeDEngine.Core.Scene;
 
 namespace ThreeDEngine.Core.Physics;
 
@@ -9,6 +12,7 @@ namespace ThreeDEngine.Core.Physics;
 /// </summary>
 public sealed class Rigidbody3D
 {
+    internal Object3D? Owner { get; set; }
     private float _mass = 1f;
     private Vector3 _velocity;
     private Vector3 _angularVelocity;
@@ -20,13 +24,13 @@ public sealed class Rigidbody3D
     private bool _autoComputeInertiaTensor = true;
     private float _restitution = 0.15f;
     private float _friction = 0.65f;
-    private float _rollingFriction = 0.015f;
+    private float _rollingFriction;
+    private float _collisionTorqueScale = 1f;
+    private float _rollingRadius;
     private float _linearDamping = 0.002f;
     private float _angularDamping = 0.005f;
     private float _maxAngularSpeed = 96f;
     private float _maxLinearSpeed = 128f;
-    private float _collisionTorqueScale = 1f;
-    private float _rollingRadius;
     private bool _generateContactRotation = true;
     private bool _deriveKinematicVelocityFromTransform = true;
     private bool _integrateKinematicVelocity;
@@ -49,177 +53,243 @@ public sealed class Rigidbody3D
     internal int ConfigurationVersion { get; private set; }
     internal int VelocityVersion { get; private set; }
     internal int ForceVersion { get; private set; }
+    internal bool HasPendingDynamics =>
+        _pendingForce != Vector3.Zero ||
+        _pendingTorque != Vector3.Zero ||
+        _pendingImpulse != Vector3.Zero ||
+        _pendingTorqueImpulse != Vector3.Zero ||
+        _hasPendingForceAtPosition ||
+        _hasPendingImpulseAtPosition;
+
+    /// <summary>
+    /// Raised only when registry membership can change. Runtime velocity/configuration writes
+    /// stay version-based and do not allocate scene change events every simulation step.
+    /// </summary>
+    public event EventHandler? MembershipChanged;
+    internal event EventHandler? ActivityChanged;
 
     public float Mass
     {
         get => _mass;
-        set { var v = SanitizePositive(value, 1f); if (NearlyEqual(_mass, v)) return; _mass = v; ConfigurationVersion++; }
+        set { using var mutation = EnterMutationScope(); var v = Guard3D.Positive(value, nameof(value)); if (NearlyEqual(_mass, v)) return; _mass = v; ConfigurationVersion++; }
     }
 
     public Vector3 Velocity
     {
         get => _velocity;
-        set { var v = Sanitize(value); if (_velocity == v) return; _velocity = v; VelocityVersion++; }
+        set
+        {
+            using var mutation = EnterMutationScope();
+            var v = Guard3D.Finite(value, nameof(value));
+            if (_velocity == v) return;
+            _velocity = v;
+            if (v != Vector3.Zero) IsSleeping = false;
+            VelocityVersion++;
+            NotifyActivityChanged();
+        }
     }
 
     public Vector3 AngularVelocity
     {
         get => _angularVelocity;
-        set { var v = Sanitize(value); if (_angularVelocity == v) return; _angularVelocity = v; VelocityVersion++; }
+        set
+        {
+            using var mutation = EnterMutationScope();
+            var v = Guard3D.Finite(value, nameof(value));
+            if (_angularVelocity == v) return;
+            _angularVelocity = v;
+            if (v != Vector3.Zero) IsSleeping = false;
+            VelocityVersion++;
+            NotifyActivityChanged();
+        }
     }
 
     public bool IsKinematic
     {
         get => _isKinematic;
-        set { if (_isKinematic == value) return; _isKinematic = value; ConfigurationVersion++; VelocityVersion++; }
+        set
+        {
+            using var mutation = EnterMutationScope();
+            if (_isKinematic == value) return;
+            _isKinematic = value;
+            ConfigurationVersion++;
+            VelocityVersion++;
+            MembershipChanged?.Invoke(this, EventArgs.Empty);
+        }
     }
 
     public bool UseGravity
     {
         get => _useGravity;
-        set { if (_useGravity == value) return; _useGravity = value; ConfigurationVersion++; }
+        set
+        {
+            using var mutation = EnterMutationScope();
+            if (_useGravity == value) return;
+            _useGravity = value;
+            if (value) IsSleeping = false;
+            ConfigurationVersion++;
+            NotifyActivityChanged();
+        }
     }
 
     /// <summary>When true, the body keeps infinite angular inertia in the Jitter solver.</summary>
     public bool FreezeRotation
     {
         get => _freezeRotation;
-        set { if (_freezeRotation == value) return; _freezeRotation = value; ConfigurationVersion++; VelocityVersion++; }
+        set { using var mutation = EnterMutationScope(); if (_freezeRotation == value) return; _freezeRotation = value; ConfigurationVersion++; VelocityVersion++; }
     }
 
     public Vector3 CenterOfMassLocal
     {
         get => _centerOfMassLocal;
-        set { var v = Sanitize(value); if (_centerOfMassLocal == v) return; _centerOfMassLocal = v; ConfigurationVersion++; }
+        set { using var mutation = EnterMutationScope(); var v = Guard3D.Finite(value, nameof(value)); if (_centerOfMassLocal == v) return; _centerOfMassLocal = v; ConfigurationVersion++; }
     }
 
     public Vector3 InertiaTensor
     {
         get => _inertiaTensor;
-        set { var v = Vector3.Max(Sanitize(value), new Vector3(0.0001f)); if (_inertiaTensor == v) return; _inertiaTensor = v; ConfigurationVersion++; }
+        set
+        {
+            using var mutation = EnterMutationScope();
+            var v = Guard3D.Finite(value, nameof(value));
+            if (v.X <= 0f || v.Y <= 0f || v.Z <= 0f) throw new ArgumentOutOfRangeException(nameof(value), value, "Inertia tensor components must be positive.");
+            if (_inertiaTensor == v) return;
+            _inertiaTensor = v;
+            ConfigurationVersion++;
+        }
     }
 
     public bool AutoComputeInertiaTensor
     {
         get => _autoComputeInertiaTensor;
-        set { if (_autoComputeInertiaTensor == value) return; _autoComputeInertiaTensor = value; ConfigurationVersion++; }
+        set { using var mutation = EnterMutationScope(); if (_autoComputeInertiaTensor == value) return; _autoComputeInertiaTensor = value; ConfigurationVersion++; }
     }
 
     public float Restitution
     {
         get => _restitution;
-        set { var v = Clamp(value, 0f, 1f); if (NearlyEqual(_restitution, v)) return; _restitution = v; ConfigurationVersion++; }
+        set { using var mutation = EnterMutationScope(); var v = Guard3D.Range(value, 0f, 1f, nameof(value)); if (NearlyEqual(_restitution, v)) return; _restitution = v; ConfigurationVersion++; }
     }
 
     public float Friction
     {
         get => _friction;
-        set { var v = Clamp(value, 0f, 8f); if (NearlyEqual(_friction, v)) return; _friction = v; ConfigurationVersion++; }
+        set { using var mutation = EnterMutationScope(); var v = Guard3D.Range(value, 0f, 8f, nameof(value)); if (NearlyEqual(_friction, v)) return; _friction = v; ConfigurationVersion++; }
     }
 
-    /// <summary>Kept for API compatibility. Jitter2 handles rolling behavior through contact friction/inertia.</summary>
+    /// <summary>
+    /// Tangential rolling-resistance coefficient applied while the body is grounded.
+    /// The Jitter2 adapter removes linear and angular rolling energy deterministically
+    /// after each solver step instead of storing this value as a compatibility no-op.
+    /// </summary>
     public float RollingFriction
     {
         get => _rollingFriction;
-        set { var v = Clamp(value, 0f, 1f); if (NearlyEqual(_rollingFriction, v)) return; _rollingFriction = v; ConfigurationVersion++; }
+        set { using var mutation = EnterMutationScope(); var v = Guard3D.Range(value, 0f, 1f, nameof(value)); if (NearlyEqual(_rollingFriction, v)) return; _rollingFriction = v; ConfigurationVersion++; }
+    }
+
+    /// <summary>
+    /// Scales the angular-velocity delta produced by one physics solver step.
+    /// Zero suppresses solver-generated angular response; one preserves the native response.
+    /// </summary>
+    public float CollisionTorqueScale
+    {
+        get => _collisionTorqueScale;
+        set { using var mutation = EnterMutationScope(); var v = Guard3D.Range(value, 0f, 4f, nameof(value)); if (NearlyEqual(_collisionTorqueScale, v)) return; _collisionTorqueScale = v; ConfigurationVersion++; }
+    }
+
+    /// <summary>
+    /// Effective rolling radius in world units. A value of zero selects a radius derived
+    /// from the collider bounds. The radius converts linear rolling resistance to angular deceleration.
+    /// </summary>
+    public float RollingRadius
+    {
+        get => _rollingRadius;
+        set { using var mutation = EnterMutationScope(); var v = Guard3D.NonNegative(value, nameof(value)); if (NearlyEqual(_rollingRadius, v)) return; _rollingRadius = v; ConfigurationVersion++; }
     }
 
     public float LinearDamping
     {
         get => _linearDamping;
-        set { var v = Clamp(value, 0f, 1f); if (NearlyEqual(_linearDamping, v)) return; _linearDamping = v; ConfigurationVersion++; }
+        set { using var mutation = EnterMutationScope(); var v = Guard3D.Range(value, 0f, 1f, nameof(value)); if (NearlyEqual(_linearDamping, v)) return; _linearDamping = v; ConfigurationVersion++; }
     }
 
     public float AngularDamping
     {
         get => _angularDamping;
-        set { var v = Clamp(value, 0f, 1f); if (NearlyEqual(_angularDamping, v)) return; _angularDamping = v; ConfigurationVersion++; }
+        set { using var mutation = EnterMutationScope(); var v = Guard3D.Range(value, 0f, 1f, nameof(value)); if (NearlyEqual(_angularDamping, v)) return; _angularDamping = v; ConfigurationVersion++; }
     }
 
     public float MaxAngularSpeed
     {
         get => _maxAngularSpeed;
-        set { var v = SanitizeNonNegative(value, 0f); if (NearlyEqual(_maxAngularSpeed, v)) return; _maxAngularSpeed = v; VelocityVersion++; }
+        set { using var mutation = EnterMutationScope(); var v = Guard3D.NonNegative(value, nameof(value)); if (NearlyEqual(_maxAngularSpeed, v)) return; _maxAngularSpeed = v; VelocityVersion++; }
     }
 
     public float MaxLinearSpeed
     {
         get => _maxLinearSpeed;
-        set { var v = SanitizeNonNegative(value, 0f); if (NearlyEqual(_maxLinearSpeed, v)) return; _maxLinearSpeed = v; VelocityVersion++; }
+        set { using var mutation = EnterMutationScope(); var v = Guard3D.NonNegative(value, nameof(value)); if (NearlyEqual(_maxLinearSpeed, v)) return; _maxLinearSpeed = v; VelocityVersion++; }
     }
 
-    /// <summary>Kept for source compatibility. Jitter2 computes contact torques from shape inertia/contact points.</summary>
-    public float CollisionTorqueScale
-    {
-        get => _collisionTorqueScale;
-        set { var v = SanitizeNonNegative(value, 1f); if (NearlyEqual(_collisionTorqueScale, v)) return; _collisionTorqueScale = v; ConfigurationVersion++; }
-    }
 
-    public float RollingRadius
-    {
-        get => _rollingRadius;
-        set { var v = SanitizeNonNegative(value, 0f); if (NearlyEqual(_rollingRadius, v)) return; _rollingRadius = v; ConfigurationVersion++; }
-    }
 
     public bool GenerateContactRotation
     {
         get => _generateContactRotation;
-        set { if (_generateContactRotation == value) return; _generateContactRotation = value; ConfigurationVersion++; }
+        set { using var mutation = EnterMutationScope(); if (_generateContactRotation == value) return; _generateContactRotation = value; ConfigurationVersion++; }
     }
 
     public bool DeriveKinematicVelocityFromTransform
     {
         get => _deriveKinematicVelocityFromTransform;
-        set { if (_deriveKinematicVelocityFromTransform == value) return; _deriveKinematicVelocityFromTransform = value; ConfigurationVersion++; VelocityVersion++; }
+        set { using var mutation = EnterMutationScope(); if (_deriveKinematicVelocityFromTransform == value) return; _deriveKinematicVelocityFromTransform = value; ConfigurationVersion++; VelocityVersion++; }
     }
 
     public bool IntegrateKinematicVelocity
     {
         get => _integrateKinematicVelocity;
-        set { if (_integrateKinematicVelocity == value) return; _integrateKinematicVelocity = value; ConfigurationVersion++; VelocityVersion++; }
+        set { using var mutation = EnterMutationScope(); if (_integrateKinematicVelocity == value) return; _integrateKinematicVelocity = value; ConfigurationVersion++; VelocityVersion++; }
     }
 
     public bool AllowSleep
     {
         get => _allowSleep;
-        set { if (_allowSleep == value) return; _allowSleep = value; ConfigurationVersion++; }
+        set
+        {
+            using var mutation = EnterMutationScope();
+            if (_allowSleep == value) return;
+            _allowSleep = value;
+            if (!value) IsSleeping = false;
+            ConfigurationVersion++;
+            NotifyActivityChanged();
+        }
     }
 
     public float SleepDelay
     {
         get => _sleepDelay;
-        set { var v = SanitizeNonNegative(value, 1f); if (NearlyEqual(_sleepDelay, v)) return; _sleepDelay = v; ConfigurationVersion++; }
+        set { using var mutation = EnterMutationScope(); var v = Guard3D.NonNegative(value, nameof(value)); if (NearlyEqual(_sleepDelay, v)) return; _sleepDelay = v; ConfigurationVersion++; }
     }
 
     public float SleepSpeedThreshold
     {
         get => _sleepSpeedThreshold;
-        set { var v = SanitizeNonNegative(value, 0.05f); if (NearlyEqual(_sleepSpeedThreshold, v)) return; _sleepSpeedThreshold = v; ConfigurationVersion++; }
+        set { using var mutation = EnterMutationScope(); var v = Guard3D.NonNegative(value, nameof(value)); if (NearlyEqual(_sleepSpeedThreshold, v)) return; _sleepSpeedThreshold = v; ConfigurationVersion++; }
     }
 
     public float SleepAngularSpeedThreshold
     {
         get => _sleepAngularSpeedThreshold;
-        set { var v = SanitizeNonNegative(value, 0.05f); if (NearlyEqual(_sleepAngularSpeedThreshold, v)) return; _sleepAngularSpeedThreshold = v; ConfigurationVersion++; }
+        set { using var mutation = EnterMutationScope(); var v = Guard3D.NonNegative(value, nameof(value)); if (NearlyEqual(_sleepAngularSpeedThreshold, v)) return; _sleepAngularSpeedThreshold = v; ConfigurationVersion++; }
     }
 
     public bool IsSleeping { get; internal set; }
     public bool IsGrounded { get; internal set; }
     public Vector3 GroundNormal { get; internal set; } = Vector3.UnitY;
-
-    // Compatibility-only diagnostic properties. Jitter2 owns actual deactivation/contact stability.
-    public float SleepContactTorqueThreshold { get; set; } = 0.01f;
-    public int SleepMinStableContactCount { get; set; } = 1;
     internal float SleepTimer { get; set; }
-    internal Vector3 PreviousPosition { get; set; }
-    internal Quaternion PreviousRotation { get; set; } = Quaternion.Identity;
-    internal bool HasKinematicPreviousPose { get; set; }
     internal Vector3 DerivedKinematicVelocity { get; set; }
     internal Vector3 DerivedKinematicAngularVelocity { get; set; }
-    internal Vector3 AccumulatedContactTorque { get; set; }
-    internal float AccumulatedContactNormalImpulse { get; set; }
-    internal int ContactCount { get; set; }
-    internal bool HadUnstableContact { get; set; }
 
     public float InverseMass => IsKinematic || Mass <= 0f ? 0f : 1f / Mass;
 
@@ -242,13 +312,16 @@ public sealed class Rigidbody3D
 
     public void WakeUp()
     {
+        using var mutation = EnterMutationScope();
         IsSleeping = false;
         SleepTimer = 0f;
         ForceVersion++;
+        NotifyActivityChanged();
     }
 
     public void Sleep()
     {
+        using var mutation = EnterMutationScope();
         IsSleeping = true;
         SleepTimer = SleepDelay;
         Velocity = Vector3.Zero;
@@ -257,7 +330,8 @@ public sealed class Rigidbody3D
 
     public void AddForce(Vector3 force)
     {
-        force = Sanitize(force);
+        using var mutation = EnterMutationScope();
+        force = Guard3D.Finite(force, nameof(force));
         if (force == Vector3.Zero) return;
         _pendingForce += force;
         ForceVersion++;
@@ -266,7 +340,8 @@ public sealed class Rigidbody3D
 
     public void AddTorque(Vector3 torque)
     {
-        torque = Sanitize(torque);
+        using var mutation = EnterMutationScope();
+        torque = Guard3D.Finite(torque, nameof(torque));
         if (torque == Vector3.Zero) return;
         _pendingTorque += torque;
         ForceVersion++;
@@ -275,8 +350,9 @@ public sealed class Rigidbody3D
 
     public void AddForce(Vector3 force, Vector3 worldPosition)
     {
-        force = Sanitize(force);
-        worldPosition = Sanitize(worldPosition);
+        using var mutation = EnterMutationScope();
+        force = Guard3D.Finite(force, nameof(force));
+        worldPosition = Guard3D.Finite(worldPosition, nameof(worldPosition));
         if (force == Vector3.Zero) return;
         _pendingForceAtPosition += force;
         _pendingForceWorldPosition = worldPosition;
@@ -287,7 +363,8 @@ public sealed class Rigidbody3D
 
     public void AddImpulse(Vector3 impulse)
     {
-        impulse = Sanitize(impulse);
+        using var mutation = EnterMutationScope();
+        impulse = Guard3D.Finite(impulse, nameof(impulse));
         if (impulse == Vector3.Zero) return;
         _pendingImpulse += impulse;
         ForceVersion++;
@@ -296,8 +373,9 @@ public sealed class Rigidbody3D
 
     public void AddImpulse(Vector3 impulse, Vector3 worldPosition)
     {
-        impulse = Sanitize(impulse);
-        worldPosition = Sanitize(worldPosition);
+        using var mutation = EnterMutationScope();
+        impulse = Guard3D.Finite(impulse, nameof(impulse));
+        worldPosition = Guard3D.Finite(worldPosition, nameof(worldPosition));
         if (impulse == Vector3.Zero) return;
         _pendingImpulseAtPosition += impulse;
         _pendingImpulseWorldPosition = worldPosition;
@@ -308,7 +386,8 @@ public sealed class Rigidbody3D
 
     public void AddTorqueImpulse(Vector3 angularImpulse)
     {
-        angularImpulse = Sanitize(angularImpulse);
+        using var mutation = EnterMutationScope();
+        angularImpulse = Guard3D.Finite(angularImpulse, nameof(angularImpulse));
         if (angularImpulse == Vector3.Zero) return;
         _pendingTorqueImpulse += angularImpulse;
         ForceVersion++;
@@ -317,6 +396,7 @@ public sealed class Rigidbody3D
 
     public void ClearForces()
     {
+        using var mutation = EnterMutationScope();
         _pendingForce = Vector3.Zero;
         _pendingTorque = Vector3.Zero;
         _pendingForceAtPosition = Vector3.Zero;
@@ -328,15 +408,18 @@ public sealed class Rigidbody3D
         _pendingImpulseWorldPosition = Vector3.Zero;
         _hasPendingImpulseAtPosition = false;
         ForceVersion++;
+        NotifyActivityChanged();
     }
 
     public void ClampAngularVelocity()
     {
+        using var mutation = EnterMutationScope();
         AngularVelocity = ClampLength(AngularVelocity, MaxAngularSpeed);
     }
 
     public void ApplySleepThresholds()
     {
+        using var mutation = EnterMutationScope();
         if (Velocity.LengthSquared() < SleepSpeedThreshold * SleepSpeedThreshold)
         {
             Velocity = Vector3.Zero;
@@ -350,8 +433,8 @@ public sealed class Rigidbody3D
 
     internal void SetSimulationVelocity(Vector3 velocity, Vector3 angularVelocity)
     {
-        _velocity = Sanitize(velocity);
-        _angularVelocity = Sanitize(angularVelocity);
+        _velocity = Guard3D.Finite(velocity, nameof(velocity));
+        _angularVelocity = Guard3D.Finite(angularVelocity, nameof(angularVelocity));
     }
 
     internal void ConsumePendingDynamics(
@@ -388,25 +471,18 @@ public sealed class Rigidbody3D
         _hasPendingImpulseAtPosition = false;
     }
 
-    private static Vector3 Sanitize(Vector3 value)
-        => float.IsFinite(value.X) && float.IsFinite(value.Y) && float.IsFinite(value.Z) ? value : Vector3.Zero;
-
-    private static float SanitizePositive(float value, float fallback)
-        => float.IsFinite(value) && value > 0f ? value : fallback;
-
-    private static float SanitizeNonNegative(float value, float fallback)
-        => float.IsFinite(value) && value >= 0f ? value : fallback;
-
-    private static float Clamp(float value, float min, float max)
-        => float.IsFinite(value) ? global::System.Math.Clamp(value, min, max) : min;
+    private SceneAccessLease3D EnterMutationScope()
+        => Owner?.OwnerScene?.EnterMutationScope(nameof(Rigidbody3D)) ?? default;
 
     private static bool NearlyEqual(float a, float b) => global::System.Math.Abs(a - b) <= 0.000001f;
 
     private static Vector3 ClampLength(Vector3 value, float maxLength)
     {
-        value = Sanitize(value);
+        value = Guard3D.Finite(value, nameof(value));
         if (maxLength <= 0f) return Vector3.Zero;
         var maxSq = maxLength * maxLength;
         return value.LengthSquared() > maxSq ? Vector3.Normalize(value) * maxLength : value;
     }
+
+    private void NotifyActivityChanged() => ActivityChanged?.Invoke(this, EventArgs.Empty);
 }

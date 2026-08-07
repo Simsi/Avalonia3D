@@ -1,0 +1,38 @@
+<Project>
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <Deterministic>true</Deterministic>
+    <DeterministicSourcePaths>true</DeterministicSourcePaths>
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true' or '$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+    <DebugType>portable</DebugType>
+    <DebugSymbols>true</DebugSymbols>
+    <BaseOutputPath>$(MSBuildThisFileDirectory)Artifacts/bin/$(MSBuildProjectName)/</BaseOutputPath>
+    <BaseIntermediateOutputPath>$(MSBuildThisFileDirectory)Artifacts/obj/$(MSBuildProjectName)/</BaseIntermediateOutputPath>
+    <NuGetLockFilePath>$(MSBuildThisFileDirectory)eng/locks/$(MSBuildProjectName)/packages.lock.json</NuGetLockFilePath>
+    <PathMap>$(MSBuildThisFileDirectory)=/_/3DEngine/</PathMap>
+
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <WarningLevel>7</WarningLevel>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <WarningsAsErrors>$(WarningsAsErrors);NU1605;NU1701</WarningsAsErrors>
+
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <RestoreLockedMode Condition="'$(LockedRestore)' == 'true'">true</RestoreLockedMode>
+
+    <Avalonia3DEngineVersion>0.1.0-alpha.8.12.1</Avalonia3DEngineVersion>
+    <Version>$(Avalonia3DEngineVersion)</Version>
+    <PackageVersion>$(Avalonia3DEngineVersion)</PackageVersion>
+    <AssemblyVersion>0.1.0.0</AssemblyVersion>
+    <FileVersion>0.1.0.0</FileVersion>
+    <InformationalVersion>$(Avalonia3DEngineVersion)</InformationalVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+</Project>

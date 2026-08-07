@@ -7,18 +7,24 @@ namespace ThreeDEngine.Core.Preview;
 
 public sealed class PreviewScene3D
 {
-    public string Name { get; init; } = "Preview";
-    public Scene3D Scene { get; init; } = new Scene3D();
+    public PreviewScene3D(string name, Scene3D scene)
+    {
+        Name = string.IsNullOrWhiteSpace(name) ? "Preview" : name;
+        Scene = scene ?? throw new System.ArgumentNullException(nameof(scene));
+    }
+
+    public string Name { get; }
+    public Scene3D Scene { get; }
 
     public static PreviewScene3D Object(string name, Object3D obj)
     {
         var scene = CreateDefaultScene();
         scene.Add(obj);
-        return new PreviewScene3D { Name = name, Scene = scene };
+        return new PreviewScene3D(name, scene);
     }
 
     public static PreviewScene3D FromScene(string name, Scene3D scene)
-        => new PreviewScene3D { Name = name, Scene = scene };
+        => new PreviewScene3D(name, scene);
 
     public static Scene3D CreateDefaultScene()
     {

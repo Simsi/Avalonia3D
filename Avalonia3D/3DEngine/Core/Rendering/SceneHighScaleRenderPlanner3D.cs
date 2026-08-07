@@ -11,12 +11,12 @@ namespace ThreeDEngine.Core.Rendering;
 /// Backends still own their buffer residency/update strategy, but visibility, layer
 /// discovery and coarse LOD policy must not drift between implementations.
 /// </summary>
-public static class SceneHighScaleRenderPlanner3D
+internal static class SceneHighScaleRenderPlanner3D
 {
     public static bool HasVisibleLayers(SceneFrameSnapshot3D snapshot)
     {
         if (snapshot is null) throw new ArgumentNullException(nameof(snapshot));
-        foreach (var layer in snapshot.HighScaleLayers)
+        foreach (var layer in snapshot.HighScaleLayersInternal)
         {
             if (IsVisible(layer)) return true;
         }
@@ -29,7 +29,7 @@ public static class SceneHighScaleRenderPlanner3D
         if (snapshot is null) throw new ArgumentNullException(nameof(snapshot));
         if (output is null) throw new ArgumentNullException(nameof(output));
         output.Clear();
-        foreach (var layer in snapshot.HighScaleLayers)
+        foreach (var layer in snapshot.HighScaleLayersInternal)
         {
             if (IsVisible(layer)) output.Add(layer);
         }

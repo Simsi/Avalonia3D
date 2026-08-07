@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "engineVersion": "0.1.0-alpha.8.12.1",
+  "minimumMeasuredIterations": 30,
+  "maximumAllowedRegressionRatio": 1.1,
+  "failOnMissingWorkload": true,
+  "requiredWorkloads": [
+    "engine-service-resolve-1000",
+    "geometry-upload-view-cached-1000",
+    "geometry-meshlet-view-cached-1000",
+    "geometry-bulk-builder-100",
+    "geometry-lod-generate-1",
+    "resource-content-intern-1000",
+    "resource-owner-sync-1000",
+    "rhi-resource-register-release-1000",
+    "fixed-update-empty-1000",
+    "simulation-command-drain-1000",
+    "scene-transaction-empty-1000",
+    "scene-journal-copy-tail-1",
+    "render-frame-publication-1024",
+    "ordinary-plan-1024",
+    "ordinary-single-transform-1024",
+    "transparent-camera-plan-256",
+    "transparent-camera-transform-plan-256",
+    "registry-visibility-patch-1024",
+    "scene-transaction-transform-512",
+    "high-scale-plan-25000",
+    "high-scale-state-patch-512",
+    "high-scale-transform-patch-512"
+  ],
+  "notes": "Stage 4 adds executable GPU-driven RHI/render-graph source and test contracts, including exact GPU record layouts, indirect commands, explicit attachments and capability fail-fast. The CPU gate continues to cover world ownership, compact geometry, deterministic planning and resource ownership. Optional device references enforce the 10% p95/allocation regression threshold. GPU/browser values must come from real captures; current LegacyRaster demos do not count as validation of the GPU-driven path and templates never contain fabricated measurements."
+}

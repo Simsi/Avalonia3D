@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0-browser</TargetFramework>
+    <RootNamespace>ThreeDEngine</RootNamespace>
+    <AssemblyName>Avalonia3D.WebGL</AssemblyName>
+    <PackageId>Avalonia3D.WebGL</PackageId>
+    <Description>WebGL2 renderer, browser interop and Avalonia presenter for Avalonia3D.</Description>
+    <IsPackable>true</IsPackable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="WebGL/**/*.cs" />
+    <ProjectReference Include="Avalonia3D.Core.csproj" />
+    <ProjectReference Include="Avalonia3D.Avalonia.csproj" />
+    <PackageReference Include="Avalonia" />
+    <None Remove="WebGL/mini3d.webgl.js" />
+    <Content Include="WebGL/mini3d.webgl.js"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest"
+             Pack="true"
+             PackagePath="contentFiles/any/any/3DEngine/WebGL" />
+  </ItemGroup>
+</Project>

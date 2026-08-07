@@ -12,11 +12,11 @@ using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Layout;
 using Avalonia.Media;
-using Avalonia.Threading;
 using ThreeDEngine.Avalonia.Controls;
 using ThreeDEngine.Avalonia.Interaction;
 using ThreeDEngine.Core.Collision;
 using ThreeDEngine.Core.HighScale;
+using ThreeDEngine.Core.Hosting;
 using ThreeDEngine.Core.Interaction;
 using ThreeDEngine.Core.Lighting;
 using ThreeDEngine.Core.Materials;
@@ -28,7 +28,7 @@ using ProjectionHelper3D = ThreeDEngine.Core.Math.ProjectionHelper;
 
 namespace ThreeDEngine.Avalonia.Preview;
 
-public sealed class Scene3DPreviewControl : UserControl
+public sealed class Scene3DPreviewControl : UserControl, IDisposable
 {
     private readonly Scene3DControl _viewport;
     private readonly ListBox _partList;
@@ -148,7 +148,6 @@ public sealed class Scene3DPreviewControl : UserControl
     private readonly ColumnDefinition _leftSplitterColumn;
     private readonly ColumnDefinition _rightSplitterColumn;
     private readonly ColumnDefinition _rightColumn;
-    private readonly DispatcherTimer _debugPhysicsTimer;
     private readonly ModelEditorHistoryService _history = new();
     private readonly Button _undoButton;
     private readonly Button _redoButton;
@@ -176,18 +175,25 @@ public sealed class Scene3DPreviewControl : UserControl
     private bool _spaceGuidesUpdating;
     private bool _updatingSceneSettings;
     private bool _applyingHistory;
-    private DateTime _lastDebugPhysicsTickUtc;
+    private bool _disposed;
 
+    [Obsolete("Use Scene3DPreviewControl(Engine3D) with an explicitly composed engine. This compatibility constructor requires Avalonia3D.Engine or the complete 3DEngine source-drop.")]
     public Scene3DPreviewControl()
+        : this(new Scene3DControl())
     {
-        _viewport = new Scene3DControl
-        {
-            ShowPerformanceMetrics = true,
-            ShowCenterCursor = false
-        };
+    }
 
-        _debugPhysicsTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16d) };
-        _debugPhysicsTimer.Tick += OnDebugPhysicsTimerTick;
+    public Scene3DPreviewControl(Engine3D engine)
+        : this(new Scene3DControl(engine ?? throw new ArgumentNullException(nameof(engine))))
+    {
+    }
+
+    private Scene3DPreviewControl(Scene3DControl viewport)
+    {
+        _viewport = viewport ?? throw new ArgumentNullException(nameof(viewport));
+        _viewport.ShowPerformanceMetrics = true;
+        _viewport.ShowCenterCursor = false;
+        _viewport.FrameRendered += (_, _) => RefreshSelectionAfterPhysics(_selectedObject);
 
         _partList = new ListBox
         {
@@ -956,7 +962,7 @@ public sealed class Scene3DPreviewControl : UserControl
         }
 
         RestoreDebugVisuals();
-        _viewport.Scene = PreviewScene3D.CreateDefaultScene();
+        _viewport.SetScene(PreviewScene3D.CreateDefaultScene(), takeOwnership: true);
         _history.Clear();
         UpdateHistoryUi();
         ApplyDebuggerSceneDefaults(_viewport.Scene);
@@ -1497,7 +1503,10 @@ public sealed class Scene3DPreviewControl : UserControl
         }
 
         var scene = _viewport.Scene;
-        scene.PhysicsCore ??= PhysicsCoreFactory.CreateDefault();
+        if (scene.PhysicsCore is null)
+        {
+            scene.SetPhysicsEnabled(true);
+        }
         EnsurePhysicsCollider(obj);
 
         var isNewBody = obj.Rigidbody is null;
@@ -1579,7 +1588,17 @@ public sealed class Scene3DPreviewControl : UserControl
         scene.Debug.ShowBounds = _showBoundsCheckBox.IsChecked == true;
         scene.Debug.ShowColliders = _showCollidersCheckBox.IsChecked == true;
         scene.Debug.ShowPickingRay = _showPickingRayCheckBox.IsChecked == true;
-        scene.PhysicsCore = _enablePhysicsCheckBox.IsChecked == true ? scene.PhysicsCore ?? PhysicsCoreFactory.CreateDefault() : null;
+        if (_enablePhysicsCheckBox.IsChecked == true)
+        {
+            if (scene.PhysicsCore is null)
+            {
+                scene.SetPhysicsEnabled(true);
+            }
+        }
+        else if (scene.PhysicsCore is not null)
+        {
+            scene.SetPhysicsEnabled(false);
+        }
         if (TryReadFloat(_cameraNearBox.Text, out var nearPlane)) scene.Camera.NearPlane = nearPlane;
         if (TryReadFloat(_cameraFarBox.Text, out var farPlane)) scene.Camera.FarPlane = farPlane;
         if (TryReadFloat(_drawDistanceBox.Text, out var drawDistance)) scene.Performance.DrawDistance = MathF.Max(1f, drawDistance);
@@ -1616,7 +1635,7 @@ public sealed class Scene3DPreviewControl : UserControl
     private static void ApplyDebuggerSceneDefaults(Scene3D scene)
     {
         scene.Debug.ShowBounds = true;
-        scene.PhysicsCore = null;
+        scene.SetPhysicsEnabled(false);
         if (scene.Performance.DrawDistance < 100f)
         {
             scene.Performance.DrawDistance = 100f;
@@ -1682,74 +1701,16 @@ public sealed class Scene3DPreviewControl : UserControl
             return;
         }
 
-        scene.Registry.Invalidate();
-        scene.StepPhysics(1f / 60f);
-        scene.Invalidate();
+        scene.UpdateLoop.AdvancePhysics = true;
+        scene.UpdateLoop.StepOnce();
         RefreshSelectionAfterPhysics(selectionToRefresh);
         UpdateDebuggerPhysicsPumpState();
     }
 
     private void UpdateDebuggerPhysicsPumpState()
     {
-        var shouldRun =
-            _enablePhysicsCheckBox.IsChecked == true &&
-            _viewport.Scene.PhysicsCore is not null &&
-            TopLevel.GetTopLevel(this) is not null &&
-            HasDebuggerDynamicPhysicsBodies();
-
-        if (shouldRun)
-        {
-            if (!_debugPhysicsTimer.IsEnabled)
-            {
-                _lastDebugPhysicsTickUtc = default;
-                _debugPhysicsTimer.Start();
-            }
-        }
-        else if (_debugPhysicsTimer.IsEnabled)
-        {
-            _debugPhysicsTimer.Stop();
-            _lastDebugPhysicsTickUtc = default;
-        }
-    }
-
-    private bool HasDebuggerDynamicPhysicsBodies()
-    {
-        foreach (var obj in _viewport.Scene.Registry.SnapshotDynamicBodies())
-        {
-            var body = obj.Rigidbody;
-            if (body is null || body.IsKinematic)
-            {
-                continue;
-            }
-
-            if (body.UseGravity || body.Velocity.LengthSquared() > 0.000001f)
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private void OnDebugPhysicsTimerTick(object? sender, EventArgs e)
-    {
         var scene = _viewport.Scene;
-        if (_enablePhysicsCheckBox.IsChecked != true || scene.PhysicsCore is null || TopLevel.GetTopLevel(this) is null)
-        {
-            UpdateDebuggerPhysicsPumpState();
-            return;
-        }
-
-        var now = DateTime.UtcNow;
-        var dt = _lastDebugPhysicsTickUtc == default ? 1f / 60f : (float)(now - _lastDebugPhysicsTickUtc).TotalSeconds;
-        _lastDebugPhysicsTickUtc = now;
-        dt = global::System.Math.Clamp(dt, 0.001f, 1f / 15f);
-
-        scene.Registry.Invalidate();
-        scene.StepPhysics(dt);
-        scene.Invalidate();
-        RefreshSelectionAfterPhysics(_selectedObject);
-        UpdateDebuggerPhysicsPumpState();
+        scene.UpdateLoop.AdvancePhysics = _enablePhysicsCheckBox.IsChecked == true && scene.PhysicsCore is not null;
     }
 
     private void RefreshSelectionAfterPhysics(Object3D? obj)
@@ -3678,6 +3639,15 @@ public sealed class Scene3DPreviewControl : UserControl
 
         var normalized = text.Trim();
         return int.TryParse(normalized, NumberStyles.Integer, CultureInfo.InvariantCulture, out value);
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        KeyDown -= OnModelEditorShortcutKeyDown;
+        _viewport.Dispose();
+        RefreshRequested = null;
     }
 
     private static float Clamp01(float value) => System.Math.Clamp(value, 0f, 1f);

@@ -2,19 +2,32 @@ using System;
 using System.Numerics;
 using ThreeDEngine.Core.Math;
 using ThreeDEngine.Core.Scene;
+using ThreeDEngine.Core.Validation;
 
 namespace ThreeDEngine.Core.Collision;
 
 public sealed class SphereCollider3D : Collider3D
 {
-    public Vector3 Center { get; set; }
-    public float Radius { get; set; } = 0.5f;
+    private Vector3 _center;
+    private float _radius = 0.5f;
+
+    public Vector3 Center
+    {
+        get => _center;
+        set { using var mutation = EnterMutationScope(); value = Guard3D.Finite(value, nameof(value)); if (_center == value) return; _center = value; RaiseChanged(); }
+    }
+
+    public float Radius
+    {
+        get => _radius;
+        set { using var mutation = EnterMutationScope(); value = Guard3D.Positive(value, nameof(value)); if (MathF.Abs(_radius - value) < 0.000001f) return; _radius = value; RaiseChanged(); }
+    }
 
     public override Bounds3D GetWorldBounds(Object3D owner)
     {
         var model = owner.GetModelMatrix();
         var center = Vector3.Transform(Center, model);
-        var r = MathF.Max(0f, Radius * GetMaxAbsScale(model));
+        var r = Radius * GetMaxAbsScale(model);
         return new Bounds3D(center - new Vector3(r), center + new Vector3(r));
     }
 
@@ -29,7 +42,7 @@ public sealed class SphereCollider3D : Collider3D
         var direction = Vector3.Normalize(ray.Direction);
         var model = owner.GetModelMatrix();
         var center = Vector3.Transform(Center, model);
-        var radius = MathF.Max(0f, Radius * GetMaxAbsScale(model));
+        var radius = Radius * GetMaxAbsScale(model);
         var oc = ray.Origin - center;
         var a = 1f;
         var b = 2f * Vector3.Dot(oc, direction);

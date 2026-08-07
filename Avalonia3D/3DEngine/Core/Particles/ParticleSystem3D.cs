@@ -1,11 +1,13 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.Numerics;
 using ThreeDEngine.Core.Collision;
 using ThreeDEngine.Core.Geometry;
 using ThreeDEngine.Core.Materials;
 using ThreeDEngine.Core.Primitives;
 using ThreeDEngine.Core.Scene;
+using ThreeDEngine.Core.Validation;
 
 namespace ThreeDEngine.Core.Particles;
 
@@ -19,6 +21,7 @@ public sealed class ParticleSystem3D : Object3D
     private static readonly Mesh3D StaticCubeMesh = CreateStaticCubeMesh();
 
     private readonly List<Particle3D> _particles;
+    private readonly ReadOnlyCollection<Particle3D> _particlesView;
     private readonly ParticleEmitter3D _emitter;
     private ParticleSystemSettings3D _settings;
     private float _emitAccumulator;
@@ -26,14 +29,20 @@ public sealed class ParticleSystem3D : Object3D
     private long _particleVersion;
     private Bounds3D _localParticleBounds = Bounds3D.Empty;
     private bool _particleBoundsDirty = true;
+    private ParticleSimulationSpace3D _simulationSpace;
 
     public ParticleSystem3D(ParticleSystemSettings3D? settings = null, ParticleEmitter3D? emitter = null)
     {
         _settings = settings?.Clone() ?? new ParticleSystemSettings3D();
-        _particles = new List<Particle3D>(global::System.Math.Max(1, _settings.Capacity));
+        _particles = new List<Particle3D>(_settings.Capacity);
+        _particlesView = _particles.AsReadOnly();
+        _settings.MutationScopeRequested = EnterOwnedMutationScope;
+        _settings.Changed += OnSettingsChanged;
+        _simulationSpace = _settings.SimulationSpace;
         _emitter = emitter ?? new ParticleEmitter3D();
+        _emitter.MutationScopeRequested = EnterOwnedMutationScope;
         Name = "Particle System";
-        Material = Material3D.CreateUnlit(_settings.StartColor);
+        Material = Material3D.CreateUnlit(ColorRgba.White);
         IsPickable = false;
         if (_settings.Prewarm)
         {
@@ -46,36 +55,51 @@ public sealed class ParticleSystem3D : Object3D
         get => _settings;
         set
         {
+            using var mutation = EnterOwnedMutationScope();
+            var replacement = (value ?? throw new ArgumentNullException(nameof(value))).Clone();
             var oldMode = _settings.RenderMode;
-            _settings = value?.Clone() ?? new ParticleSystemSettings3D();
+            var oldSpace = _simulationSpace;
+            _settings.Changed -= OnSettingsChanged;
+            _settings.MutationScopeRequested = null;
+            _settings = replacement;
+            _settings.MutationScopeRequested = EnterOwnedMutationScope;
+            _settings.Changed += OnSettingsChanged;
+            ConvertSimulationSpace(oldSpace, _settings.SimulationSpace);
+            _simulationSpace = _settings.SimulationSpace;
             TrimToCapacity();
             MarkParticlesDirty(markGeometryDirty: oldMode != _settings.RenderMode);
         }
     }
 
     public ParticleEmitter3D Emitter => _emitter;
-    public IReadOnlyList<Particle3D> Particles => _particles;
+    public IReadOnlyList<Particle3D> Particles => _particlesView;
     public int AliveCount => _particles.Count;
     public bool IsPlaying => _isPlaying;
     public long ParticleMeshVersion => _particleVersion;
     public long ParticleVersion => _particleVersion;
 
     public static Mesh3D GetStaticRenderMesh(ParticleRenderMode3D mode)
-        => mode == ParticleRenderMode3D.Cube3D ? StaticCubeMesh : StaticQuadMesh;
+        => Guard3D.Defined(mode, nameof(mode)) == ParticleRenderMode3D.Cube3D ? StaticCubeMesh : StaticQuadMesh;
 
-    /// <summary>
-    /// Kept for source compatibility. Billboard basis is now a renderer uniform, so camera motion
-    /// does not dirty particle geometry.
-    /// </summary>
-    public void SetBillboardBasis(Vector3 cameraRight, Vector3 cameraUp, Vector3 cameraForward)
+    public void Play()
     {
+        using var mutation = EnterOwnedMutationScope();
+        if (_isPlaying) return;
+        _isPlaying = true;
+        RaiseChanged(SceneChangeKind.Transform);
     }
 
-    public void Play() => _isPlaying = true;
-    public void Pause() => _isPlaying = false;
+    public void Pause()
+    {
+        using var mutation = EnterOwnedMutationScope();
+        if (!_isPlaying) return;
+        _isPlaying = false;
+        RaiseChanged(SceneChangeKind.Transform);
+    }
 
     public void Stop(bool clear = false)
     {
+        using var mutation = EnterOwnedMutationScope();
         _isPlaying = false;
         _emitAccumulator = 0f;
         if (clear)
@@ -83,10 +107,15 @@ public sealed class ParticleSystem3D : Object3D
             _particles.Clear();
             MarkParticlesDirty(markGeometryDirty: false);
         }
+        else
+        {
+            RaiseChanged(SceneChangeKind.Transform);
+        }
     }
 
     public void Clear()
     {
+        using var mutation = EnterOwnedMutationScope();
         _particles.Clear();
         _emitAccumulator = 0f;
         MarkParticlesDirty(markGeometryDirty: false);
@@ -94,6 +123,8 @@ public sealed class ParticleSystem3D : Object3D
 
     public void Emit(int count)
     {
+        using var mutation = EnterOwnedMutationScope();
+        Guard3D.NonNegative(count, nameof(count));
         var emitted = false;
         for (var i = 0; i < count; i++) emitted |= SpawnParticle();
         if (emitted) MarkParticlesDirty(markGeometryDirty: false);
@@ -101,7 +132,9 @@ public sealed class ParticleSystem3D : Object3D
 
     public void Advance(float deltaSeconds)
     {
-        if (deltaSeconds <= 0f) return;
+        using var mutation = EnterOwnedMutationScope();
+        Guard3D.NonNegative(deltaSeconds, nameof(deltaSeconds));
+        if (deltaSeconds == 0f) return;
 
         var changed = false;
         var write = 0;
@@ -151,7 +184,8 @@ public sealed class ParticleSystem3D : Object3D
         }
 
         var bounds = GetLocalParticleBounds();
-        return bounds.IsValid ? bounds.Transform(GetModelMatrix()) : Bounds3D.Empty;
+        if (!bounds.IsValid) return Bounds3D.Empty;
+        return _simulationSpace == ParticleSimulationSpace3D.World ? bounds : bounds.Transform(GetModelMatrix());
     }
 
     protected override Mesh3D BuildMesh()
@@ -204,16 +238,84 @@ public sealed class ParticleSystem3D : Object3D
 
     private bool SpawnParticle()
     {
-        if (_particles.Count >= global::System.Math.Max(1, _settings.Capacity)) return false;
-        _particles.Add(_emitter.Create(_settings));
+        if (_particles.Count >= _settings.Capacity) return false;
+        var particle = _emitter.Create(_settings);
+        if (_simulationSpace == ParticleSimulationSpace3D.World)
+        {
+            var model = GetModelMatrix();
+            particle.Position = Vector3.Transform(particle.Position, model);
+            particle.Velocity = Vector3.TransformNormal(particle.Velocity, model);
+            var scale = ResolveModelScale(model);
+            particle.StartSize *= scale;
+            particle.EndSize *= scale;
+        }
+        _particles.Add(particle);
         return true;
     }
 
     private void TrimToCapacity()
     {
-        var capacity = global::System.Math.Max(1, _settings.Capacity);
+        var capacity = _settings.Capacity;
         if (_particles.Count <= capacity) return;
         _particles.RemoveRange(capacity, _particles.Count - capacity);
+    }
+
+    private void OnSettingsChanged(object? sender, ParticleSettingsChangedEventArgs3D e)
+    {
+        if (_simulationSpace != _settings.SimulationSpace)
+        {
+            ConvertSimulationSpace(_simulationSpace, _settings.SimulationSpace);
+            _simulationSpace = _settings.SimulationSpace;
+        }
+        if ((e.Kind & ParticleSettingsChangeKind3D.Capacity) != 0) TrimToCapacity();
+        MarkParticlesDirty((e.Kind & ParticleSettingsChangeKind3D.Geometry) != 0);
+    }
+
+    private void ConvertSimulationSpace(ParticleSimulationSpace3D from, ParticleSimulationSpace3D to)
+    {
+        if (from == to || _particles.Count == 0) return;
+        Guard3D.Defined(from, nameof(from));
+        Guard3D.Defined(to, nameof(to));
+        var model = GetModelMatrix();
+        var scale = ResolveModelScale(model);
+        Matrix4x4 conversion;
+        float sizeFactor;
+        if (from == ParticleSimulationSpace3D.Local && to == ParticleSimulationSpace3D.World)
+        {
+            conversion = model;
+            sizeFactor = scale;
+        }
+        else if (from == ParticleSimulationSpace3D.World && to == ParticleSimulationSpace3D.Local)
+        {
+            if (!Matrix4x4.Invert(model, out conversion))
+                throw new InvalidOperationException("Particle simulation space cannot be converted through a singular model transform.");
+            sizeFactor = 1f / scale;
+        }
+        else
+        {
+            throw new ArgumentOutOfRangeException(nameof(to), to, "Unsupported particle simulation-space transition.");
+        }
+
+        for (var i = 0; i < _particles.Count; i++)
+        {
+            var particle = _particles[i];
+            particle.Position = Vector3.Transform(particle.Position, conversion);
+            particle.Velocity = Vector3.TransformNormal(particle.Velocity, conversion);
+            particle.StartSize *= sizeFactor;
+            particle.EndSize *= sizeFactor;
+            _particles[i] = particle;
+        }
+    }
+
+    private static float ResolveModelScale(Matrix4x4 model)
+    {
+        var x = Vector3.TransformNormal(Vector3.UnitX, model).Length();
+        var y = Vector3.TransformNormal(Vector3.UnitY, model).Length();
+        var z = Vector3.TransformNormal(Vector3.UnitZ, model).Length();
+        var scale = MathF.Max(x, MathF.Max(y, z));
+        if (!float.IsFinite(scale) || scale <= 0.000001f)
+            throw new InvalidOperationException("Particle model transform must have a finite non-zero scale.");
+        return scale;
     }
 
     private void MarkParticlesDirty(bool markGeometryDirty)

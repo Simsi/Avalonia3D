@@ -8,7 +8,7 @@ public sealed class Avalonia3DSelfTestResult
 {
     internal Avalonia3DSelfTestResult(IReadOnlyList<Avalonia3DSelfTestCaseResult> cases, TimeSpan elapsed)
     {
-        Cases = cases;
+        Cases = cases is null ? throw new ArgumentNullException(nameof(cases)) : cases.ToArray();
         Elapsed = elapsed;
     }
 

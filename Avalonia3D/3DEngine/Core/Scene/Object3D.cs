@@ -5,6 +5,7 @@ using System.Numerics;
 using System.Runtime.CompilerServices;
 using ThreeDEngine.Core.Collision;
 using ThreeDEngine.Core.Geometry;
+using ThreeDEngine.Core.Hosting;
 using ThreeDEngine.Core.Interaction;
 using ThreeDEngine.Core.Materials;
 using ThreeDEngine.Core.Math;
@@ -39,18 +40,38 @@ public abstract class Object3D : INotifyPropertyChanged
     private bool _worldBoundsDirty = true;
     private int _transformVersion;
     private int _materialVersion;
+    private Scene3D? _ownerScene;
+    private bool _meshBuiltOutsideEngineCache;
+    private Engine3D? _meshEngineScope;
 
     protected Object3D()
     {
         Id = Guid.NewGuid().ToString("N");
-        Transform = new Transform3D();
+        Transform = new Transform3D { EnterMutationScope = EnterMutationScope };
         Transform.Changed += OnTransformChanged;
         _material.Changed += OnMaterialChanged;
+        _material.MutationScopeRequested += EnterMaterialMutationScope;
     }
 
     public string Id { get; }
 
-    internal Scene3D? OwnerScene { get; set; }
+    internal Scene3D? OwnerScene
+    {
+        get => _ownerScene;
+        set
+        {
+            if (ReferenceEquals(_ownerScene, value)) return;
+            _ownerScene = value;
+            if (value is not null && (_meshBuiltOutsideEngineCache || (_meshEngineScope is not null && !ReferenceEquals(_meshEngineScope, value.Engine))))
+            {
+                _mesh = null;
+                _meshDirty = true;
+                _meshBuiltOutsideEngineCache = false;
+                _meshEngineScope = null;
+                _worldBoundsDirty = true;
+            }
+        }
+    }
 
     public event PropertyChangedEventHandler? PropertyChanged;
     public event EventHandler? Changed;
@@ -104,6 +125,7 @@ public abstract class Object3D : INotifyPropertyChanged
         get => _rotationDegrees;
         set
         {
+            using var access = EnterMutationScope();
             if (_rotationDegrees == value)
             {
                 return;
@@ -148,6 +170,7 @@ public abstract class Object3D : INotifyPropertyChanged
         get => _fill;
         set
         {
+            using var access = EnterMutationScope();
             if (_fill.Equals(value))
             {
                 return;
@@ -171,6 +194,7 @@ public abstract class Object3D : INotifyPropertyChanged
         get => _material;
         set
         {
+            using var access = EnterMutationScope();
             if (ReferenceEquals(_material, value))
             {
                 return;
@@ -179,10 +203,12 @@ public abstract class Object3D : INotifyPropertyChanged
             if (_material is not null)
             {
                 _material.Changed -= OnMaterialChanged;
+                _material.MutationScopeRequested -= EnterMaterialMutationScope;
             }
 
             _material = value ?? throw new ArgumentNullException(nameof(value));
             _material.Changed += OnMaterialChanged;
+            _material.MutationScopeRequested += EnterMaterialMutationScope;
             _fill = _material.EffectiveColor;
             _materialVersion++;
             OnPropertyChanged(nameof(Material));
@@ -197,13 +223,19 @@ public abstract class Object3D : INotifyPropertyChanged
         get => _collider;
         set
         {
+            using var access = EnterMutationScope();
             if (ReferenceEquals(_collider, value))
             {
                 return;
             }
+            if (value?.Owner is not null && !ReferenceEquals(value.Owner, this))
+            {
+                throw new InvalidOperationException("A Collider3D instance cannot be shared by multiple scene objects.");
+            }
 
             if (_collider is not null)
             {
+                _collider.Changed -= OnColliderChanged;
                 _collider.Owner = null;
             }
 
@@ -211,6 +243,7 @@ public abstract class Object3D : INotifyPropertyChanged
             if (_collider is not null)
             {
                 _collider.Owner = this;
+                _collider.Changed += OnColliderChanged;
             }
 
             MarkWorldBoundsDirtyRecursive();
@@ -224,12 +257,45 @@ public abstract class Object3D : INotifyPropertyChanged
         get => _rigidbody;
         set
         {
+            using var access = EnterMutationScope();
             if (ReferenceEquals(_rigidbody, value)) return;
+            if (value?.Owner is not null && !ReferenceEquals(value.Owner, this))
+            {
+                throw new InvalidOperationException("A Rigidbody3D instance cannot be shared by multiple scene objects.");
+            }
+            if (_rigidbody is not null)
+            {
+                _rigidbody.MembershipChanged -= OnRigidbodyMembershipChanged;
+                _rigidbody.ActivityChanged -= OnRigidbodyActivityChanged;
+                _rigidbody.Owner = null;
+            }
+
             _rigidbody = value;
+            if (_rigidbody is not null)
+            {
+                _rigidbody.Owner = this;
+                _rigidbody.MembershipChanged += OnRigidbodyMembershipChanged;
+                _rigidbody.ActivityChanged += OnRigidbodyActivityChanged;
+            }
+
             OnPropertyChanged(nameof(Rigidbody));
             RaiseChanged(SceneChangeKind.Physics);
         }
     }
+
+    private void OnColliderChanged(object? sender, EventArgs e)
+    {
+        MarkWorldBoundsDirtyRecursive();
+        RaiseChanged(SceneChangeKind.Physics);
+    }
+
+    private void OnRigidbodyMembershipChanged(object? sender, EventArgs e)
+    {
+        RaiseChanged(SceneChangeKind.Physics);
+    }
+
+    private void OnRigidbodyActivityChanged(object? sender, EventArgs e)
+        => OwnerScene?.NotifyUpdateActivityChanged();
 
     public ColorRgba Color
     {
@@ -242,6 +308,7 @@ public abstract class Object3D : INotifyPropertyChanged
         get => _isVisible;
         set
         {
+            using var access = EnterMutationScope();
             if (_isVisible == value) return;
             _isVisible = value;
             OnPropertyChanged(nameof(IsVisible));
@@ -254,6 +321,7 @@ public abstract class Object3D : INotifyPropertyChanged
         get => _isPickable;
         set
         {
+            using var access = EnterMutationScope();
             if (_isPickable == value) return;
             _isPickable = value;
             OnPropertyChanged(nameof(IsPickable));
@@ -266,6 +334,7 @@ public abstract class Object3D : INotifyPropertyChanged
         get => _isHovered;
         set
         {
+            using var access = EnterMutationScope();
             if (_isHovered == value) return;
             _isHovered = value;
             _materialVersion++;
@@ -280,6 +349,7 @@ public abstract class Object3D : INotifyPropertyChanged
         get => _isSelected;
         set
         {
+            using var access = EnterMutationScope();
             if (_isSelected == value) return;
             _isSelected = value;
             _materialVersion++;
@@ -359,6 +429,26 @@ public abstract class Object3D : INotifyPropertyChanged
 
     protected abstract Mesh3D BuildMesh();
 
+    /// <summary>
+    /// Shares immutable generated geometry inside the owning engine scope. Detached objects can
+    /// still be inspected and receive a private mesh; once normally rendered through a scene,
+    /// identical primitives use that scene's engine-owned cache.
+    /// </summary>
+    protected Mesh3D GetOrCreateCachedMesh(MeshResourceKey key, Func<Mesh3D> factory)
+    {
+        ArgumentNullException.ThrowIfNull(factory);
+        if (OwnerScene is { } scene)
+        {
+            _meshBuiltOutsideEngineCache = false;
+            _meshEngineScope = scene.Engine;
+            return scene.Engine.Services.GetRequiredService<MeshCache3D>().GetOrCreate(key, factory);
+        }
+
+        _meshBuiltOutsideEngineCache = true;
+        _meshEngineScope = null;
+        return factory();
+    }
+
     protected virtual void OnWorldCacheInvalidated()
     {
     }
@@ -399,6 +489,9 @@ public abstract class Object3D : INotifyPropertyChanged
         RaiseChanged(SceneChangeKind.Transform);
     }
 
+    private SceneAccessLease3D EnterMaterialMutationScope()
+        => _ownerScene?.EnterMutationScope(nameof(Material3D)) ?? default;
+
     private void OnMaterialChanged(object? sender, EventArgs e)
     {
         _fill = _material.EffectiveColor;
@@ -419,6 +512,7 @@ public abstract class Object3D : INotifyPropertyChanged
 
     protected bool SetField<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
     {
+        using var access = EnterMutationScope();
         if (EqualityComparer<T>.Default.Equals(field, value))
         {
             return false;
@@ -426,18 +520,24 @@ public abstract class Object3D : INotifyPropertyChanged
 
         field = value;
         OnPropertyChanged(propertyName);
-        RaiseChanged();
+        RaiseChanged(SceneChangeKind.Metadata);
         return true;
     }
+
+    private SceneAccessLease3D EnterMutationScope()
+        => _ownerScene?.EnterMutationScope() ?? default;
+
+    /// <summary>Same-assembly derived systems use this to preserve world ownership.</summary>
+    private protected SceneAccessLease3D EnterOwnedMutationScope() => EnterMutationScope();
 
     protected void OnPropertyChanged([CallerMemberName] string? propertyName = null)
     {
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
     }
 
-    protected virtual void RaiseChanged(SceneChangeKind kind = SceneChangeKind.Unknown)
+    protected virtual void RaiseChanged(SceneChangeKind kind = SceneChangeKind.Unknown, Object3D? source = null)
     {
-        Changed?.Invoke(this, new Object3DChangedEventArgs(kind));
+        Changed?.Invoke(this, new Object3DChangedEventArgs(kind, source ?? this));
     }
 
     public void RaiseClicked(ScenePointerEventArgs e) => Clicked?.Invoke(this, e);

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using ThreeDEngine.Core.Collision;
 using ThreeDEngine.Core.Geometry;
 
@@ -7,8 +8,16 @@ namespace ThreeDEngine.Core.Scene;
 
 public abstract class CompositeObject3D : Object3D
 {
+    protected CompositeObject3D()
+    {
+        _childrenView = _children.AsReadOnly();
+        _partsView = new ReadOnlyDictionary<string, Object3D>(_parts);
+    }
+
     private readonly List<Object3D> _children = new();
+    private readonly ReadOnlyCollection<Object3D> _childrenView;
     private readonly Dictionary<string, Object3D> _parts = new(StringComparer.Ordinal);
+    private readonly ReadOnlyDictionary<string, Object3D> _partsView;
     private bool _built;
     private bool _building;
     private Bounds3D _cachedWorldBounds = Bounds3D.Empty;
@@ -25,7 +34,7 @@ public abstract class CompositeObject3D : Object3D
         get
         {
             EnsureBuilt();
-            return _children;
+            return _childrenView;
         }
     }
 
@@ -34,7 +43,7 @@ public abstract class CompositeObject3D : Object3D
         get
         {
             EnsureBuilt();
-            return _parts;
+            return _partsView;
         }
     }
 
@@ -159,7 +168,8 @@ public abstract class CompositeObject3D : Object3D
         }
 
         part.Name = name;
-        part.OwnerScene = OwnerScene;
+        if (OwnerScene is { } scene) scene.AttachOwnerSceneRecursive(part);
+        else part.OwnerScene = null;
         part.Parent = this;
         part.Changed += OnChildChanged;
         _children.Add(part);
@@ -193,7 +203,7 @@ public abstract class CompositeObject3D : Object3D
         foreach (var child in oldChildren)
         {
             child.Changed -= OnChildChanged;
-            child.OwnerScene = null;
+            Scene3D.DetachOwnerSceneRecursive(child);
             child.Parent = null;
         }
 
@@ -211,7 +221,7 @@ public abstract class CompositeObject3D : Object3D
             foreach (var child in newChildren)
             {
                 child.Changed -= OnChildChanged;
-                child.OwnerScene = null;
+                Scene3D.DetachOwnerSceneRecursive(child);
                 child.Parent = null;
             }
         }
@@ -220,7 +230,7 @@ public abstract class CompositeObject3D : Object3D
             foreach (var child in _children)
             {
                 child.Changed -= OnChildChanged;
-                child.OwnerScene = null;
+                Scene3D.DetachOwnerSceneRecursive(child);
                 child.Parent = null;
             }
 
@@ -228,7 +238,7 @@ public abstract class CompositeObject3D : Object3D
             _parts.Clear();
             foreach (var child in oldChildren)
             {
-                child.OwnerScene = OwnerScene;
+                if (OwnerScene is { } scene) scene.AttachOwnerSceneRecursive(child);
                 child.Parent = this;
                 child.Changed += OnChildChanged;
                 _children.Add(child);
@@ -256,7 +266,7 @@ public abstract class CompositeObject3D : Object3D
 
         foreach (var child in newChildren)
         {
-            child.OwnerScene = OwnerScene;
+            if (OwnerScene is { } scene) scene.AttachOwnerSceneRecursive(child);
             child.Parent = this;
             child.Changed += OnChildChanged;
             _children.Add(child);
@@ -276,7 +286,7 @@ public abstract class CompositeObject3D : Object3D
         foreach (var child in _children)
         {
             child.Changed -= OnChildChanged;
-            child.OwnerScene = null;
+            Scene3D.DetachOwnerSceneRecursive(child);
             child.Parent = null;
         }
 
@@ -287,8 +297,17 @@ public abstract class CompositeObject3D : Object3D
     private void OnChildChanged(object? sender, EventArgs e)
     {
         _worldBoundsDirty = true;
+        if (_building)
+        {
+            // Builder configuration belongs to the pending subtree transaction. Publishing
+            // temporary parts would leak objects that are not registered yet and would also
+            // report changes from a build that may still fail and roll back.
+            return;
+        }
+
         MarkWorldBoundsDirtyRecursive();
         var kind = e is Object3DChangedEventArgs changed ? changed.Kind : SceneChangeKind.Unknown;
-        RaiseChanged(kind);
+        var source = e is Object3DChangedEventArgs precise ? precise.Source : sender as Object3D;
+        RaiseChanged(kind, source);
     }
 }

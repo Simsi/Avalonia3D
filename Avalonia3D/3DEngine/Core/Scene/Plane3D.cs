@@ -1,6 +1,7 @@
 using System.Numerics;
 using ThreeDEngine.Core.Collision;
 using ThreeDEngine.Core.Geometry;
+using ThreeDEngine.Core.Validation;
 
 namespace ThreeDEngine.Core.Scene;
 
@@ -23,7 +24,7 @@ public sealed class Plane3D : Object3D
         get => _width;
         set
         {
-            var clamped = System.MathF.Max(0.001f, value);
+            var clamped = Guard3D.Positive(value, nameof(Width));
             if (System.MathF.Abs(_width - clamped) < 0.0001f) return;
             _width = clamped;
             UpdateColliderSize();
@@ -36,7 +37,7 @@ public sealed class Plane3D : Object3D
         get => _height;
         set
         {
-            var clamped = System.MathF.Max(0.001f, value);
+            var clamped = Guard3D.Positive(value, nameof(Height));
             if (System.MathF.Abs(_height - clamped) < 0.0001f) return;
             _height = clamped;
             UpdateColliderSize();
@@ -49,7 +50,7 @@ public sealed class Plane3D : Object3D
         get => _segmentsX;
         set
         {
-            var clamped = System.Math.Max(1, value);
+            var clamped = Guard3D.Positive(value, nameof(SegmentsX));
             if (_segmentsX == clamped) return;
             _segmentsX = clamped;
             MarkGeometryDirty();
@@ -61,14 +62,14 @@ public sealed class Plane3D : Object3D
         get => _segmentsY;
         set
         {
-            var clamped = System.Math.Max(1, value);
+            var clamped = Guard3D.Positive(value, nameof(SegmentsY));
             if (_segmentsY == clamped) return;
             _segmentsY = clamped;
             MarkGeometryDirty();
         }
     }
 
-    protected override Mesh3D BuildMesh() => MeshCache3D.Shared.GetOrCreate(
+    protected override Mesh3D BuildMesh() => GetOrCreateCachedMesh(
         MeshResourceKey.Plane(Width, Height, SegmentsX, SegmentsY),
         () => MeshFactory.CreatePlane(Width, Height, SegmentsX, SegmentsY));
 

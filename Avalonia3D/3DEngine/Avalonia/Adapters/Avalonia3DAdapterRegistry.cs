@@ -33,7 +33,7 @@ public sealed class Avalonia3DAdapterRegistry
             if (adapter.CanAdapt(control))
             {
                 var obj = adapter.Adapt(control);
-                _scene.Add(obj);
+                AddToScene(obj);
                 return obj;
             }
         }
@@ -45,8 +45,19 @@ public sealed class Avalonia3DAdapterRegistry
             AlwaysFaceCamera = false
         };
 
-        _scene.Add(plane);
+        AddToScene(plane);
         return plane;
+    }
+
+    private void AddToScene(Object3D obj)
+    {
+        if (_scene.World.HasSimulationOwner && !_scene.World.IsCurrentThreadSimulationOwner)
+        {
+            _scene.World.Mutate(scene => scene.Add(obj));
+            return;
+        }
+
+        _scene.Add(obj);
     }
 
     private static float ToWorldUnits(double value, double fallbackPixels)

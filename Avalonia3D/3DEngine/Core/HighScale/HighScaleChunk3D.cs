@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using ThreeDEngine.Core.Collision;
 
 namespace ThreeDEngine.Core.HighScale;
@@ -26,18 +27,22 @@ public readonly struct HighScaleChunkKey3D : IEquatable<HighScaleChunkKey3D>
 public sealed class HighScaleChunk3D
 {
     private readonly List<int> _indices = new();
+    private readonly ReadOnlyCollection<int> _indicesView;
 
     public HighScaleChunk3D(HighScaleChunkKey3D key, Bounds3D bounds)
     {
+        if (!bounds.IsValid) throw new ArgumentException("Chunk bounds must be valid.", nameof(bounds));
         Key = key;
         Bounds = bounds;
+        _indicesView = _indices.AsReadOnly();
     }
 
     public HighScaleChunkKey3D Key { get; }
     public Bounds3D Bounds { get; internal set; }
-    public IReadOnlyList<int> InstanceIndices => _indices;
+    public IReadOnlyList<int> InstanceIndices => _indicesView;
     public int Version { get; private set; }
     public bool IsDirty { get; private set; } = true;
+    internal bool BoundsDirty { get; private set; }
 
     internal void Clear()
     {
@@ -48,6 +53,7 @@ public sealed class HighScaleChunk3D
 
     internal void Add(int instanceIndex)
     {
+        if (instanceIndex < 0) throw new ArgumentOutOfRangeException(nameof(instanceIndex));
         _indices.Add(instanceIndex);
         Version++;
         IsDirty = true;
@@ -58,6 +64,10 @@ public sealed class HighScaleChunk3D
         Version++;
         IsDirty = true;
     }
+
+    internal void MarkBoundsDirty() => BoundsDirty = true;
+
+    internal void MarkBoundsClean() => BoundsDirty = false;
 
     internal void MarkClean() => IsDirty = false;
 }

@@ -8,13 +8,14 @@ internal sealed partial class OpenGlSceneRenderer
 {
     private void UploadSkyboxTexture(GlInterface gl, Skybox3D skybox, RenderStats stats)
     {
-        if (skybox.Mode != SkyboxMode3D.Equirectangular || !skybox.HasEquirectangularTexture || string.IsNullOrWhiteSpace(skybox.EquirectangularTextureKey) || skybox.EquirectangularTextureData is not { Length: > 0 })
+        var texture = skybox.Mode == SkyboxMode3D.Equirectangular ? skybox.EquirectangularTextureInternal : null;
+        if (texture is null)
         {
             UploadFloat(_uniform1f, _skyboxTextureEnabledLocation, 0f);
             return;
         }
 
-        var resource = EnsureMaterialTexture(gl, skybox.EquirectangularTextureKey, skybox.EquirectangularTextureData, skybox.EnvironmentTextureVersion, GlTexture6, stats);
+        var resource = EnsureMaterialTexture(gl, texture, GlTexture6, stats);
         if (resource is null)
         {
             UploadFloat(_uniform1f, _skyboxTextureEnabledLocation, 0f);
@@ -28,7 +29,6 @@ internal sealed partial class OpenGlSceneRenderer
         gl.ActiveTexture(GlTexture0);
     }
 
-
     private void UploadSkyboxCubemapTextures(GlInterface gl, Skybox3D skybox, RenderStats stats)
     {
         if (skybox.Mode != SkyboxMode3D.Cubemap || !skybox.HasCubemapTextures)
@@ -37,32 +37,38 @@ internal sealed partial class OpenGlSceneRenderer
             return;
         }
 
-        var samplerLocations = new[] { _skyboxPXLocation, _skyboxNXLocation, _skyboxPYLocation, _skyboxNYLocation, _skyboxPZLocation, _skyboxNZLocation };
-        var textureUnits = new[] { GlTexture0, GlTexture1, GlTexture2, GlTexture3, GlTexture4, GlTexture5 };
         for (var i = 0; i < 6; i++)
         {
-            var key = skybox.CubemapTextureKeys[i];
-            var data = skybox.CubemapTextureData[i];
-            if (string.IsNullOrWhiteSpace(key) || data is not { Length: > 0 })
+            var texture = skybox.CubemapTexturesInternal[i];
+            if (texture is null)
             {
                 UploadFloat(_uniform1f, _skyboxCubemapEnabledLocation, 0f);
                 return;
             }
 
-            var resource = EnsureMaterialTexture(gl, key, data, skybox.EnvironmentTextureVersion, textureUnits[i], stats);
+            var textureUnit = GlTexture0 + i;
+            var samplerLocation = i switch
+            {
+                0 => _skyboxPXLocation,
+                1 => _skyboxNXLocation,
+                2 => _skyboxPYLocation,
+                3 => _skyboxNYLocation,
+                4 => _skyboxPZLocation,
+                _ => _skyboxNZLocation
+            };
+            var resource = EnsureMaterialTexture(gl, texture, textureUnit, stats);
             if (resource is null)
             {
                 UploadFloat(_uniform1f, _skyboxCubemapEnabledLocation, 0f);
                 return;
             }
 
-            gl.ActiveTexture(textureUnits[i]);
+            gl.ActiveTexture(textureUnit);
             gl.BindTexture(GlTexture2D, resource.TextureId);
-            if (samplerLocations[i] >= 0) _uniform1i?.Invoke(samplerLocations[i], i);
+            if (samplerLocation >= 0) _uniform1i?.Invoke(samplerLocation, i);
         }
 
         UploadFloat(_uniform1f, _skyboxCubemapEnabledLocation, 1f);
         gl.ActiveTexture(GlTexture0);
     }
-
 }

@@ -9,7 +9,7 @@ namespace ThreeDEngine.Core.Rendering;
 /// Shared particle instance packing and per-system transparent ordering. Backends provide
 /// storage/upload; Core owns the transform, color, scale and order math.
 /// </summary>
-public static class ParticleInstanceStream3D
+internal static class ParticleInstanceStream3D
 {
     public const int BillboardFloatStride = 8; // center.xyz + size + color.rgba
     public const int MeshFloatStride = 20; // model matrix + color.rgba

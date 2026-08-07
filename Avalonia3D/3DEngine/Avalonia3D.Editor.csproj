@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net8.0-browser</TargetFrameworks>
+    <RootNamespace>ThreeDEngine</RootNamespace>
+    <AssemblyName>Avalonia3D.Editor</AssemblyName>
+    <PackageId>Avalonia3D.Editor</PackageId>
+    <Description>Optional preview, editor, demo catalog and test controls for Avalonia3D.</Description>
+    <IsPackable>true</IsPackable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Core/Preview/**/*.cs" />
+    <Compile Include="Core/Demos/**/*.cs" />
+    <Compile Include="Avalonia/Preview/**/*.cs" />
+    <Compile Include="TestControls/**/*.cs" />
+    <ProjectReference Include="Avalonia3D.Core.csproj" />
+    <ProjectReference Include="Avalonia3D.Avalonia.csproj" />
+    <PackageReference Include="Avalonia" />
+  </ItemGroup>
+</Project>

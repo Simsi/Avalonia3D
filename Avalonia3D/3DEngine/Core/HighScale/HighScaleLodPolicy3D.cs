@@ -1,5 +1,6 @@
 using System;
 using System.Numerics;
+using ThreeDEngine.Core.Validation;
 
 namespace ThreeDEngine.Core.HighScale;
 
@@ -18,19 +19,19 @@ public sealed class HighScaleLodPolicy3D
     public float DetailedDistance
     {
         get => _detailedDistance;
-        set => SetDistance(ref _detailedDistance, value, 0.01f);
+        set => SetDistances(value, _simplifiedDistance, _proxyDistance, _drawDistance, _fadeDistance);
     }
 
     public float SimplifiedDistance
     {
         get => _simplifiedDistance;
-        set => SetDistance(ref _simplifiedDistance, value, DetailedDistance + 0.01f);
+        set => SetDistances(_detailedDistance, value, _proxyDistance, _drawDistance, _fadeDistance);
     }
 
     public float ProxyDistance
     {
         get => _proxyDistance;
-        set => SetDistance(ref _proxyDistance, value, SimplifiedDistance + 0.01f);
+        set => SetDistances(_detailedDistance, _simplifiedDistance, value, _drawDistance, _fadeDistance);
     }
 
     /// <summary>
@@ -40,20 +41,19 @@ public sealed class HighScaleLodPolicy3D
     public float DrawDistance
     {
         get => _drawDistance;
-        set => SetDistance(ref _drawDistance, value, ProxyDistance + 0.01f);
+        set => SetDistances(_detailedDistance, _simplifiedDistance, _proxyDistance, value, _fadeDistance);
     }
 
-    /// <summary>
-    /// Distance band used by renderers for dithered fade near DrawDistance.
-    /// </summary>
+    /// <summary>Distance band used by renderers for dithered fade near DrawDistance.</summary>
     public float FadeDistance
     {
         get => _fadeDistance;
-        set => SetDistance(ref _fadeDistance, value, 0f);
+        set => SetDistances(_detailedDistance, _simplifiedDistance, _proxyDistance, _drawDistance, value);
     }
 
     /// <summary>
-    /// If true, far objects are reported as Billboard. Renderers without a billboard pass draw them through proxy geometry.
+    /// If true, far objects are reported as Billboard. A backend that cannot render billboards
+    /// must reject the selected LOD instead of silently drawing proxy geometry.
     /// </summary>
     public bool EnableBillboardFallback
     {
@@ -66,62 +66,56 @@ public sealed class HighScaleLodPolicy3D
         }
     }
 
+    public void SetDistances(float detailed, float simplified, float proxy, float draw, float fade)
+    {
+        Guard3D.Positive(detailed, nameof(detailed));
+        Guard3D.Positive(simplified, nameof(simplified));
+        Guard3D.Positive(proxy, nameof(proxy));
+        Guard3D.Positive(draw, nameof(draw));
+        Guard3D.NonNegative(fade, nameof(fade));
+        if (!(detailed < simplified && simplified < proxy && proxy < draw))
+            throw new ArgumentException("LOD distances must satisfy detailed < simplified < proxy < draw.");
+        if (fade > draw)
+            throw new ArgumentOutOfRangeException(nameof(fade), fade, "Fade distance cannot exceed draw distance.");
+        if (_detailedDistance == detailed && _simplifiedDistance == simplified && _proxyDistance == proxy &&
+            _drawDistance == draw && _fadeDistance == fade)
+        {
+            return;
+        }
+
+        _detailedDistance = detailed;
+        _simplifiedDistance = simplified;
+        _proxyDistance = proxy;
+        _drawDistance = draw;
+        _fadeDistance = fade;
+        _version++;
+    }
+
     public HighScaleLodLevel3D Resolve(Vector3 cameraPosition, Matrix4x4 instanceTransform)
     {
+        Guard3D.Finite(cameraPosition, nameof(cameraPosition));
+        Guard3D.FiniteMatrix(instanceTransform, nameof(instanceTransform), requireInvertible: true);
         var pos = new Vector3(instanceTransform.M41, instanceTransform.M42, instanceTransform.M43);
         var d2 = Vector3.DistanceSquared(cameraPosition, pos);
-        if (d2 > DrawDistance * DrawDistance)
-        {
-            return HighScaleLodLevel3D.Culled;
-        }
-
-        if (d2 <= DetailedDistance * DetailedDistance)
-        {
-            return HighScaleLodLevel3D.Detailed;
-        }
-
-        if (d2 <= SimplifiedDistance * SimplifiedDistance)
-        {
-            return HighScaleLodLevel3D.Simplified;
-        }
-
-        if (d2 <= ProxyDistance * ProxyDistance)
-        {
-            return HighScaleLodLevel3D.Proxy;
-        }
-
+        if (d2 > DrawDistance * DrawDistance) return HighScaleLodLevel3D.Culled;
+        if (d2 <= DetailedDistance * DetailedDistance) return HighScaleLodLevel3D.Detailed;
+        if (d2 <= SimplifiedDistance * SimplifiedDistance) return HighScaleLodLevel3D.Simplified;
+        if (d2 <= ProxyDistance * ProxyDistance) return HighScaleLodLevel3D.Proxy;
         return EnableBillboardFallback ? HighScaleLodLevel3D.Billboard : HighScaleLodLevel3D.Proxy;
     }
 
     public float ResolveFadeAlpha(Vector3 cameraPosition, Matrix4x4 instanceTransform)
     {
-        if (FadeDistance <= 0.001f)
-        {
-            return 1f;
-        }
+        Guard3D.Finite(cameraPosition, nameof(cameraPosition));
+        Guard3D.FiniteMatrix(instanceTransform, nameof(instanceTransform), requireInvertible: true);
+        if (FadeDistance <= 0.001f) return 1f;
 
         var pos = new Vector3(instanceTransform.M41, instanceTransform.M42, instanceTransform.M43);
         var distance = Vector3.Distance(cameraPosition, pos);
         var fadeStart = MathF.Max(0f, DrawDistance - FadeDistance);
-        if (distance <= fadeStart)
-        {
-            return 1f;
-        }
-
-        if (distance >= DrawDistance)
-        {
-            return 0f;
-        }
-
-        var t = (distance - fadeStart) / MathF.Max(FadeDistance, 0.001f);
+        if (distance <= fadeStart) return 1f;
+        if (distance >= DrawDistance) return 0f;
+        var t = (distance - fadeStart) / FadeDistance;
         return System.Math.Clamp(1f - t, 0f, 1f);
-    }
-
-    private void SetDistance(ref float field, float value, float min)
-    {
-        var clamped = MathF.Max(min, value);
-        if (MathF.Abs(field - clamped) < 0.0001f) return;
-        field = clamped;
-        _version++;
     }
 }

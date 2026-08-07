@@ -2,14 +2,60 @@ using System;
 using System.Numerics;
 using ThreeDEngine.Core.Math;
 using ThreeDEngine.Core.Scene;
+using ThreeDEngine.Core.Validation;
 
 namespace ThreeDEngine.Core.Collision;
 
 public sealed class CapsuleCollider3D : Collider3D
 {
-    public Vector3 Center { get; set; }
-    public float Radius { get; set; } = 0.25f;
-    public float Height { get; set; } = 1.8f;
+    private Vector3 _center;
+    private float _radius = 0.25f;
+    private float _height = 1.8f;
+
+    public Vector3 Center
+    {
+        get => _center;
+        set { using var mutation = EnterMutationScope(); value = Guard3D.Finite(value, nameof(value)); if (_center == value) return; _center = value; RaiseChanged(); }
+    }
+
+    public float Radius
+    {
+        get => _radius;
+        set
+        {
+            using var mutation = EnterMutationScope();
+            value = Guard3D.Positive(value, nameof(value));
+            if (value * 2f > _height) throw new ArgumentOutOfRangeException(nameof(value), value, "Capsule diameter cannot exceed its height.");
+            if (MathF.Abs(_radius - value) < 0.000001f) return;
+            _radius = value;
+            RaiseChanged();
+        }
+    }
+
+    public float Height
+    {
+        get => _height;
+        set
+        {
+            using var mutation = EnterMutationScope();
+            value = Guard3D.Positive(value, nameof(value));
+            if (value < _radius * 2f) throw new ArgumentOutOfRangeException(nameof(value), value, "Capsule height cannot be smaller than its diameter.");
+            if (MathF.Abs(_height - value) < 0.000001f) return;
+            _height = value;
+            RaiseChanged();
+        }
+    }
+
+    public void SetDimensions(float radius, float height)
+    {
+        radius = Guard3D.Positive(radius, nameof(radius));
+        height = Guard3D.Positive(height, nameof(height));
+        if (height < radius * 2f) throw new ArgumentOutOfRangeException(nameof(height), height, "Capsule height cannot be smaller than its diameter.");
+        if (MathF.Abs(_radius - radius) < 0.000001f && MathF.Abs(_height - height) < 0.000001f) return;
+        _radius = radius;
+        _height = height;
+        RaiseChanged();
+    }
 
     public override Bounds3D GetWorldBounds(Object3D owner)
     {
@@ -47,8 +93,8 @@ public sealed class CapsuleCollider3D : Collider3D
         var axis = axisVector.LengthSquared() > 0.000001f ? Vector3.Normalize(axisVector) : Vector3.UnitY;
         var sx = Vector3.TransformNormal(Vector3.UnitX, model).Length();
         var sz = Vector3.TransformNormal(Vector3.UnitZ, model).Length();
-        var radius = MathF.Max(0.0001f, Radius * MathF.Max(sx, sz));
-        var height = MathF.Max(radius * 2f, Height * yScale);
+        var radius = Radius * MathF.Max(sx, sz);
+        var height = Height * yScale;
         var halfSegment = MathF.Max(0f, height * 0.5f - radius);
         return new WorldCapsule(center - axis * halfSegment, center + axis * halfSegment, radius);
     }

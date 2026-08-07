@@ -4,12 +4,14 @@ using ThreeDEngine.Core.Materials;
 
 namespace ThreeDEngine.Core.Rendering;
 
-public readonly struct ShaderProgramDescriptor3D : IEquatable<ShaderProgramDescriptor3D>
+internal readonly struct ShaderProgramDescriptor3D : IEquatable<ShaderProgramDescriptor3D>
 {
     public ShaderProgramDescriptor3D(string shaderId, VertexLayout3D vertexLayout, LightingMode lightingMode, SurfaceMode surfaceMode, bool usesInstancing = false, bool usesTexture = false)
     {
-        ShaderId = string.IsNullOrWhiteSpace(shaderId) ? "mesh" : shaderId;
+        ShaderId = string.IsNullOrWhiteSpace(shaderId) ? "mesh" : shaderId.Trim();
         VertexLayout = vertexLayout ?? throw new ArgumentNullException(nameof(vertexLayout));
+        if (!Enum.IsDefined(lightingMode)) throw new ArgumentOutOfRangeException(nameof(lightingMode));
+        if (!Enum.IsDefined(surfaceMode)) throw new ArgumentOutOfRangeException(nameof(surfaceMode));
         LightingMode = lightingMode;
         SurfaceMode = surfaceMode;
         UsesInstancing = usesInstancing;
@@ -24,7 +26,7 @@ public readonly struct ShaderProgramDescriptor3D : IEquatable<ShaderProgramDescr
     public bool UsesTexture { get; }
 
     public RendererResourceKey ResourceKey => RendererResourceKey.Shader(
-        ShaderId + "|layout=" + VertexLayout.GetHashCode().ToString(System.Globalization.CultureInfo.InvariantCulture)
+        ShaderId + "|layout=" + VertexLayout.ToString()
         + "|light=" + LightingMode
         + "|surface=" + SurfaceMode
         + "|inst=" + UsesInstancing

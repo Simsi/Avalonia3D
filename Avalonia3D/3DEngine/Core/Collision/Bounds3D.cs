@@ -1,5 +1,6 @@
 using System;
 using System.Numerics;
+using ThreeDEngine.Core.Validation;
 
 namespace ThreeDEngine.Core.Collision;
 
@@ -20,15 +21,21 @@ public readonly struct Bounds3D
     }
 
     public Bounds3D(Vector3 min, Vector3 max)
-        : this(min, max, normalize: true)
     {
+        Min = Guard3D.Finite(min, nameof(min));
+        Max = Guard3D.Finite(max, nameof(max));
+        if (Min.X > Max.X || Min.Y > Max.Y || Min.Z > Max.Z)
+            throw new ArgumentException("Bounds minimum must not exceed maximum on any axis.", nameof(min));
     }
 
     public Vector3 Min { get; }
     public Vector3 Max { get; }
     public Vector3 Center => IsValid ? (Min + Max) * 0.5f : Vector3.Zero;
     public Vector3 Size => IsValid ? Max - Min : Vector3.Zero;
-    public bool IsValid => Min.X <= Max.X && Min.Y <= Max.Y && Min.Z <= Max.Z;
+    public bool IsValid =>
+        float.IsFinite(Min.X) && float.IsFinite(Min.Y) && float.IsFinite(Min.Z) &&
+        float.IsFinite(Max.X) && float.IsFinite(Max.Y) && float.IsFinite(Max.Z) &&
+        Min.X <= Max.X && Min.Y <= Max.Y && Min.Z <= Max.Z;
 
     public static Bounds3D Empty => new(
         new Vector3(float.PositiveInfinity, float.PositiveInfinity, float.PositiveInfinity),
@@ -49,6 +56,7 @@ public readonly struct Bounds3D
 
     public bool Contains(Vector3 point)
     {
+        Guard3D.Finite(point, nameof(point));
         if (!IsValid)
         {
             return false;
@@ -61,6 +69,7 @@ public readonly struct Bounds3D
 
     public Bounds3D Encapsulate(Vector3 point)
     {
+        Guard3D.Finite(point, nameof(point));
         return IsValid
             ? new Bounds3D(Vector3.Min(Min, point), Vector3.Max(Max, point))
             : new Bounds3D(point, point);
@@ -83,6 +92,7 @@ public readonly struct Bounds3D
 
     public Bounds3D Transform(Matrix4x4 matrix)
     {
+        Guard3D.FiniteMatrix(matrix, nameof(matrix), requireInvertible: true);
         if (!IsValid)
         {
             return Empty;

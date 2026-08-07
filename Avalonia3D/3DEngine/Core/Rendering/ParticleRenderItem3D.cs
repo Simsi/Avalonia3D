@@ -9,7 +9,7 @@ namespace ThreeDEngine.Core.Rendering;
 /// Backend-neutral particle render item. It contains the per-system decisions that both
 /// desktop OpenGL and WebGL need before they translate particles into their own instance buffers.
 /// </summary>
-public readonly struct ParticleRenderItem3D
+internal readonly struct ParticleRenderItem3D
 {
     public ParticleRenderItem3D(
         ParticleSystem3D system,

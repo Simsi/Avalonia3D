@@ -1,6 +1,6 @@
 namespace ThreeDEngine.Core.Rendering.Pipeline;
 
-public enum RenderTargetFormat3D
+internal enum RenderTargetFormat3D
 {
     Unknown = 0,
     Rgba8 = 1,

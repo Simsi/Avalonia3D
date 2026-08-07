@@ -9,7 +9,7 @@ namespace ThreeDEngine.Core.Rendering;
 /// the key rules diverge, material/skinning fixes have to be applied twice. This
 /// helper centralizes the policy while keeping ids WebGL-safe and compact.
 /// </summary>
-public static class RenderId3D
+internal static class RenderId3D
 {
     public const ulong FnvOffsetBasis = 14695981039346656037UL;
     public const ulong FnvPrime = 1099511628211UL;
@@ -33,18 +33,27 @@ public static class RenderId3D
         return "ord:" + FormatStableHash(StableHash64(meshResourceKey)) + ":" + FormatStableHash(materialBatchHash) + skinKey;
     }
 
-    public static string BuildParticleRetainedBatchId(string particleSystemId, object renderMode)
-        => "particles:" + particleSystemId + ":" + renderMode;
+    public static string BuildParticleRetainedBatchId(string particleSystemId, int renderMode)
+        => "particles:" + particleSystemId + ":" + renderMode.ToString(CultureInfo.InvariantCulture);
 
     public static string BuildHighScaleBatchId(string layerId, int chunkX, int chunkY, int chunkZ, int lod, int partIndex)
         => $"hs:{layerId}:{chunkX}:{chunkY}:{chunkZ}:{lod}:{partIndex}";
 
-    public static string BuildTransparentDrawId(string retainedBatchId, string ownerId, int sourceOrder)
+    public static string BuildTransparentDrawId(string retainedBatchId, string ownerId)
     {
+        // Source order is deliberately excluded. Packed scene registries may swap the last
+        // element into a removed slot, and camera sorting may reorder items; neither event
+        // changes the retained identity of the same object/material/mesh draw.
         var hash = StableHash64(retainedBatchId);
         hash = CombineStableHash(hash, StableHash64(ownerId));
-        hash = CombineStableHash(hash, unchecked((ulong)(uint)sourceOrder));
         return FormatStableHash(hash, "tr:");
+    }
+
+    public static string BuildTransparentDepthBatchId(string retainedBatchId, int depthBin)
+    {
+        var hash = StableHash64(retainedBatchId);
+        hash = CombineStableHash(hash, unchecked((ulong)(uint)depthBin));
+        return FormatStableHash(hash, "tb:");
     }
 
     public static ulong CombineStableHash(ulong hash, ulong value)

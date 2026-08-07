@@ -2,16 +2,17 @@ using System;
 using System.Runtime.CompilerServices;
 using ThreeDEngine.Core.Materials;
 using ThreeDEngine.Core.Primitives;
+using ThreeDEngine.Core.Resources;
 
 namespace ThreeDEngine.Core.Rendering;
 
-public readonly struct MaterialBinding3D : IEquatable<MaterialBinding3D>
+internal readonly struct MaterialBinding3D : IEquatable<MaterialBinding3D>
 {
     private static readonly ConditionalWeakTable<Material3D, CacheEntry> Cache = new();
 
     private MaterialBinding3D(Material3D material)
     {
-        material ??= Material3D.Default;
+        ArgumentNullException.ThrowIfNull(material);
         BaseColor = material.EffectiveColor;
         SpecularColor = material.SpecularColor;
         Lighting = material.Lighting;
@@ -26,27 +27,16 @@ public readonly struct MaterialBinding3D : IEquatable<MaterialBinding3D>
         AlphaCutoff = material.AlphaCutoff;
         DoubleSided = material.DoubleSided;
         EmissiveColor = material.EmissiveColor;
-        BaseColorTextureKey = material.BaseColorTextureKey;
-        BaseColorTextureData = material.BaseColorTextureData;
-        BaseColorTextureMimeType = material.BaseColorTextureMimeType;
+        BaseColorTextureResource = material.BaseColorTextureInternal;
         BaseColorTextureVersion = material.BaseColorTextureVersion;
-        NormalMapTextureKey = material.NormalMapTextureKey;
-        NormalMapTextureData = material.NormalMapTextureData;
-        NormalMapTextureMimeType = material.NormalMapTextureMimeType;
+        NormalMapTextureResource = material.NormalMapTextureInternal;
         NormalMapTextureVersion = material.NormalMapTextureVersion;
         NormalMapStrength = material.NormalMapStrength;
-        MetallicRoughnessTextureKey = material.MetallicRoughnessTextureKey;
-        MetallicRoughnessTextureData = material.MetallicRoughnessTextureData;
-        MetallicRoughnessTextureMimeType = material.MetallicRoughnessTextureMimeType;
+        MetallicRoughnessTextureResource = material.MetallicRoughnessTextureInternal;
         MetallicRoughnessTextureVersion = material.MetallicRoughnessTextureVersion;
-        EmissiveTextureKey = material.EmissiveTextureKey;
-        EmissiveTextureData = material.EmissiveTextureData;
-        EmissiveTextureMimeType = material.EmissiveTextureMimeType;
+        EmissiveTextureResource = material.EmissiveTextureInternal;
         EmissiveTextureVersion = material.EmissiveTextureVersion;
 
-        // Assign the identity fields before passing this readonly struct to helpers. The values
-        // are immediately replaced, but the explicit initialization avoids definite-assignment
-        // ambiguity on stricter compilers.
         KeyHash = 0UL;
         BatchKeyHash = 0UL;
         Key = string.Empty;
@@ -74,33 +64,50 @@ public readonly struct MaterialBinding3D : IEquatable<MaterialBinding3D>
     public float AlphaCutoff { get; }
     public bool DoubleSided { get; }
     public ColorRgba EmissiveColor { get; }
-    public string? BaseColorTextureKey { get; }
-    public byte[]? BaseColorTextureData { get; }
-    public string? BaseColorTextureMimeType { get; }
+
+    public TextureResource3D? BaseColorTextureResource { get; }
+    public string? BaseColorTextureKey => BaseColorTextureResource?.LogicalKey;
+    public string? BaseColorTextureResourceKey => BaseColorTextureResource?.ResourceKey;
+    public byte[]? BaseColorTextureData => BaseColorTextureResource?.CopyEncodedData();
+    internal byte[]? BaseColorTextureDataInternal => BaseColorTextureResource?.EncodedDataInternal;
+    public string? BaseColorTextureMimeType => BaseColorTextureResource?.MimeType;
     public int BaseColorTextureVersion { get; }
-    public bool HasBaseColorTexture => !string.IsNullOrWhiteSpace(BaseColorTextureKey) && BaseColorTextureData is { Length: > 0 };
-    public string? NormalMapTextureKey { get; }
-    public byte[]? NormalMapTextureData { get; }
-    public string? NormalMapTextureMimeType { get; }
+    public bool HasBaseColorTexture => BaseColorTextureResource is not null;
+
+    public TextureResource3D? NormalMapTextureResource { get; }
+    public string? NormalMapTextureKey => NormalMapTextureResource?.LogicalKey;
+    public string? NormalMapTextureResourceKey => NormalMapTextureResource?.ResourceKey;
+    public byte[]? NormalMapTextureData => NormalMapTextureResource?.CopyEncodedData();
+    internal byte[]? NormalMapTextureDataInternal => NormalMapTextureResource?.EncodedDataInternal;
+    public string? NormalMapTextureMimeType => NormalMapTextureResource?.MimeType;
     public int NormalMapTextureVersion { get; }
     public float NormalMapStrength { get; }
-    public bool HasNormalMap => !string.IsNullOrWhiteSpace(NormalMapTextureKey) && NormalMapTextureData is { Length: > 0 } && NormalMapStrength > 0.0001f;
-    public string? MetallicRoughnessTextureKey { get; }
-    public byte[]? MetallicRoughnessTextureData { get; }
-    public string? MetallicRoughnessTextureMimeType { get; }
+    public bool HasNormalMap => NormalMapTextureResource is not null && NormalMapStrength > 0.0001f;
+
+    public TextureResource3D? MetallicRoughnessTextureResource { get; }
+    public string? MetallicRoughnessTextureKey => MetallicRoughnessTextureResource?.LogicalKey;
+    public string? MetallicRoughnessTextureResourceKey => MetallicRoughnessTextureResource?.ResourceKey;
+    public byte[]? MetallicRoughnessTextureData => MetallicRoughnessTextureResource?.CopyEncodedData();
+    internal byte[]? MetallicRoughnessTextureDataInternal => MetallicRoughnessTextureResource?.EncodedDataInternal;
+    public string? MetallicRoughnessTextureMimeType => MetallicRoughnessTextureResource?.MimeType;
     public int MetallicRoughnessTextureVersion { get; }
-    public bool HasMetallicRoughnessTexture => !string.IsNullOrWhiteSpace(MetallicRoughnessTextureKey) && MetallicRoughnessTextureData is { Length: > 0 };
-    public string? EmissiveTextureKey { get; }
-    public byte[]? EmissiveTextureData { get; }
-    public string? EmissiveTextureMimeType { get; }
+    public bool HasMetallicRoughnessTexture => MetallicRoughnessTextureResource is not null;
+
+    public TextureResource3D? EmissiveTextureResource { get; }
+    public string? EmissiveTextureKey => EmissiveTextureResource?.LogicalKey;
+    public string? EmissiveTextureResourceKey => EmissiveTextureResource?.ResourceKey;
+    public byte[]? EmissiveTextureData => EmissiveTextureResource?.CopyEncodedData();
+    internal byte[]? EmissiveTextureDataInternal => EmissiveTextureResource?.EncodedDataInternal;
+    public string? EmissiveTextureMimeType => EmissiveTextureResource?.MimeType;
     public int EmissiveTextureVersion { get; }
-    public bool HasEmissiveTexture => !string.IsNullOrWhiteSpace(EmissiveTextureKey) && EmissiveTextureData is { Length: > 0 };
+    public bool HasEmissiveTexture => EmissiveTextureResource is not null;
+
     public string Key { get; }
     public ulong KeyHash { get; }
+
     /// <summary>
     /// GPU retained batching key. Base color and opacity are intentionally excluded because
-    /// WebGL/OpenGL retained paths stream color as per-instance state; color-only changes should
-    /// not destroy and recreate retained batches.
+    /// retained paths stream color as per-instance state. Texture identity is content-based.
     /// </summary>
     public string BatchKey { get; }
     public ulong BatchKeyHash { get; }
@@ -108,14 +115,10 @@ public readonly struct MaterialBinding3D : IEquatable<MaterialBinding3D>
 
     public static MaterialBinding3D FromMaterial(Material3D material)
     {
-        material ??= Material3D.Default;
+        ArgumentNullException.ThrowIfNull(material);
         var entry = Cache.GetValue(material, static _ => new CacheEntry());
         var version = material.Version;
-        if (entry.TryGet(version, out var cached))
-        {
-            return cached;
-        }
-
+        if (entry.TryGet(version, out var cached)) return cached;
         var created = new MaterialBinding3D(material);
         entry.Set(version, created);
         return created;
@@ -125,7 +128,6 @@ public readonly struct MaterialBinding3D : IEquatable<MaterialBinding3D>
         => KeyHash == other.KeyHash && string.Equals(Key, other.Key, StringComparison.Ordinal);
 
     public override bool Equals(object? obj) => obj is MaterialBinding3D other && Equals(other);
-
     public override int GetHashCode() => KeyHash.GetHashCode();
 
     private static ulong ComputeSignatureHash(MaterialBinding3D m, bool includeBaseColor)
@@ -134,11 +136,7 @@ public readonly struct MaterialBinding3D : IEquatable<MaterialBinding3D>
         {
             var hash = RenderId3D.FnvOffsetBasis;
             hash = HashInt(hash, includeBaseColor ? 1 : 0);
-            if (includeBaseColor)
-            {
-                hash = HashColor(hash, m.BaseColor);
-            }
-
+            if (includeBaseColor) hash = HashColor(hash, m.BaseColor);
             hash = HashColor(hash, m.SpecularColor);
             hash = HashInt(hash, (int)m.Lighting);
             hash = HashInt(hash, (int)m.Surface);
@@ -152,20 +150,17 @@ public readonly struct MaterialBinding3D : IEquatable<MaterialBinding3D>
             hash = HashFloat4(hash, m.AlphaCutoff);
             hash = HashInt(hash, m.DoubleSided ? 1 : 0);
             hash = HashColor(hash, m.EmissiveColor);
-            hash = HashTexture(hash, m.BaseColorTextureKey, m.BaseColorTextureVersion);
-            hash = HashTexture(hash, m.NormalMapTextureKey, m.NormalMapTextureVersion);
+            hash = HashTexture(hash, m.BaseColorTextureResourceKey);
+            hash = HashTexture(hash, m.NormalMapTextureResourceKey);
             hash = HashFloat4(hash, m.NormalMapStrength);
-            hash = HashTexture(hash, m.MetallicRoughnessTextureKey, m.MetallicRoughnessTextureVersion);
-            hash = HashTexture(hash, m.EmissiveTextureKey, m.EmissiveTextureVersion);
+            hash = HashTexture(hash, m.MetallicRoughnessTextureResourceKey);
+            hash = HashTexture(hash, m.EmissiveTextureResourceKey);
             return hash == 0UL ? 1UL : hash;
         }
     }
 
-    private static ulong HashTexture(ulong hash, string? key, int version)
-    {
-        hash = HashString(hash, key ?? string.Empty);
-        return HashInt(hash, version);
-    }
+    private static ulong HashTexture(ulong hash, string? resourceKey)
+        => HashString(hash, resourceKey ?? string.Empty);
 
     private static ulong HashColor(ulong hash, ColorRgba color)
     {
@@ -195,14 +190,10 @@ public readonly struct MaterialBinding3D : IEquatable<MaterialBinding3D>
     {
         unchecked
         {
-            hash ^= (byte)value;
-            hash *= RenderId3D.FnvPrime;
-            hash ^= (byte)(value >> 8);
-            hash *= RenderId3D.FnvPrime;
-            hash ^= (byte)(value >> 16);
-            hash *= RenderId3D.FnvPrime;
-            hash ^= (byte)(value >> 24);
-            hash *= RenderId3D.FnvPrime;
+            hash ^= (byte)value; hash *= RenderId3D.FnvPrime;
+            hash ^= (byte)(value >> 8); hash *= RenderId3D.FnvPrime;
+            hash ^= (byte)(value >> 16); hash *= RenderId3D.FnvPrime;
+            hash ^= (byte)(value >> 24); hash *= RenderId3D.FnvPrime;
             return hash;
         }
     }
@@ -214,12 +205,7 @@ public readonly struct MaterialBinding3D : IEquatable<MaterialBinding3D>
 
         public bool TryGet(int version, out MaterialBinding3D binding)
         {
-            if (_version == version)
-            {
-                binding = _binding;
-                return true;
-            }
-
+            if (_version == version) { binding = _binding; return true; }
             binding = default;
             return false;
         }

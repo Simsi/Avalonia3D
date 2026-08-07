@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using ThreeDEngine.Core.Materials;
 using ThreeDEngine.Core.Primitives;
+using ThreeDEngine.Core.Validation;
 
 namespace ThreeDEngine.Core.Assets.Models;
 
@@ -23,19 +24,19 @@ public sealed class ModelMaterialAsset3D
         ColorRgba? emissiveColor = null,
         bool doubleSided = false)
     {
-        Index = index;
-        Name = string.IsNullOrWhiteSpace(name) ? $"Material_{index}" : name;
-        BaseColor = baseColor;
-        MetallicFactor = global::System.Math.Clamp(metallicFactor, 0f, 1f);
-        RoughnessFactor = global::System.Math.Clamp(roughnessFactor, 0f, 1f);
-        AlphaMode = string.IsNullOrWhiteSpace(alphaMode) ? "OPAQUE" : alphaMode;
-        AlphaCutoff = global::System.Math.Clamp(alphaCutoff, 0f, 1f);
-        BaseColorTextureIndex = baseColorTextureIndex;
-        NormalTextureIndex = normalTextureIndex;
-        NormalTextureScale = global::System.Math.Clamp(normalTextureScale, 0f, 4f);
-        MetallicRoughnessTextureIndex = metallicRoughnessTextureIndex;
-        EmissiveTextureIndex = emissiveTextureIndex;
-        EmissiveColor = emissiveColor ?? ColorRgba.Transparent;
+        Index = Guard3D.NonNegative(index, nameof(index));
+        Name = Guard3D.RequiredText(name, nameof(name));
+        BaseColor = Guard3D.Color(baseColor, nameof(baseColor));
+        MetallicFactor = Guard3D.Range(metallicFactor, 0f, 1f, nameof(metallicFactor));
+        RoughnessFactor = Guard3D.Range(roughnessFactor, 0f, 1f, nameof(roughnessFactor));
+        AlphaMode = NormalizeAlphaMode(alphaMode);
+        AlphaCutoff = Guard3D.Range(alphaCutoff, 0f, 1f, nameof(alphaCutoff));
+        BaseColorTextureIndex = ValidateTextureIndex(baseColorTextureIndex, nameof(baseColorTextureIndex));
+        NormalTextureIndex = ValidateTextureIndex(normalTextureIndex, nameof(normalTextureIndex));
+        NormalTextureScale = Guard3D.Range(normalTextureScale, 0f, 4f, nameof(normalTextureScale));
+        MetallicRoughnessTextureIndex = ValidateTextureIndex(metallicRoughnessTextureIndex, nameof(metallicRoughnessTextureIndex));
+        EmissiveTextureIndex = ValidateTextureIndex(emissiveTextureIndex, nameof(emissiveTextureIndex));
+        EmissiveColor = Guard3D.Color(emissiveColor ?? ColorRgba.Transparent, nameof(emissiveColor));
         DoubleSided = doubleSided;
     }
 
@@ -87,31 +88,37 @@ public sealed class ModelMaterialAsset3D
         string role)
     {
         if (!textureIndex.HasValue) return;
-        var key = $"model-texture:{textureIndex.Value}:{role}";
         if (textures is null)
         {
-            if (role == "base") material.BaseColorTextureKey = key;
-            else if (role == "metallicRoughness") material.MetallicRoughnessTextureKey = key;
-            else if (role == "emissive") material.EmissiveTextureKey = key;
-            else if (role == "normal") material.NormalMapTextureKey = key;
-            return;
+            throw new InvalidOperationException($"Texture index {textureIndex.Value} for material role '{role}' cannot be resolved because no texture catalog was supplied.");
         }
 
         for (var i = 0; i < textures.Count; i++)
         {
             var texture = textures[i];
-            if (texture.Index == textureIndex.Value && texture.Data is { Length: > 0 })
+            if (texture.Index == textureIndex.Value && texture.DataInternal is { Length: > 0 })
             {
-                var resolvedKey = BuildTextureKey(texture.Index, role, texture.Data);
-                setter(material, resolvedKey, texture.Data, texture.MimeType);
+                var resolvedKey = BuildTextureKey(texture.Index, role, texture.DataInternal!);
+                setter(material, resolvedKey, texture.DataInternal!, texture.MimeType);
                 return;
             }
         }
 
-        if (role == "base") material.BaseColorTextureKey = key;
-        else if (role == "metallicRoughness") material.MetallicRoughnessTextureKey = key;
-        else if (role == "emissive") material.EmissiveTextureKey = key;
-        else if (role == "normal") material.NormalMapTextureKey = key;
+        throw new InvalidOperationException($"Texture index {textureIndex.Value} for material role '{role}' was not found or has no payload.");
+    }
+
+    private static int? ValidateTextureIndex(int? value, string parameterName)
+    {
+        if (value is < 0) throw new ArgumentOutOfRangeException(parameterName, value, "Texture indices must be non-negative.");
+        return value;
+    }
+
+    private static string NormalizeAlphaMode(string value)
+    {
+        value = Guard3D.RequiredText(value, nameof(value)).ToUpperInvariant();
+        return value is "OPAQUE" or "MASK" or "BLEND"
+            ? value
+            : throw new ArgumentOutOfRangeException(nameof(value), value, "Alpha mode must be OPAQUE, MASK, or BLEND.");
     }
 
     private static float ComputeShininess(float roughness)

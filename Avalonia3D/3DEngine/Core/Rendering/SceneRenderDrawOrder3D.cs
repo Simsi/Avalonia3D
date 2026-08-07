@@ -7,7 +7,7 @@ namespace ThreeDEngine.Core.Rendering;
 /// the actual buffer/draw implementation, but the ordering rule must stay identical:
 /// opaque first, transparent last, transparent back-to-front, stable source order as tie-breaker.
 /// </summary>
-public static class SceneRenderDrawOrder3D
+internal static class SceneRenderDrawOrder3D
 {
     private const ulong FnvOffset = 14695981039346656037UL;
     private const ulong FnvPrime = 1099511628211UL;

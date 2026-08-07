@@ -9,6 +9,7 @@ using System.Text.Json;
 using ThreeDEngine.Core.Assets.Models;
 using ThreeDEngine.Core.Assets.Resolvers;
 using ThreeDEngine.Core.Collision;
+using ThreeDEngine.Core.Geometry.Surfaces;
 using ThreeDEngine.Core.Primitives;
 
 namespace ThreeDEngine.Core.Importers.Gltf;
@@ -613,7 +614,7 @@ public static class GltfModelImporter
 
                     if ((normals is null || normals.Length != positions.Length) && context.Options.GenerateMissingNormals)
                     {
-                        normals = MeshPrimitiveAsset3D.GenerateNormals(positions, indices);
+                        normals = TangentGenerator3D.GenerateNormals(positions, indices);
                         context.Diagnostics.Info("GLTF_NORMALS_GENERATED", $"Generated missing normals for mesh '{name}' primitive {primitiveIndex}.");
                     }
 
@@ -1004,8 +1005,17 @@ public static class GltfModelImporter
                     var output = GetInt(samplerElement, "output", -1);
                     var interpolation = ParseInterpolation(GetString(samplerElement, "interpolation") ?? "LINEAR");
                     var times = input >= 0 ? ReadFloatAccessor(root, context, input, "animation.input") : Array.Empty<float>();
-                    var values = output >= 0 ? ReadAnimationOutputAccessor(root, context, output, times.Length, interpolation) : Array.Empty<Vector4>();
-                    samplers.Add(new AnimationSampler3D(times, values, interpolation));
+                    var outputData = output >= 0
+                        ? ReadAnimationOutputAccessor(root, context, output, times.Length, interpolation)
+                        : AnimationOutputData.Empty;
+                    if (outputData.Values.Length != times.Length)
+                    {
+                        samplers.Add(new AnimationSampler3D(Array.Empty<float>(), Array.Empty<Vector4>(), interpolation));
+                    }
+                    else
+                    {
+                        samplers.Add(new AnimationSampler3D(times, outputData.Values, interpolation, outputData.InTangents, outputData.OutTangents));
+                    }
                 }
             }
 
@@ -1037,10 +1047,10 @@ public static class GltfModelImporter
         return clips;
     }
 
-    private static Vector4[] ReadAnimationOutputAccessor(JsonElement root, ImportContext context, int accessorIndex, int keyCount, AnimationInterpolation3D interpolation)
+    private static AnimationOutputData ReadAnimationOutputAccessor(JsonElement root, ImportContext context, int accessorIndex, int keyCount, AnimationInterpolation3D interpolation)
     {
         var accessor = ResolveAccessor(root, context, accessorIndex);
-        if (accessor.Count == 0) return Array.Empty<Vector4>();
+        if (accessor.Count == 0) return AnimationOutputData.Empty;
         var raw = new Vector4[accessor.Count];
         for (var i = 0; i < raw.Length; i++)
         {
@@ -1051,15 +1061,36 @@ public static class GltfModelImporter
                 accessor.ComponentCount > 3 ? ReadComponentAsFloat(context.BinaryChunk, accessor, i, 3) : 0f);
         }
 
-        if (interpolation == AnimationInterpolation3D.CubicSpline && keyCount > 0 && raw.Length >= keyCount * 3)
+        if (interpolation == AnimationInterpolation3D.CubicSpline)
         {
+            if (keyCount <= 0 || raw.Length != keyCount * 3)
+            {
+                context.Diagnostics.Error("GLTF_CUBIC_SPLINE_COUNT", $"CUBICSPLINE output contains {raw.Length} elements for {keyCount} input keys; exactly three output elements per key are required.");
+                return AnimationOutputData.Empty;
+            }
+            var inTangents = new Vector4[keyCount];
             var values = new Vector4[keyCount];
-            for (var i = 0; i < values.Length; i++) values[i] = raw[i * 3 + 1];
-            context.Diagnostics.Warning("GLTF_CUBIC_SPLINE_APPROX", "CUBICSPLINE animation is imported using its key values; tangent interpolation is approximated.");
-            return values;
+            var outTangents = new Vector4[keyCount];
+            for (var i = 0; i < keyCount; i++)
+            {
+                inTangents[i] = raw[i * 3];
+                values[i] = raw[i * 3 + 1];
+                outTangents[i] = raw[i * 3 + 2];
+            }
+            return new AnimationOutputData(values, inTangents, outTangents);
         }
 
-        return raw;
+        if (raw.Length != keyCount)
+        {
+            context.Diagnostics.Error("GLTF_ANIMATION_OUTPUT_COUNT", $"Animation output contains {raw.Length} elements for {keyCount} input keys.");
+            return AnimationOutputData.Empty;
+        }
+        return new AnimationOutputData(raw, null, null);
+    }
+
+    private readonly record struct AnimationOutputData(Vector4[] Values, Vector4[]? InTangents, Vector4[]? OutTangents)
+    {
+        public static AnimationOutputData Empty => new(Array.Empty<Vector4>(), null, null);
     }
 
     private static AnimationInterpolation3D ParseInterpolation(string value)

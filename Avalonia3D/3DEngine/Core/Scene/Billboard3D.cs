@@ -1,4 +1,5 @@
 using ThreeDEngine.Core.Geometry;
+using ThreeDEngine.Core.Validation;
 
 namespace ThreeDEngine.Core.Scene;
 
@@ -21,7 +22,7 @@ public sealed class Billboard3D : Object3D
         get => _width;
         set
         {
-            var clamped = System.MathF.Max(0.001f, value);
+            var clamped = Guard3D.Positive(value, nameof(Width));
             if (System.MathF.Abs(_width - clamped) < 0.0001f) return;
             _width = clamped;
             MarkGeometryDirty();
@@ -33,7 +34,7 @@ public sealed class Billboard3D : Object3D
         get => _height;
         set
         {
-            var clamped = System.MathF.Max(0.001f, value);
+            var clamped = Guard3D.Positive(value, nameof(Height));
             if (System.MathF.Abs(_height - clamped) < 0.0001f) return;
             _height = clamped;
             MarkGeometryDirty();

@@ -4,6 +4,7 @@ using System.Numerics;
 using ThreeDEngine.Core.Collision;
 using ThreeDEngine.Core.Math;
 using ThreeDEngine.Core.Scene;
+using ThreeDEngine.Core.Validation;
 
 namespace ThreeDEngine.Core.Spatial;
 
@@ -23,9 +24,12 @@ public sealed class SpatialHashGrid3D
 {
     private const int MaxCellsPerObject = 10000;
     private const int MaxCellsPerQuery = 20000;
+    private const int MaximumOverflowObjects = 65_536;
     private readonly Dictionary<CellKey, List<Object3D>> _cells = new();
     private readonly Dictionary<Object3D, List<CellKey>> _objectCells = new(ObjectReferenceComparer.Instance);
+    private readonly HashSet<Object3D> _overflowObjects = new(ObjectReferenceComparer.Instance);
     private float _cellSize;
+    private int _version;
 
     public SpatialHashGrid3D(float cellSize = 8f)
     {
@@ -35,20 +39,29 @@ public sealed class SpatialHashGrid3D
     public float CellSize
     {
         get => _cellSize;
-        set => _cellSize = MathF.Max(0.5f, float.IsFinite(value) ? value : 8f);
+        set
+        {
+            var validated = Guard3D.Positive(value, nameof(CellSize));
+            if (_objectCells.Count != 0 && validated != _cellSize)
+                throw new InvalidOperationException("CellSize cannot change while objects are indexed. Call Clear() before reconfiguring the grid.");
+            _cellSize = validated;
+        }
     }
-    public int Version { get; private set; }
+    public int Version => _version;
+    public int IndexedObjectCount => _objectCells.Count;
+    public int OverflowObjectCount => _overflowObjects.Count;
 
     public void Clear()
     {
         _cells.Clear();
         _objectCells.Clear();
-        Version++;
+        _overflowObjects.Clear();
+        IncrementVersion();
     }
 
     public void Add(Object3D obj, Bounds3D bounds)
     {
-        if (obj is null) return;
+        if (obj is null) throw new ArgumentNullException(nameof(obj));
 
         // Reuse the per-object cell list across transform-only updates. The old
         // implementation allocated a new List<CellKey> for every Add/Update, which
@@ -64,25 +77,32 @@ public sealed class SpatialHashGrid3D
             keys.Clear();
         }
 
+        _overflowObjects.Remove(obj);
         if (!IsUsable(bounds))
         {
-            Version++;
+            AddOverflowObject(obj);
+            IncrementVersion();
             return;
         }
 
-        var min = ToCell(bounds.Min);
-        var max = ToCell(bounds.Max);
+        if (!TryToCell(bounds.Min, out var min) || !TryToCell(bounds.Max, out var max))
+        {
+            AddOverflowObject(obj);
+            IncrementVersion();
+            return;
+        }
         if (!CanEnumerateCellRange(min, max, MaxCellsPerObject))
         {
-            Version++;
+            AddOverflowObject(obj);
+            IncrementVersion();
             return;
         }
 
-        for (var x = min.X; x <= max.X; x++)
-        for (var y = min.Y; y <= max.Y; y++)
-        for (var z = min.Z; z <= max.Z; z++)
+        for (long x = min.X; x <= max.X; x++)
+        for (long y = min.Y; y <= max.Y; y++)
+        for (long z = min.Z; z <= max.Z; z++)
         {
-            var key = new CellKey(x, y, z);
+            var key = new CellKey((int)x, (int)y, (int)z);
             if (!_cells.TryGetValue(key, out var bucket))
             {
                 bucket = new List<Object3D>(4);
@@ -93,7 +113,7 @@ public sealed class SpatialHashGrid3D
             keys.Add(key);
         }
 
-        Version++;
+        IncrementVersion();
     }
 
     public bool Remove(Object3D obj)
@@ -101,8 +121,9 @@ public sealed class SpatialHashGrid3D
         if (obj is null || !_objectCells.TryGetValue(obj, out var keys)) return false;
         RemoveFromCells(obj, keys);
         _objectCells.Remove(obj);
+        _overflowObjects.Remove(obj);
         keys.Clear();
-        Version++;
+        IncrementVersion();
         return true;
     }
 
@@ -134,36 +155,43 @@ public sealed class SpatialHashGrid3D
 
     public List<Object3D> QueryBounds(Bounds3D bounds, SpatialQueryScratch3D scratch)
     {
+        ArgumentNullException.ThrowIfNull(scratch);
         scratch.Clear();
-        if (!IsUsable(bounds)) return scratch.Results;
-        var min = ToCell(bounds.Min);
-        var max = ToCell(bounds.Max);
-        if (!CanEnumerateCellRange(min, max, MaxCellsPerQuery)) return scratch.Results;
+        if (!IsUsable(bounds)) throw new ArgumentException("Spatial query bounds must be valid and finite.", nameof(bounds));
+        if (!TryToCell(bounds.Min, out var min) || !TryToCell(bounds.Max, out var max))
+            throw new ArgumentOutOfRangeException(nameof(bounds), "Spatial query bounds exceed the representable grid coordinate range.");
+        if (!CanEnumerateCellRange(min, max, MaxCellsPerQuery))
+            throw new InvalidOperationException($"Spatial query spans more than {MaxCellsPerQuery} cells. Partition the query; silent incomplete results and full-scan fallback are prohibited.");
 
-        for (var x = min.X; x <= max.X; x++)
-        for (var y = min.Y; y <= max.Y; y++)
-        for (var z = min.Z; z <= max.Z; z++)
+        for (long x = min.X; x <= max.X; x++)
+        for (long y = min.Y; y <= max.Y; y++)
+        for (long z = min.Z; z <= max.Z; z++)
         {
-            AddCellObjects(new CellKey(x, y, z), scratch.Seen, scratch.Results);
+            AddCellObjects(new CellKey((int)x, (int)y, (int)z), scratch.Seen, scratch.Results);
         }
+        AddOverflowObjects(scratch);
         return scratch.Results;
     }
 
-    public IReadOnlyList<Object3D> QueryRay(Ray ray, float maxDistance = 10000f, int maxSteps = 2048)
+    public IReadOnlyList<Object3D> QueryRay(Ray ray, float maxDistance = 10000f, int maxSteps = 4096)
     {
         var scratch = new SpatialQueryScratch3D();
         QueryRay(ray, scratch, maxDistance, maxSteps);
         return scratch.Results.ToArray();
     }
 
-    public List<Object3D> QueryRay(Ray ray, SpatialQueryScratch3D scratch, float maxDistance = 10000f, int maxSteps = 2048)
+    public List<Object3D> QueryRay(Ray ray, SpatialQueryScratch3D scratch, float maxDistance = 10000f, int maxSteps = 4096)
     {
+        ArgumentNullException.ThrowIfNull(scratch);
         scratch.Clear();
-        if (!IsFinite(ray.Origin) || !IsFinite(ray.Direction) || ray.Direction.LengthSquared() < 0.000001f) return scratch.Results;
-        if (!float.IsFinite(maxDistance) || maxDistance <= 0f || maxSteps <= 0) return scratch.Results;
+        if (!IsFinite(ray.Origin) || !IsFinite(ray.Direction) || ray.Direction.LengthSquared() < 0.000001f)
+            throw new ArgumentException("Spatial ray origin/direction must be finite and direction must be non-zero.", nameof(ray));
+        if (!float.IsFinite(maxDistance) || maxDistance <= 0f) throw new ArgumentOutOfRangeException(nameof(maxDistance));
+        if (maxSteps <= 0) throw new ArgumentOutOfRangeException(nameof(maxSteps));
 
         var direction = Vector3.Normalize(ray.Direction);
-        var cell = ToCell(ray.Origin);
+        if (!TryToCell(ray.Origin, out var cell))
+            throw new ArgumentOutOfRangeException(nameof(ray), "Spatial ray origin exceeds the representable grid coordinate range.");
         var stepX = direction.X >= 0f ? 1 : -1;
         var stepY = direction.Y >= 0f ? 1 : -1;
         var stepZ = direction.Z >= 0f ? 1 : -1;
@@ -180,32 +208,52 @@ public sealed class SpatialHashGrid3D
         var tDeltaZ = MathF.Abs(direction.Z) < 0.000001f ? float.PositiveInfinity : CellSize / MathF.Abs(direction.Z);
 
         var distance = 0f;
-        for (var i = 0; i < maxSteps && distance <= maxDistance; i++)
+        var steps = 0;
+        for (; steps < maxSteps && distance <= maxDistance; steps++)
         {
             AddCellObjects(cell, scratch.Seen, scratch.Results);
 
             if (tMaxX <= tMaxY && tMaxX <= tMaxZ)
             {
                 distance = tMaxX;
-                cell = new CellKey(cell.X + stepX, cell.Y, cell.Z);
+                cell = new CellKey(AdvanceCoordinate(cell.X, stepX), cell.Y, cell.Z);
                 tMaxX += tDeltaX;
             }
             else if (tMaxY <= tMaxZ)
             {
                 distance = tMaxY;
-                cell = new CellKey(cell.X, cell.Y + stepY, cell.Z);
+                cell = new CellKey(cell.X, AdvanceCoordinate(cell.Y, stepY), cell.Z);
                 tMaxY += tDeltaY;
             }
             else
             {
                 distance = tMaxZ;
-                cell = new CellKey(cell.X, cell.Y, cell.Z + stepZ);
+                cell = new CellKey(cell.X, cell.Y, AdvanceCoordinate(cell.Z, stepZ));
                 tMaxZ += tDeltaZ;
             }
 
             if (!float.IsFinite(distance)) break;
         }
+        if (steps >= maxSteps && distance <= maxDistance)
+            throw new InvalidOperationException($"Spatial ray traversal exhausted maxSteps={maxSteps} before reaching maxDistance={maxDistance}. Increase maxSteps or partition the query; incomplete results are prohibited.");
+        AddOverflowObjects(scratch);
         return scratch.Results;
+    }
+
+    private void AddOverflowObject(Object3D obj)
+    {
+        if (_overflowObjects.Contains(obj)) return;
+        if (_overflowObjects.Count >= MaximumOverflowObjects)
+            throw new InvalidOperationException($"Spatial overflow capacity {MaximumOverflowObjects} is exhausted. Bounds must be partitioned or corrected; full-scan fallback is prohibited.");
+        _overflowObjects.Add(obj);
+    }
+
+    private void AddOverflowObjects(SpatialQueryScratch3D scratch)
+    {
+        foreach (var obj in _overflowObjects)
+        {
+            if (scratch.Seen.Add(obj)) scratch.Results.Add(obj);
+        }
     }
 
     private void AddCellObjects(CellKey key, HashSet<Object3D> seen, List<Object3D> result)
@@ -218,7 +266,29 @@ public sealed class SpatialHashGrid3D
         }
     }
 
-    private CellKey ToCell(Vector3 p) => new(FastFloor(p.X / CellSize), FastFloor(p.Y / CellSize), FastFloor(p.Z / CellSize));
+    private bool TryToCell(Vector3 point, out CellKey cell)
+    {
+        var x = point.X / CellSize;
+        var y = point.Y / CellSize;
+        var z = point.Z / CellSize;
+        if (!CanConvertToCellCoordinate(x) || !CanConvertToCellCoordinate(y) || !CanConvertToCellCoordinate(z))
+        {
+            cell = default;
+            return false;
+        }
+        cell = new CellKey(FastFloor(x), FastFloor(y), FastFloor(z));
+        return true;
+    }
+
+    private static bool CanConvertToCellCoordinate(float value)
+        => float.IsFinite(value) && value >= int.MinValue && value < int.MaxValue;
+
+    private static int AdvanceCoordinate(int value, int step)
+    {
+        if ((step > 0 && value == int.MaxValue) || (step < 0 && value == int.MinValue))
+            throw new InvalidOperationException("Spatial ray traversal exceeded the representable grid coordinate range.");
+        return value + step;
+    }
 
     private static bool IsUsable(Bounds3D bounds) => bounds.IsValid && IsFinite(bounds.Min) && IsFinite(bounds.Max);
     private static bool IsFinite(Vector3 p) => float.IsFinite(p.X) && float.IsFinite(p.Y) && float.IsFinite(p.Z);
@@ -229,9 +299,13 @@ public sealed class SpatialHashGrid3D
         var x = (long)max.X - min.X + 1L;
         var y = (long)max.Y - min.Y + 1L;
         var z = (long)max.Z - min.Z + 1L;
-        if (x <= 0L || y <= 0L || z <= 0L) return false;
-        return x * y * z <= limit;
+        if (x <= 0L || y <= 0L || z <= 0L || limit <= 0) return false;
+        if (x > limit || y > limit / x) return false;
+        var xy = x * y;
+        return z <= limit / xy;
     }
+
+    private void IncrementVersion() => _version = checked(_version + 1);
 
     private static int FastFloor(float value)
     {

@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net8.0-browser</TargetFrameworks>
+    <RootNamespace>ThreeDEngine</RootNamespace>
+    <AssemblyName>Avalonia3D.Assets.Gltf</AssemblyName>
+    <PackageId>Avalonia3D.Assets.Gltf</PackageId>
+    <Description>glTF/GLB importer and engine-scoped model asset cache for Avalonia3D.</Description>
+    <IsPackable>true</IsPackable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Core/Assets/Models/ModelAssetCache3D.cs" />
+    <Compile Include="Core/Importers/Gltf/**/*.cs" />
+    <ProjectReference Include="Avalonia3D.Core.csproj" />
+  </ItemGroup>
+</Project>
